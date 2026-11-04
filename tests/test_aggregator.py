@@ -399,6 +399,18 @@ def test_build_thread_telemetry_native_antigravity_subagent(tmp_path: Path):
     assert node.rollup_metrics.cache_read_tokens == 300
     assert node.rollup_metrics.output_tokens == 450
     assert node.rollup_metrics.total_subagents == 1
+    # Verify native Antigravity child context telemetry reconstruction (Task 4 review issue 2)
+    assert child.context_used_tokens == 750
+    assert child.context_provenance == "estimated"
+    assert child.context_limit is None
+    assert child.context_max_tokens == 1_048_576
+    assert child.context_limit_provenance == "default"
+    assert len(child.context_samples) == 1
+    assert child.context_samples[0].used_tokens == 750
+    assert child.context_samples[0].source_id == "native-child-id-1:step:1"
+    assert child.context_samples[0].provider_thread_id == "native-child-id-1"
+    assert child.active_provider_thread_id == "native-child-id-1"
+    assert child.latest_step_label == "Model step #1"
 
 
 def test_circular_lineage_protection(tmp_path: Path):
@@ -521,3 +533,930 @@ def test_list_root_threads_and_resolve(tmp_path: Path):
 
     # Test resolve not found
     assert resolve_thread(tmp_path, "nonexistent-xyz") is None
+
+
+def test_current_running_turn_selection(tmp_path: Path):
+    """When a thread has running status, current turn metrics selects the running turn."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "claude-3-7-sonnet"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-run", "proj", "Running Thread", "claudeAgent", "full-access", "default",
+            "pt-run", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "claude_inst"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "c-run-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-run", "t-run", "node-1", "claudeAgent", "running", "2026-11-03T10:05:00Z",
+            json.dumps(pt_payload), "claudeAgent", "claude_inst"))
+
+    # Turn 1 completed
+    t1_payload = {
+        "nativeTurnRef": {"driver": "claudeAgent", "nativeId": "turn-1"},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 1000, "outputTokens": 200}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-1", "t-run", "pt-run", "node-1", 1, "completed",
+            "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(t1_payload)))
+
+    # Turn 2 running
+    t2_payload = {
+        "nativeTurnRef": {"driver": "claudeAgent", "nativeId": "turn-2"},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 500, "outputTokens": 50}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-2", "t-run", "pt-run", "node-1", 2, "running",
+            "2026-11-03T10:02:00Z", None, json.dumps(t2_payload)))
+
+    conn.commit()
+    conn.close()
+
+    node = build_thread_telemetry("t-run", tmp_path)
+    assert node.status == "running"
+    assert node.current_turn_metrics is not None
+    assert node.current_turn_metrics.ordinal == 2
+    assert node.current_turn_metrics.input_tokens == 500
+    assert node.current_turn_metrics.output_tokens == 50
+    assert node.turn_metrics_availability == "available"
+    # Whole chat totals unchanged: sum of both turns
+    assert node.self_metrics.input_tokens == 1500
+    assert node.self_metrics.output_tokens == 250
+    assert node.self_metrics.step_count == 2
+    assert node.self_metrics.provider_turn_count == 2
+
+
+def test_latest_completed_turn_selection(tmp_path: Path):
+    """When a thread is idle, current turn metrics selects the latest completed turn."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "codex"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-idle", "proj", "Idle Thread", "codex", "full-access", "default",
+            "pt-idle", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "codex"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "codex", "nativeId": "c-idle-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-idle", "t-idle", "node-1", "codex", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt_payload), "codex", "codex"))
+
+    # Turn 1 completed
+    t1_payload = {
+        "nativeTurnRef": {"driver": "codex", "nativeId": "turn-1"},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 1000, "outputTokens": 200}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-1", "t-idle", "pt-idle", "node-1", 1, "completed",
+            "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(t1_payload)))
+
+    # Turn 2 completed
+    t2_payload = {
+        "nativeTurnRef": {"driver": "codex", "nativeId": "turn-2"},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 3000, "outputTokens": 600}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-2", "t-idle", "pt-idle", "node-1", 2, "completed",
+            "2026-11-03T10:02:00Z", "2026-11-03T10:02:15Z", json.dumps(t2_payload)))
+
+    conn.commit()
+    conn.close()
+
+    node = build_thread_telemetry("t-idle", tmp_path)
+    assert node.status in ("idle", "completed")
+    assert node.current_turn_metrics is not None
+    assert node.current_turn_metrics.ordinal == 2
+    assert node.current_turn_metrics.input_tokens == 3000
+    assert node.current_turn_metrics.output_tokens == 600
+    assert node.turn_metrics_availability == "available"
+
+
+def test_cumulative_fallback_not_claimed_as_exact_turn(tmp_path: Path):
+    """Cumulative tokenUsage fallback is retained in whole chat but not claimed as exact turn metric."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "codex"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-fb", "proj", "Fallback Thread", "codex", "full-access", "default",
+            "pt-fb", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "codex"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "codex", "nativeId": "c-fb-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-fb", "t-fb", "node-1", "codex", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt_payload), "codex", "codex"))
+
+    # Turn with only tokenUsage (cumulative fallback), no turnTokenUsage
+    turn_payload = {
+        "nativeTurnRef": {"driver": "codex", "nativeId": "turn-1"},
+        "tokenUsage": {"inputTokens": 4500, "outputTokens": 800}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-1", "t-fb", "pt-fb", "node-1", 1, "completed",
+            "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(turn_payload)))
+
+    conn.commit()
+    conn.close()
+
+    node = build_thread_telemetry("t-fb", tmp_path)
+    # Turn metrics must be marked unavailable (not claimed as exact turn usage)
+    assert node.turn_metrics_availability == "unavailable"
+    assert node.current_turn_metrics.availability == "unavailable"
+    assert node.current_turn_metrics.provenance == "cumulative_fallback"
+    # Whole chat totals remain unchanged
+    assert node.self_metrics.input_tokens == 4500
+    assert node.self_metrics.output_tokens == 800
+    assert node.self_metrics.step_count == 1
+
+
+def test_zero_exact_usage_distinguished_from_unavailable(tmp_path: Path):
+    """Zero reported exact usage produces available turn metrics with 0 tokens, not unavailable."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "claudeAgent"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-zero", "proj", "Zero Exact Thread", "claudeAgent", "full-access", "default",
+            "pt-zero", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "claude_inst"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "c-zero-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-zero", "t-zero", "node-1", "claudeAgent", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt_payload), "claudeAgent", "claude_inst"))
+
+    turn_payload = {
+        "nativeTurnRef": {"driver": "claudeAgent", "nativeId": "turn-1"},
+        "tokenUsage": {"inputTokens": 5000, "outputTokens": 1000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 0, "outputTokens": 0}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-1", "t-zero", "pt-zero", "node-1", 1, "completed",
+            "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(turn_payload)))
+
+    conn.commit()
+    conn.close()
+
+    node = build_thread_telemetry("t-zero", tmp_path)
+    assert node.turn_metrics_availability == "available"
+    assert node.current_turn_metrics.availability == "available"
+    assert node.current_turn_metrics.input_tokens == 0
+    assert node.current_turn_metrics.output_tokens == 0
+
+
+def test_antigravity_current_turn_unavailable_and_step_labeled_separately(tmp_path: Path):
+    """Antigravity has unavailable current-turn scope and exposes latest model step separately."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "gemini-flash"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-agy", "proj", "Antigravity Chat", "antigravity", "full-access", "default",
+            "pt-agy", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "antigravity_gemini"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "antigravity", "nativeId": "agy-conv-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-agy", "t-agy", "node-1", "antigravity", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt_payload), "antigravity", "antigravity_gemini"))
+
+    conn.commit()
+    conn.close()
+
+    def mock_reader(native_id: str, t3_dir: Path, source_label: str = "main"):
+        return ConversationTelemetry(
+            native_id=native_id,
+            steps=[
+                ModelStep(step_index=1, source=source_label, status="completed", input_tokens=1000, output_tokens=200),
+                ModelStep(step_index=2, source=source_label, status="completed", input_tokens=1500, output_tokens=300),
+            ]
+        )
+
+    node = build_thread_telemetry("t-agy", tmp_path, agy_reader=mock_reader)
+    assert node.driver == "antigravity"
+    assert node.turn_metrics_availability == "unavailable"
+    assert node.current_turn_metrics.availability == "unavailable"
+    assert node.latest_step_label == "Model step #2"
+    assert node.steps[0].row_label == "Model step #1"
+    assert node.steps[0].activity_kind == "model_step"
+    assert node.self_metrics.model_step_count == 2
+    assert node.self_metrics.provider_turn_count == 0
+
+
+def test_mixed_provider_rollup_counts_and_unchanged_totals(tmp_path: Path):
+    """Mixed provider rollup counts turns and inference steps separately while preserving legacy totals."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    # Parent thread: Codex with 2 provider turns
+    p_payload = {"modelSelection": {"model": "gpt-5-codex"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-parent", "proj", "Parent Orchestrator", "codex", "full-access", "default",
+            "pt-parent", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(p_payload), "codex"))
+
+    pt_p_payload = {"nativeThreadRef": {"driver": "codex", "nativeId": "c-parent-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-parent", "t-parent", "node-1", "codex", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt_p_payload), "codex", "codex"))
+
+    # Parent 2 turns
+    for ord_val, in_tok, out_tok in [(1, 2000, 400), (2, 3000, 600)]:
+        t_pay = {
+            "nativeTurnRef": {"driver": "codex", "nativeId": f"turn-{ord_val}"},
+            "turnTokenUsage": {"usageStatus": "complete", "inputTokens": in_tok, "outputTokens": out_tok}
+        }
+        conn.execute("""
+        INSERT INTO orchestration_v2_projection_provider_turns
+        (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (f"pturn-{ord_val}", "t-parent", "pt-parent", "node-1", ord_val, "completed",
+                "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(t_pay)))
+
+    # Child thread: Antigravity delegated subagent
+    c_payload = {"modelSelection": {"model": "gemini-flash"}, "lineage": {"parentThreadId": "t-parent"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-child", "proj", "Child Worker", "antigravity", "full-access", "default",
+            "pt-child", "2026-11-03T10:02:00Z", "2026-11-03T10:04:00Z", None,
+            json.dumps(c_payload), "antigravity_gemini"))
+
+    pt_c_payload = {"nativeThreadRef": {"driver": "antigravity", "nativeId": "agy-child-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-child", "t-child", "node-2", "antigravity", "idle", "2026-11-03T10:04:00Z",
+            json.dumps(pt_c_payload), "antigravity", "antigravity_gemini"))
+
+    sub_pay = {"title": "Child Worker", "model": "gemini-flash"}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_subagents
+    (subagent_id, thread_id, parent_node_id, provider, provider_thread_id, child_thread_id,
+     origin, status, started_at, completed_at, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("sub-c1", "t-parent", "node-1", "antigravity", "pt-child", "t-child",
+            "app_owned", "completed", "2026-11-03T10:02:00Z", "2026-11-03T10:04:00Z",
+            "2026-11-03T10:04:00Z", json.dumps(sub_pay), "antigravity", "antigravity_gemini"))
+
+    conn.commit()
+    conn.close()
+
+    def mock_reader(native_id: str, t3_dir: Path, source_label: str = "main"):
+        return ConversationTelemetry(
+            native_id=native_id,
+            steps=[
+                ModelStep(step_index=1, source=source_label, status="completed", input_tokens=500, output_tokens=100),
+                ModelStep(step_index=2, source=source_label, status="completed", input_tokens=600, output_tokens=150),
+                ModelStep(step_index=3, source=source_label, status="completed", input_tokens=700, output_tokens=200),
+            ]
+        )
+
+    node = build_thread_telemetry("t-parent", tmp_path, agy_reader=mock_reader)
+    assert len(node.subagents) == 1
+    child_node = node.subagents[0]
+
+    # Verify self metrics separation
+    assert node.self_metrics.step_count == 2
+    assert node.self_metrics.provider_turn_count == 2
+    assert node.self_metrics.model_step_count == 0
+    assert node.self_metrics.steps_display == "2 turns"
+
+    assert child_node.self_metrics.step_count == 3
+    assert child_node.self_metrics.provider_turn_count == 0
+    assert child_node.self_metrics.model_step_count == 3
+    assert child_node.self_metrics.steps_display == "3 steps"
+
+    # Verify rollup metrics separation
+    assert node.rollup_metrics.step_count == 5  # 2 + 3 (legacy step_count preserved)
+    assert node.rollup_metrics.provider_turn_count == 2
+    assert node.rollup_metrics.model_step_count == 3
+    assert node.rollup_metrics.steps_display == "2 turns, 3 steps"
+
+    # Whole chat totals unchanged
+    assert node.rollup_metrics.input_tokens == 5000 + 1800  # (2000 + 3000) + (500 + 600 + 700)
+    assert node.rollup_metrics.output_tokens == 1000 + 450  # (400 + 600) + (100 + 150 + 200)
+
+    # Provider steps have no synthetic turn in tool_calls, row_label is Provider turn #N, action is unknown
+    assert node.steps[0].activity_kind == "provider_turn"
+    assert node.steps[0].row_label == "Provider turn #1"
+    assert node.steps[0].tool_calls == []
+    assert node.steps[0].action_summary == "unknown"
+
+
+def test_context_high_to_low_sequence_retains_peak(tmp_path: Path):
+    """A new reading below an old peak lowers the current reading while retaining the peak."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "claude-3-7-sonnet"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-drop", "proj", "Drop Test", "claudeAgent", "full-access", "default",
+            "pt-drop", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "claude_inst"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "c-drop-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-drop", "t-drop", "node-1", "claudeAgent", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt_payload), "claudeAgent", "claude_inst"))
+
+    # Turn 1: 80,000 tokens
+    t1_payload = {
+        "tokenUsage": {"usedTokens": 80000, "maxTokens": 200000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 1000, "outputTokens": 200}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-turn-1", "t-drop", "pt-drop", "node-1", 1, "completed",
+            "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(t1_payload)))
+
+    # Turn 2: 25,000 tokens (Context drop!)
+    t2_payload = {
+        "tokenUsage": {"usedTokens": 25000, "maxTokens": 200000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 500, "outputTokens": 100}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-turn-2", "t-drop", "pt-drop", "node-1", 2, "completed",
+            "2026-11-03T10:02:00Z", "2026-11-03T10:02:10Z", json.dumps(t2_payload)))
+
+    conn.commit()
+    conn.close()
+
+    node = build_thread_telemetry("t-drop", tmp_path)
+    assert node.context_used_tokens == 25000
+    assert node.observed_peak_tokens == 80000
+    assert node.context_limit == 200000
+    assert pytest.approx(node.context_pct, rel=1e-3) == 12.5
+    assert node.context_provenance == "measured"
+    assert len(node.context_samples) == 2
+    assert node.context_samples[0].used_tokens == 80000
+    assert node.context_samples[1].used_tokens == 25000
+
+
+def test_context_timestamp_recency_over_token_magnitude(tmp_path: Path):
+    """Timestamp recency determines freshest reading rather than token magnitude."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "claude-3-7-sonnet"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-recency", "proj", "Recency Test", "claudeAgent", "full-access", "default",
+            "pt-recency", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "claude_inst"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "c-rec-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-recency", "t-recency", "node-1", "claudeAgent", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt_payload), "claudeAgent", "claude_inst"))
+
+    # Turn A: larger tokens but earlier timestamp
+    tA_payload = {
+        "tokenUsage": {"usedTokens": 95000, "maxTokens": 200000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 1000, "outputTokens": 200}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-A", "t-recency", "pt-recency", "node-1", 1, "completed",
+            "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(tA_payload)))
+
+    # Turn B: smaller tokens but later timestamp
+    tB_payload = {
+        "tokenUsage": {"usedTokens": 32000, "maxTokens": 200000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 500, "outputTokens": 100}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-B", "t-recency", "pt-recency", "node-1", 2, "completed",
+            "2026-11-03T10:05:00Z", "2026-11-03T10:05:15Z", json.dumps(tB_payload)))
+
+    conn.commit()
+    conn.close()
+
+    node = build_thread_telemetry("t-recency", tmp_path)
+    assert node.context_used_tokens == 32000
+    assert node.observed_peak_tokens == 95000
+
+
+def test_context_explicit_zero_valid(tmp_path: Path):
+    """Explicit zero context usage is valid and does not fallback to older peak."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "claude-3-7-sonnet"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-zero", "proj", "Zero Test", "claudeAgent", "full-access", "default",
+            "pt-zero", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "claude_inst"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "c-zero-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-zero", "t-zero", "node-1", "claudeAgent", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt_payload), "claudeAgent", "claude_inst"))
+
+    t1_payload = {
+        "tokenUsage": {"usedTokens": 40000, "maxTokens": 200000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 1000, "outputTokens": 200}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-z1", "t-zero", "pt-zero", "node-1", 1, "completed",
+            "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(t1_payload)))
+
+    # Turn 2: explicit zero
+    t2_payload = {
+        "tokenUsage": {"usedTokens": 0, "maxTokens": 200000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 0, "outputTokens": 0}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-z2", "t-zero", "pt-zero", "node-1", 2, "completed",
+            "2026-11-03T10:02:00Z", "2026-11-03T10:02:10Z", json.dumps(t2_payload)))
+
+    conn.commit()
+    conn.close()
+
+    node = build_thread_telemetry("t-zero", tmp_path)
+    assert node.context_used_tokens == 0
+    assert node.context_pct == 0.0
+    assert node.observed_peak_tokens == 40000
+
+
+def test_context_missing_limits_visibly_unknown(tmp_path: Path):
+    """Unknown limits remain visibly unknown, preserving legacy 1M JSON default with explicit provenance."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "claude-3-7-sonnet"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-nolim", "proj", "No Limit Test", "claudeAgent", "full-access", "default",
+            "pt-nolim", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "claude_inst"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "c-nolim-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-nolim", "t-nolim", "node-1", "claudeAgent", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt_payload), "claudeAgent", "claude_inst"))
+
+    # Turn with usedTokens but no maxTokens
+    t_payload = {
+        "tokenUsage": {"usedTokens": 18000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 1000, "outputTokens": 200}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-nl", "t-nolim", "pt-nolim", "node-1", 1, "completed",
+            "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(t_payload)))
+
+    conn.commit()
+    conn.close()
+
+    node = build_thread_telemetry("t-nolim", tmp_path)
+    assert node.context_used_tokens == 18000
+    assert node.context_limit is None
+    assert node.context_limit_provenance == "default"
+    assert node.context_max_tokens == 1048576  # Legacy JSON numeric default preserved
+
+    data = node.to_dict()
+    assert data["context_limit"] is None
+    assert data["context_limit_provenance"] == "default"
+    assert data["context_max_tokens"] == 1048576
+
+
+def test_context_missing_timestamps_labels_uncertainty(tmp_path: Path):
+    """Missing timestamps do not fabricate event times, and ordering uncertainty is labeled."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "claude-3-7-sonnet"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-nots", "proj", "No TS Test", "claudeAgent", "full-access", "default",
+            "pt-nots", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "claude_inst"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "c-nots-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-nots", "t-nots", "node-1", "claudeAgent", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt_payload), "claudeAgent", "claude_inst"))
+
+    t1_payload = {
+        "tokenUsage": {"usedTokens": 22000, "maxTokens": 200000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 1000, "outputTokens": 200}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-ts1", "t-nots", "pt-nots", "node-1", 1, "completed",
+            None, None, json.dumps(t1_payload)))
+
+    t2_payload = {
+        "tokenUsage": {"usedTokens": 38000, "maxTokens": 200000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 1000, "outputTokens": 200}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-ts2", "t-nots", "pt-nots", "node-1", 2, "completed",
+            None, None, json.dumps(t2_payload)))
+
+    conn.commit()
+    conn.close()
+
+    node = build_thread_telemetry("t-nots", tmp_path)
+    assert node.context_used_tokens == 38000
+    assert node.context_uncertainty is True
+    # Verify timestamps are honestly None and not fabricated
+    assert node.context_samples[0].timestamp is None
+    assert node.context_samples[1].timestamp is None
+
+
+def test_context_provider_switch_constrains_history_and_limits(tmp_path: Path):
+    """Switching providers constrains context history to active provider thread and does not join incompatible histories."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    # App thread points to active provider thread pt-2 (codex)
+    th_payload = {"modelSelection": {"model": "gpt-5-codex"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-switch", "proj", "Switch Test", "codex", "full-access", "default",
+            "pt-2", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None,
+            json.dumps(th_payload), "codex_inst"))
+
+    # Old provider thread pt-1 (claude)
+    pt1_payload = {"nativeThreadRef": {"driver": "claudeAgent", "nativeId": "c-old"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-1", "t-switch", "node-1", "claudeAgent", "idle", "2026-11-03T10:01:00Z",
+            json.dumps(pt1_payload), "claudeAgent", "claude_inst"))
+
+    # Active provider thread pt-2 (codex)
+    pt2_payload = {"nativeThreadRef": {"driver": "codex", "nativeId": "c-new"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-2", "t-switch", "node-2", "codex", "idle", "2026-11-03T10:05:00Z",
+            json.dumps(pt2_payload), "codex", "codex_inst"))
+
+    # Turn under pt-1 (Claude: 85,000 / 200,000)
+    t1_payload = {
+        "tokenUsage": {"usedTokens": 85000, "maxTokens": 200000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 2000, "outputTokens": 500}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-pt1", "t-switch", "pt-1", "node-1", 1, "completed",
+            "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(t1_payload)))
+
+    # Turn under pt-2 (Codex: 12,000 / 128,000)
+    t2_payload = {
+        "tokenUsage": {"usedTokens": 12000, "maxTokens": 128000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 1000, "outputTokens": 300}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-pt2", "t-switch", "pt-2", "node-2", 2, "completed",
+            "2026-11-03T10:04:00Z", "2026-11-03T10:04:15Z", json.dumps(t2_payload)))
+
+    conn.commit()
+    conn.close()
+
+    node = build_thread_telemetry("t-switch", tmp_path)
+    # Context must reflect active pt-2 only
+    assert node.context_used_tokens == 12000
+    assert node.context_limit == 128000
+    assert node.observed_peak_tokens == 12000
+    assert node.active_provider_thread_id == "pt-2"
+    # History must contain only pt-2 samples
+    assert len(node.context_samples) == 1
+    assert node.context_samples[0].provider_thread_id == "pt-2"
+    assert node.context_samples[0].used_tokens == 12000
+
+
+def test_context_measured_wins_over_antigravity_unless_provably_stale(tmp_path: Path):
+    """Measured provider context wins unless provably stale relative to timestamped Antigravity inference."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    th_payload = {"modelSelection": {"model": "gemini-2.5-pro"}, "lineage": {"parentThreadId": None}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-agy-stale", "proj", "Agy Stale", "antigravity", "full-access", "default",
+            "pt-agy-s", "2026-11-03T10:00:00Z", "2026-11-03T10:06:00Z", None,
+            json.dumps(th_payload), "antigravity_gemini"))
+
+    pt_payload = {"nativeThreadRef": {"driver": "antigravity", "nativeId": "agy-stale-1"}}
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-agy-s", "t-agy-stale", "node-1", "antigravity", "idle", "2026-11-03T10:06:00Z",
+            json.dumps(pt_payload), "antigravity", "antigravity_gemini"))
+
+    # Provider turn completed at 10:01:00Z with measured 40,000 tokens
+    t_payload = {
+        "tokenUsage": {"usedTokens": 40000, "maxTokens": 1000000},
+        "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 1000, "outputTokens": 200}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-meas", "t-agy-stale", "pt-agy-s", "node-1", 1, "completed",
+            "2026-11-03T10:01:00Z", "2026-11-03T10:01:10Z", json.dumps(t_payload)))
+
+    conn.commit()
+    conn.close()
+
+    # Case A: Antigravity step completed at 10:05:00Z (provably newer than 10:01:10Z)
+    def mock_reader_newer(native_id: str, t3_dir: Path, source_label: str = "main"):
+        return ConversationTelemetry(
+            native_id=native_id,
+            steps=[
+                ModelStep(
+                    step_index=1,
+                    source=source_label,
+                    status="completed",
+                    input_tokens=10000,
+                    cache_read_tokens=4000,
+                    output_tokens=1000,
+                    started_at="2026-11-03T10:04:50Z",
+                    completed_at="2026-11-03T10:05:00Z",
+                )
+            ]
+        )
+
+    node_newer = build_thread_telemetry("t-agy-stale", tmp_path, agy_reader=mock_reader_newer)
+    # Provably stale provider measurement falls back to freshest Antigravity estimate (10000+4000+1000=15000)
+    assert node_newer.context_used_tokens == 15000
+    assert node_newer.context_provenance == "estimated"
+
+    # Case B: Antigravity step completed at 10:00:30Z (older than provider 10:01:10Z)
+    def mock_reader_older(native_id: str, t3_dir: Path, source_label: str = "main"):
+        return ConversationTelemetry(
+            native_id=native_id,
+            steps=[
+                ModelStep(
+                    step_index=1,
+                    source=source_label,
+                    status="completed",
+                    input_tokens=5000,
+                    cache_read_tokens=1000,
+                    output_tokens=500,
+                    started_at="2026-11-03T10:00:00Z",
+                    completed_at="2026-11-03T10:00:30Z",
+                )
+            ]
+        )
+
+    # Fresh provider measurement wins over older Antigravity estimate
+    node_older = build_thread_telemetry("t-agy-stale", tmp_path, agy_reader=mock_reader_older)
+    assert node_older.context_used_tokens == 40000
+    assert node_older.context_provenance == "measured"
+
+
+
+def test_native_subagent_context_estimation_with_zero_tokens(tmp_path: Path):
+    """Explicit zero token estimate is preserved with estimated provenance and single sample."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    parent_payload = {
+        "modelSelection": {"model": "gemini-3.8-flash"},
+        "lineage": {"parentThreadId": None, "rootThreadId": "t-parent-zero"}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-parent-zero", "proj", "Parent Zero", "antigravity", "full-access", "default",
+            "pt-pzero", "2026-11-03T10:00:00Z", "2026-11-03T10:10:00Z", None,
+            json.dumps(parent_payload), "antigravity_gemini"))
+
+    pt_payload = {
+        "nativeThreadRef": {"driver": "antigravity", "nativeId": "agy-parent-zero"},
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-pzero", "t-parent-zero", "node-1", "antigravity", "idle", "2026-11-03T10:10:00Z",
+            json.dumps(pt_payload), "antigravity", "antigravity_gemini"))
+    conn.commit()
+    conn.close()
+
+    def mock_agy_reader(native_id: str, t3_dir: Path, source_label: str = "main") -> ConversationTelemetry:
+        if native_id == "agy-parent-zero":
+            return ConversationTelemetry(
+                native_id=native_id,
+                child_native_ids=["native-child-zero"],
+                steps=[ModelStep(step_index=1, source=source_label, status="completed",
+                                 input_tokens=100, output_tokens=50, started_at="2026-11-03T10:01:00Z")]
+            )
+        elif native_id == "native-child-zero":
+            return ConversationTelemetry(
+                native_id=native_id,
+                steps=[ModelStep(step_index=1, source=source_label, status="completed",
+                                 input_tokens=0, cache_read_tokens=0, output_tokens=0,
+                                 started_at="2026-11-03T10:02:00Z")]
+            )
+        raise ValueError(f"Unknown native_id: {native_id}")
+
+    node = build_thread_telemetry("t-parent-zero", tmp_path, agy_reader=mock_agy_reader)
+    assert len(node.subagents) == 1
+    child = node.subagents[0]
+    assert child.native_id == "native-child-zero"
+    assert child.context_used_tokens == 0
+    assert child.context_provenance == "estimated"
+    assert child.context_limit is None
+    assert len(child.context_samples) == 1
+    assert child.context_samples[0].used_tokens == 0
+    assert child.context_samples[0].source_id == "native-child-zero:step:1"
+    assert child.context_samples[0].provider_thread_id == "native-child-zero"
+    assert child.active_provider_thread_id == "native-child-zero"
+    assert child.latest_step_label == "Model step #1"
+
+
+def test_native_subagent_context_empty_no_data(tmp_path: Path):
+    """Empty native subagent without steps remains unknown with no samples and no fake ceiling."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = setup_test_db(db_file)
+
+    parent_payload = {
+        "modelSelection": {"model": "gemini-3.8-flash"},
+        "lineage": {"parentThreadId": None, "rootThreadId": "t-parent-empty"}
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-parent-empty", "proj", "Parent Empty", "antigravity", "full-access", "default",
+            "pt-pempty", "2026-11-03T10:00:00Z", "2026-11-03T10:10:00Z", None,
+            json.dumps(parent_payload), "antigravity_gemini"))
+
+    pt_payload = {
+        "nativeThreadRef": {"driver": "antigravity", "nativeId": "agy-parent-empty"},
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-pempty", "t-parent-empty", "node-1", "antigravity", "idle", "2026-11-03T10:10:00Z",
+            json.dumps(pt_payload), "antigravity", "antigravity_gemini"))
+    conn.commit()
+    conn.close()
+
+    def mock_agy_reader(native_id: str, t3_dir: Path, source_label: str = "main") -> ConversationTelemetry:
+        if native_id == "agy-parent-empty":
+            return ConversationTelemetry(
+                native_id=native_id,
+                child_native_ids=["native-child-empty"],
+                steps=[ModelStep(step_index=1, source=source_label, status="completed",
+                                 input_tokens=100, output_tokens=50, started_at="2026-11-03T10:01:00Z")]
+            )
+        elif native_id == "native-child-empty":
+            return ConversationTelemetry(native_id=native_id, steps=[])
+        raise ValueError(f"Unknown native_id: {native_id}")
+
+    node = build_thread_telemetry("t-parent-empty", tmp_path, agy_reader=mock_agy_reader)
+    assert len(node.subagents) == 1
+    child = node.subagents[0]
+    assert child.native_id == "native-child-empty"
+    assert child.context_used_tokens == 0
+    assert child.context_provenance == "unknown"
+    assert child.context_limit is None
+    assert child.context_max_tokens == 1_048_576
+    assert child.context_limit_provenance == "default"
+    assert len(child.context_samples) == 0
+    assert child.latest_step_label is None

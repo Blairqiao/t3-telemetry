@@ -13,6 +13,8 @@ class ModelStep:
     step_index: int
     source: str = "main"
     status: str = "completed"
+    activity_kind: str = "model_step"
+    provider_turn_id: str | None = None
     input_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
@@ -26,13 +28,25 @@ class ModelStep:
     spawned_subagent_ids: list[str] = field(default_factory=list)
 
     @property
+    def kind(self) -> str:
+        return self.activity_kind
+
+    @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.cache_read_tokens + self.output_tokens
+
+    @property
+    def row_label(self) -> str:
+        if self.activity_kind == "provider_turn":
+            return f"Provider turn #{self.step_index}"
+        return f"Model step #{self.step_index}"
 
     @property
     def action_summary(self) -> str:
         if self.tool_calls:
             return ", ".join(self.tool_calls)
+        if self.activity_kind == "provider_turn":
+            return "unknown"
         if self.thinking_tokens > 0 and self.response_tokens > 0:
             return "think + reply"
         if self.thinking_tokens > 0:
@@ -41,8 +55,10 @@ class ModelStep:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        data["kind"] = self.activity_kind
         data["total_tokens"] = self.total_tokens
         data["action_summary"] = self.action_summary
+        data["row_label"] = self.row_label
         return data
 
 
@@ -88,6 +104,7 @@ class ProviderTurnRecord:
     response_tokens: int = 0
     output_tokens: int = 0
     usage_status: str = "unavailable"
+    usage_provenance: str = "unavailable"
 
 
 @dataclass(slots=True)
@@ -156,6 +173,8 @@ class TokenMetricsSummary:
     response_tokens: int = 0
     output_tokens: int = 0
     step_count: int = 0
+    provider_turn_count: int = 0
+    model_step_count: int = 0
     active_subagents: int = 0
     total_subagents: int = 0
     duration_seconds: float = 0.0
@@ -177,6 +196,20 @@ class TokenMetricsSummary:
             return 0.0
         return (self.thinking_tokens / self.output_tokens) * 100.0
 
+    @property
+    def steps_display(self) -> str:
+        if self.provider_turn_count > 0 and self.model_step_count > 0:
+            turn_str = "1 turn" if self.provider_turn_count == 1 else f"{self.provider_turn_count} turns"
+            step_str = "1 step" if self.model_step_count == 1 else f"{self.model_step_count} steps"
+            return f"{turn_str}, {step_str}"
+        if self.provider_turn_count > 0:
+            return "1 turn" if self.provider_turn_count == 1 else f"{self.provider_turn_count} turns"
+        if self.model_step_count > 0:
+            return "1 step" if self.model_step_count == 1 else f"{self.model_step_count} steps"
+        if self.step_count > 0:
+            return "1 step" if self.step_count == 1 else f"{self.step_count} steps"
+        return "0"
+
     def add_step(self, step: ModelStep) -> None:
         self.input_tokens += step.input_tokens
         self.cache_read_tokens += step.cache_read_tokens
@@ -185,6 +218,10 @@ class TokenMetricsSummary:
         self.response_tokens += step.response_tokens
         self.output_tokens += step.output_tokens
         self.step_count += 1
+        if step.activity_kind == "provider_turn":
+            self.provider_turn_count += 1
+        else:
+            self.model_step_count += 1
         self.duration_seconds += step.duration_seconds
 
     def add_summary(self, other: TokenMetricsSummary) -> None:
@@ -195,6 +232,8 @@ class TokenMetricsSummary:
         self.response_tokens += other.response_tokens
         self.output_tokens += other.output_tokens
         self.step_count += other.step_count
+        self.provider_turn_count += other.provider_turn_count
+        self.model_step_count += other.model_step_count
         self.duration_seconds += other.duration_seconds
 
     def to_dict(self) -> dict[str, Any]:
@@ -209,10 +248,71 @@ class TokenMetricsSummary:
             "cache_hit_pct": round(self.cache_hit_pct, 2),
             "thinking_pct": round(self.thinking_pct, 2),
             "step_count": self.step_count,
+            "provider_turn_count": self.provider_turn_count,
+            "model_step_count": self.model_step_count,
             "active_subagents": self.active_subagents,
             "total_subagents": self.total_subagents,
             "duration_seconds": round(self.duration_seconds, 3),
         }
+
+
+@dataclass(slots=True)
+class TurnMetrics(TokenMetricsSummary):
+    """Metrics for a single provider turn."""
+
+    ordinal: int | None = None
+    turn_id: str | None = None
+    status: str = "completed"
+    availability: str = "unavailable"
+    provenance: str = "exact"
+    activity_kind: str = "provider_turn"
+
+    def to_dict(self) -> dict[str, Any]:
+        data = super().to_dict()
+        data["ordinal"] = self.ordinal
+        data["turn_id"] = self.turn_id
+        data["status"] = self.status
+        data["availability"] = self.availability
+        data["provenance"] = self.provenance
+        data["activity_kind"] = self.activity_kind
+        return data
+
+
+@dataclass(slots=True)
+class ContextSample:
+    """A context occupancy reading at a point in time."""
+
+    source_id: str
+    used_tokens: int
+    timestamp: str | None = None
+    limit: int | None = None
+    provenance: str = "measured"  # "measured" or "estimated"
+    provider_thread_id: str | None = None
+    observed_at: str | None = None
+    timestamp_kind: str = "event"  # "event" or "observation"
+
+    @property
+    def source_identity(self) -> str:
+        return self.source_id
+
+    @property
+    def max_tokens(self) -> int | None:
+        return self.limit
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {
+            "source_id": self.source_id,
+            "used_tokens": self.used_tokens,
+            "timestamp": self.timestamp,
+            "limit": self.limit,
+            "provenance": self.provenance,
+            "provider_thread_id": self.provider_thread_id,
+        }
+        if self.observed_at is not None:
+            data["observed_at"] = self.observed_at
+        if self.timestamp_kind != "event":
+            data["timestamp_kind"] = self.timestamp_kind
+        return data
 
 
 @dataclass(slots=True)
@@ -228,19 +328,42 @@ class ThreadTelemetryNode:
     native_id: str | None = None
     status: str = "idle"
     updated_at: str | None = None
+    active_provider_thread_id: str | None = None
     context_used_tokens: int = 0
     context_max_tokens: int = 1048576
+    context_limit: int | None = None
+    context_provenance: str = "unknown"
+    context_limit_provenance: str = "default"
+    context_uncertainty: bool = False
+    context_samples: list[ContextSample] = field(default_factory=list)
     self_metrics: TokenMetricsSummary = field(default_factory=TokenMetricsSummary)
     rollup_metrics: TokenMetricsSummary = field(default_factory=TokenMetricsSummary)
+    current_turn_metrics: TurnMetrics | None = None
+    turn_metrics_availability: str = "unavailable"
+    latest_step_label: str | None = None
     steps: list[ModelStep] = field(default_factory=list)
     combined_steps: list[ModelStep] = field(default_factory=list)
     subagents: list[ThreadTelemetryNode] = field(default_factory=list)
 
     @property
+    def provider_thread_id(self) -> str | None:
+        return self.active_provider_thread_id
+
+    @property
+    def observed_peak_tokens(self) -> int:
+        vals = [self.context_used_tokens] + [s.used_tokens for s in self.context_samples]
+        return max(vals) if vals else 0
+
+    @property
+    def turn_metrics(self) -> TurnMetrics | None:
+        return self.current_turn_metrics
+
+    @property
     def context_pct(self) -> float:
-        if self.context_max_tokens <= 0:
+        lim = self.context_limit if self.context_limit is not None else self.context_max_tokens
+        if lim is None or lim <= 0:
             return 0.0
-        return min(100.0, (self.context_used_tokens / self.context_max_tokens) * 100.0)
+        return min(100.0, (self.context_used_tokens / lim) * 100.0)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -251,13 +374,22 @@ class ThreadTelemetryNode:
             "model": self.model,
             "thinking_level": self.thinking_level,
             "native_id": self.native_id,
+            "active_provider_thread_id": self.active_provider_thread_id,
             "status": self.status,
             "updated_at": self.updated_at,
             "context_used_tokens": self.context_used_tokens,
             "context_max_tokens": self.context_max_tokens,
+            "context_limit": self.context_limit,
+            "context_provenance": self.context_provenance,
+            "context_limit_provenance": self.context_limit_provenance,
+            "context_uncertainty": self.context_uncertainty,
             "context_pct": round(self.context_pct, 2),
+            "context_samples": [s.to_dict() for s in self.context_samples],
             "self_metrics": self.self_metrics.to_dict(),
             "rollup_metrics": self.rollup_metrics.to_dict(),
+            "current_turn_metrics": self.current_turn_metrics.to_dict() if self.current_turn_metrics else None,
+            "turn_metrics_availability": self.turn_metrics_availability,
+            "latest_step_label": self.latest_step_label,
             "steps": [s.to_dict() for s in self.steps],
             "subagents": [c.to_dict() for c in self.subagents],
         }

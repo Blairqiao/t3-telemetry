@@ -204,25 +204,55 @@ def read_t3_state(t3_dir: Path | str) -> T3StateSnapshot:
                 used_tokens = token_usage.get("usedTokens")
                 max_tokens = token_usage.get("maxTokens")
 
-                turn_token_usage = payload.get("turnTokenUsage") or {}
-                usage_status = turn_token_usage.get("usageStatus", "unavailable")
+                turn_token_usage = payload.get("turnTokenUsage")
+                usage_provenance = "unavailable"
+                usage_status = "unavailable"
+                input_tokens = 0
+                cache_read = 0
+                cache_creation = 0
+                output_tokens = 0
+                thinking = 0
+                response_tokens = 0
 
-                input_tokens = int(turn_token_usage.get("inputTokens") or 0)
-                cache_read = int(turn_token_usage.get("cachedInputTokens") or 0)
-                cache_creation = int(turn_token_usage.get("cacheCreationTokens") or 0)
-                output_tokens = int(turn_token_usage.get("outputTokens") or 0)
-                thinking = int(
-                    turn_token_usage.get("reasoningTokens")
-                    or turn_token_usage.get("reasoningOutputTokens")
-                    or 0
-                )
-                response_tokens = max(0, output_tokens - thinking)
-
-                # Fallback to tokenUsage if turnTokenUsage is unavailable and not Antigravity
-                if (usage_status == "unavailable" or (input_tokens == 0 and output_tokens == 0)) and driver != "antigravity":
-                    if token_usage.get("inputTokens") or token_usage.get("outputTokens"):
+                if turn_token_usage is not None and isinstance(turn_token_usage, dict):
+                    raw_status = turn_token_usage.get("usageStatus", "unavailable")
+                    if raw_status != "unavailable":
+                        usage_status = raw_status
+                        usage_provenance = "exact"
+                        input_tokens = int(turn_token_usage.get("inputTokens") or 0)
+                        cache_read = int(turn_token_usage.get("cachedInputTokens") or 0)
+                        cache_creation = int(turn_token_usage.get("cacheCreationTokens") or 0)
+                        output_tokens = int(turn_token_usage.get("outputTokens") or 0)
+                        thinking = int(
+                            turn_token_usage.get("reasoningTokens")
+                            or turn_token_usage.get("reasoningOutputTokens")
+                            or 0
+                        )
+                        response_tokens = max(0, output_tokens - thinking)
+                    else:
+                        # turnTokenUsage explicitly unavailable, check fallback for non-antigravity
+                        if driver != "antigravity" and (token_usage.get("inputTokens") or token_usage.get("outputTokens")):
+                            input_tokens = int(token_usage.get("inputTokens") or 0)
+                            cache_read = int(token_usage.get("cachedInputTokens") or 0)
+                            cache_creation = int(token_usage.get("cacheCreationTokens") or 0)
+                            output_tokens = int(token_usage.get("outputTokens") or 0)
+                            thinking = int(
+                                token_usage.get("reasoningTokens")
+                                or token_usage.get("reasoningOutputTokens")
+                                or 0
+                            )
+                            response_tokens = max(0, output_tokens - thinking)
+                            usage_status = "complete"
+                            usage_provenance = "cumulative_fallback"
+                        else:
+                            usage_status = "unavailable"
+                            usage_provenance = "unavailable"
+                else:
+                    # turnTokenUsage absent, fallback to tokenUsage if non-antigravity
+                    if driver != "antigravity" and (token_usage.get("inputTokens") or token_usage.get("outputTokens")):
                         input_tokens = int(token_usage.get("inputTokens") or 0)
                         cache_read = int(token_usage.get("cachedInputTokens") or 0)
+                        cache_creation = int(token_usage.get("cacheCreationTokens") or 0)
                         output_tokens = int(token_usage.get("outputTokens") or 0)
                         thinking = int(
                             token_usage.get("reasoningTokens")
@@ -231,6 +261,10 @@ def read_t3_state(t3_dir: Path | str) -> T3StateSnapshot:
                         )
                         response_tokens = max(0, output_tokens - thinking)
                         usage_status = "complete"
+                        usage_provenance = "cumulative_fallback"
+                    else:
+                        usage_status = "unavailable"
+                        usage_provenance = "unavailable"
 
                 turn_record = ProviderTurnRecord(
                     provider_turn_id=row["provider_turn_id"],
@@ -252,6 +286,7 @@ def read_t3_state(t3_dir: Path | str) -> T3StateSnapshot:
                     response_tokens=response_tokens,
                     output_tokens=output_tokens,
                     usage_status=usage_status,
+                    usage_provenance=usage_provenance,
                 )
                 snapshot.provider_turns_by_thread.setdefault(th_id, []).append(turn_record)
 

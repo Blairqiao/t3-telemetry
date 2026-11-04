@@ -6,12 +6,286 @@ from pathlib import Path
 from typing import Callable
 
 from t3_telemetry.db_t3 import T3StateSnapshot, read_t3_state
+from datetime import datetime
+
 from t3_telemetry.models import (
+    ContextSample,
     ConversationTelemetry,
     ModelStep,
     ThreadTelemetryNode,
     TokenMetricsSummary,
+    TurnMetrics,
 )
+
+
+def parse_iso_timestamp(ts: str | None) -> float | None:
+    """Parse ISO-8601 timestamp string into epoch float timestamp, or None."""
+    if not ts:
+        return None
+    try:
+        s = ts.replace("Z", "+00:00")
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+
+def extract_turn_metrics(
+    driver: str,
+    status: str,
+    turns: list,
+) -> tuple[TurnMetrics, str]:
+    """Extract current or latest completed provider turn metrics.
+
+    Returns (turn_metrics, availability), where availability is 'available', 'partial', or 'unavailable'.
+    """
+    if driver == "antigravity":
+        return TurnMetrics(availability="unavailable", provenance="unavailable"), "unavailable"
+
+    if status == "running":
+        running_turns = [t for t in turns if t.status == "running"]
+        target = running_turns[-1] if running_turns else (turns[-1] if turns else None)
+    else:
+        completed_turns = [t for t in turns if t.status in ("completed", "idle")]
+        target = completed_turns[-1] if completed_turns else (turns[-1] if turns else None)
+
+    if target is None:
+        return TurnMetrics(availability="unavailable", provenance="unavailable"), "unavailable"
+
+    if target.usage_provenance == "cumulative_fallback":
+        return (
+            TurnMetrics(
+                ordinal=target.ordinal,
+                turn_id=target.provider_turn_id,
+                status=target.status,
+                availability="unavailable",
+                provenance="cumulative_fallback",
+                duration_seconds=target.duration_seconds,
+            ),
+            "unavailable",
+        )
+
+    if target.usage_provenance == "exact":
+        if target.usage_status == "complete":
+            return (
+                TurnMetrics(
+                    ordinal=target.ordinal,
+                    turn_id=target.provider_turn_id,
+                    status=target.status,
+                    availability="available",
+                    provenance="exact",
+                    input_tokens=target.input_tokens,
+                    cache_read_tokens=target.cache_read_tokens,
+                    cache_creation_tokens=target.cache_creation_tokens,
+                    thinking_tokens=target.thinking_tokens,
+                    response_tokens=target.response_tokens,
+                    output_tokens=target.output_tokens,
+                    duration_seconds=target.duration_seconds,
+                    step_count=1,
+                    provider_turn_count=1,
+                ),
+                "available",
+            )
+        elif target.usage_status == "partial":
+            return (
+                TurnMetrics(
+                    ordinal=target.ordinal,
+                    turn_id=target.provider_turn_id,
+                    status=target.status,
+                    availability="partial",
+                    provenance="exact",
+                    input_tokens=target.input_tokens,
+                    cache_read_tokens=target.cache_read_tokens,
+                    cache_creation_tokens=target.cache_creation_tokens,
+                    thinking_tokens=target.thinking_tokens,
+                    response_tokens=target.response_tokens,
+                    output_tokens=target.output_tokens,
+                    duration_seconds=target.duration_seconds,
+                    step_count=1,
+                    provider_turn_count=1,
+                ),
+                "partial",
+            )
+        else:
+            return (
+                TurnMetrics(
+                    ordinal=target.ordinal,
+                    turn_id=target.provider_turn_id,
+                    status=target.status,
+                    availability="unavailable",
+                    provenance="exact",
+                    duration_seconds=target.duration_seconds,
+                ),
+                "unavailable",
+            )
+
+    return (
+        TurnMetrics(
+            ordinal=target.ordinal,
+            turn_id=target.provider_turn_id,
+            status=target.status,
+            availability="unavailable",
+            provenance="unavailable",
+            duration_seconds=target.duration_seconds,
+        ),
+        "unavailable",
+    )
+
+
+def extract_context_telemetry(
+    *,
+    turns: list[ProviderTurnRecord] | None = None,
+    active_pt_id: str | None = None,
+    pt: ProviderThreadRecord | None = None,
+    is_antigravity: bool = False,
+    agy_steps: list[ModelStep] | None = None,
+    native_id: str | None = None,
+) -> tuple[int, int, int | None, str, str, bool, list[ContextSample], str | None]:
+    """Reconstruct context history and determine freshest applicable reading.
+
+    Returns:
+        (context_used_tokens, context_max_tokens, context_limit, context_provenance,
+         context_limit_provenance, context_uncertainty, context_samples, latest_step_label)
+    """
+    turns = turns or []
+    agy_steps = agy_steps or []
+
+    # 1. Filter provider turns to active provider thread
+    if active_pt_id:
+        turns_for_active_pt = [t for t in turns if t.provider_thread_id == active_pt_id]
+    else:
+        turns_for_active_pt = list(turns)
+
+    pt_for_active = pt if (pt and (not active_pt_id or pt.provider_thread_id == active_pt_id)) else None
+
+    # 2. Collect measured samples
+    measured_samples: list[ContextSample] = []
+    for turn in turns_for_active_pt:
+        if turn.used_tokens is not None:
+            limit = turn.max_tokens if (turn.max_tokens is not None and turn.max_tokens > 0) else None
+            ts = turn.completed_at or turn.started_at
+            measured_samples.append(
+                ContextSample(
+                    source_id=turn.provider_turn_id,
+                    used_tokens=turn.used_tokens,
+                    timestamp=ts,
+                    limit=limit,
+                    provenance="measured",
+                    provider_thread_id=turn.provider_thread_id,
+                )
+            )
+
+    if not measured_samples and pt_for_active and pt_for_active.used_tokens is not None:
+        limit = pt_for_active.max_tokens if (pt_for_active.max_tokens is not None and pt_for_active.max_tokens > 0) else None
+        measured_samples.append(
+            ContextSample(
+                source_id=f"pt:{pt_for_active.provider_thread_id}",
+                used_tokens=pt_for_active.used_tokens,
+                timestamp=pt_for_active.updated_at,
+                limit=limit,
+                provenance="measured",
+                provider_thread_id=pt_for_active.provider_thread_id,
+            )
+        )
+
+    # 3. Collect estimated samples from Antigravity
+    estimated_samples: list[ContextSample] = []
+    if is_antigravity and agy_steps:
+        for s in agy_steps:
+            inf_tok = s.input_tokens + s.cache_read_tokens + s.output_tokens
+            ts = s.completed_at or s.started_at
+            source_id = f"{native_id}:step:{s.step_index}" if native_id else f"step:{s.step_index}"
+            estimated_samples.append(
+                ContextSample(
+                    source_id=source_id,
+                    used_tokens=inf_tok,
+                    timestamp=ts,
+                    limit=None,
+                    provenance="estimated",
+                    provider_thread_id=active_pt_id,
+                )
+            )
+
+    # 4. Determine freshest applicable sample and recency uncertainty
+    latest_measured: ContextSample | None = None
+    uncertainty = False
+
+    if measured_samples:
+        ts_values = [parse_iso_timestamp(s.timestamp) for s in measured_samples]
+        if all(t is not None for t in ts_values):
+            measured_samples.sort(key=lambda s: parse_iso_timestamp(s.timestamp) or 0.0)
+            latest_measured = measured_samples[-1]
+            ts_set = {s.timestamp for s in measured_samples}
+            uncertainty = (len(ts_set) < len(measured_samples))
+        else:
+            latest_measured = measured_samples[-1]
+            uncertainty = True
+
+    latest_estimated: ContextSample | None = None
+    if estimated_samples:
+        latest_estimated = estimated_samples[-1]
+
+    # Rule: Measured provider context wins over rough Antigravity estimate unless provably stale
+    context_uncertainty = False
+    if latest_measured is not None and latest_estimated is not None:
+        t_meas = parse_iso_timestamp(latest_measured.timestamp)
+        t_est = parse_iso_timestamp(latest_estimated.timestamp)
+        if t_meas is not None and t_est is not None and t_est > t_meas:
+            selected_sample = latest_estimated
+        else:
+            selected_sample = latest_measured
+            context_uncertainty = uncertainty
+    elif latest_measured is not None:
+        selected_sample = latest_measured
+        context_uncertainty = uncertainty
+    elif latest_estimated is not None:
+        selected_sample = latest_estimated
+    else:
+        selected_sample = None
+
+    # 5. Populate context fields and samples
+    all_samples: list[ContextSample] = []
+    if measured_samples and estimated_samples:
+        all_samples = list(measured_samples) + list(estimated_samples)
+        all_samples.sort(key=lambda s: parse_iso_timestamp(s.timestamp) or 0.0)
+    elif measured_samples:
+        all_samples = list(measured_samples)
+    elif estimated_samples:
+        all_samples = list(estimated_samples)
+
+    context_samples = all_samples[-50:]
+
+    if selected_sample is not None:
+        context_used_tokens = selected_sample.used_tokens
+        context_provenance = selected_sample.provenance
+        if selected_sample.limit is not None and selected_sample.limit > 0:
+            context_limit = selected_sample.limit
+            context_max_tokens = selected_sample.limit
+            context_limit_provenance = "measured"
+        else:
+            context_limit = None
+            context_max_tokens = 1_048_576
+            context_limit_provenance = "default"
+    else:
+        context_used_tokens = 0
+        context_provenance = "unknown"
+        context_limit = None
+        context_max_tokens = 1_048_576
+        context_limit_provenance = "default"
+
+    latest_step_label = None
+    if is_antigravity and agy_steps:
+        latest_step_label = f"Model step #{agy_steps[-1].step_index}"
+
+    return (
+        context_used_tokens,
+        context_max_tokens,
+        context_limit,
+        context_provenance,
+        context_limit_provenance,
+        context_uncertainty,
+        context_samples,
+        latest_step_label,
+    )
 
 
 def build_thread_telemetry(
@@ -59,6 +333,21 @@ def build_thread_telemetry(
         model = "unknown"
         thinking_level = None
         updated_at = pt.updated_at if pt else None
+
+    # Identify active provider thread
+    active_pt_id = None
+    if app_thread and app_thread.active_provider_thread_id:
+        active_pt_id = app_thread.active_provider_thread_id
+    elif pt and pt.provider_thread_id:
+        active_pt_id = pt.provider_thread_id
+    elif turns:
+        active_pt_id = turns[-1].provider_thread_id
+
+    # If pt is not for active_pt_id, lookup matching pt
+    if active_pt_id and (not pt or pt.provider_thread_id != active_pt_id):
+        pt_candidate = snapshot.provider_threads.get(active_pt_id)
+        if pt_candidate:
+            pt = pt_candidate
 
     if pt:
         if not driver:
@@ -124,40 +413,48 @@ def build_thread_telemetry(
                     step_index=turn.ordinal,
                     source=source_label,
                     status=turn.status,
+                    activity_kind="provider_turn",
+                    provider_turn_id=turn.provider_turn_id,
                     input_tokens=turn.input_tokens,
                     cache_read_tokens=turn.cache_read_tokens,
                     cache_creation_tokens=turn.cache_creation_tokens,
                     thinking_tokens=turn.thinking_tokens,
                     response_tokens=turn.response_tokens,
                     output_tokens=turn.output_tokens,
-                    tool_calls=[f"turn #{turn.ordinal}"],
+                    tool_calls=[],
                     started_at=turn.started_at,
                     completed_at=turn.completed_at,
                     duration_seconds=turn.duration_seconds,
                 )
                 steps.append(step)
 
-    # Context window usage
-    context_used_tokens = pt.used_tokens if pt and pt.used_tokens is not None else 0
-    context_max_tokens = pt.max_tokens if pt and pt.max_tokens is not None else 1_048_576
-
-    for turn in turns:
-        if turn.used_tokens is not None and turn.used_tokens > context_used_tokens:
-            context_used_tokens = turn.used_tokens
-        if turn.max_tokens is not None and turn.max_tokens > 0:
-            context_max_tokens = turn.max_tokens
-
-    if is_antigravity and agy_telemetry:
-        if context_used_tokens == 0 or agy_telemetry.latest_context_tokens > context_used_tokens:
-            context_used_tokens = agy_telemetry.latest_context_tokens
-
-    if context_max_tokens is None or context_max_tokens <= 0:
-        context_max_tokens = 1_048_576
+    (
+        context_used_tokens,
+        context_max_tokens,
+        context_limit,
+        context_provenance,
+        context_limit_provenance,
+        context_uncertainty,
+        context_samples,
+        latest_step_label,
+    ) = extract_context_telemetry(
+        turns=turns,
+        active_pt_id=active_pt_id,
+        pt=pt,
+        is_antigravity=is_antigravity,
+        agy_steps=agy_telemetry.steps if (is_antigravity and agy_telemetry) else None,
+        native_id=native_id,
+    )
 
     # Self metrics
     self_metrics = TokenMetricsSummary()
     for s in steps:
         self_metrics.add_step(s)
+
+    # Current / Latest provider turn metrics
+    current_turn_metrics, turn_metrics_availability = extract_turn_metrics(driver, status, turns)
+
+
 
     node = ThreadTelemetryNode(
         thread_id=thread_id,
@@ -169,9 +466,18 @@ def build_thread_telemetry(
         native_id=native_id,
         status=status,
         updated_at=updated_at,
+        active_provider_thread_id=active_pt_id,
         context_used_tokens=context_used_tokens,
         context_max_tokens=context_max_tokens,
+        context_limit=context_limit,
+        context_provenance=context_provenance,
+        context_limit_provenance=context_limit_provenance,
+        context_uncertainty=context_uncertainty,
+        context_samples=context_samples,
         self_metrics=self_metrics,
+        current_turn_metrics=current_turn_metrics,
+        turn_metrics_availability=turn_metrics_availability,
+        latest_step_label=latest_step_label,
         steps=steps,
     )
 
@@ -263,6 +569,22 @@ def build_thread_telemetry(
             c_rollup = TokenMetricsSummary()
             c_rollup.add_summary(c_self)
 
+            (
+                c_used_tokens,
+                c_max_tokens,
+                c_limit,
+                c_provenance,
+                c_limit_provenance,
+                c_uncertainty,
+                c_context_samples,
+                c_latest_step_label,
+            ) = extract_context_telemetry(
+                is_antigravity=True,
+                agy_steps=child_steps,
+                native_id=child_native_id,
+                active_pt_id=child_native_id,
+            )
+
             child_node = ThreadTelemetryNode(
                 thread_id=child_native_id,
                 title=f"Native subagent {child_native_id[:8]}",
@@ -271,6 +593,15 @@ def build_thread_telemetry(
                 model=child_conv.model_name or model if child_conv else model,
                 native_id=child_native_id,
                 status="completed",
+                active_provider_thread_id=child_native_id,
+                context_used_tokens=c_used_tokens,
+                context_max_tokens=c_max_tokens,
+                context_limit=c_limit,
+                context_provenance=c_provenance,
+                context_limit_provenance=c_limit_provenance,
+                context_uncertainty=c_uncertainty,
+                context_samples=c_context_samples,
+                latest_step_label=c_latest_step_label,
                 self_metrics=c_self,
                 rollup_metrics=c_rollup,
                 steps=child_steps,
@@ -338,6 +669,11 @@ def resolve_thread(
 ) -> ThreadTelemetryNode | None:
     """Resolve a thread by query (or latest active root thread if query is None)."""
     snapshot = read_t3_state(t3_dir)
+    return resolve_thread_in_snapshot(t3_dir, snapshot, query, agy_reader)
+
+
+def resolve_thread_id_in_snapshot(snapshot: T3StateSnapshot, query: str | None = None) -> str | None:
+    """Resolve a thread ID purely from a snapshot without building telemetry."""
     if not snapshot.threads:
         return None
 
@@ -352,30 +688,43 @@ def resolve_thread(
             return None
 
         root_candidates.sort(key=lambda t: t.updated_at or t.created_at or "", reverse=True)
-        return build_thread_telemetry(root_candidates[0].thread_id, t3_dir, snapshot=snapshot, agy_reader=agy_reader)
+        return root_candidates[0].thread_id
 
     q = query.strip().lower()
 
     # 1. Exact thread_id
     for t in snapshot.threads.values():
         if t.thread_id == query.strip():
-            return build_thread_telemetry(t.thread_id, t3_dir, snapshot=snapshot, agy_reader=agy_reader)
+            return t.thread_id
 
     # 2. Prefix thread_id
     matches = [t for t in snapshot.threads.values() if t.thread_id.lower().startswith(q)]
     if matches:
         matches.sort(key=lambda t: t.updated_at or t.created_at or "", reverse=True)
-        return build_thread_telemetry(matches[0].thread_id, t3_dir, snapshot=snapshot, agy_reader=agy_reader)
+        return matches[0].thread_id
 
     # 3. Provider native_id match
     for pt in snapshot.provider_threads.values():
         if pt.native_id and pt.native_id.lower().startswith(q) and pt.thread_id in snapshot.threads:
-            return build_thread_telemetry(pt.thread_id, t3_dir, snapshot=snapshot, agy_reader=agy_reader)
+            return pt.thread_id
 
     # 4. Title substring (case-insensitive)
     title_matches = [t for t in snapshot.threads.values() if q in (t.title or "").lower()]
     if title_matches:
         title_matches.sort(key=lambda t: t.updated_at or t.created_at or "", reverse=True)
-        return build_thread_telemetry(title_matches[0].thread_id, t3_dir, snapshot=snapshot, agy_reader=agy_reader)
+        return title_matches[0].thread_id
 
     return None
+
+
+def resolve_thread_in_snapshot(
+    t3_dir: Path | str,
+    snapshot: T3StateSnapshot,
+    query: str | None = None,
+    agy_reader: Callable[[str, Path, str], ConversationTelemetry] | None = None,
+) -> ThreadTelemetryNode | None:
+    """Resolve a query using an already loaded snapshot and return built node."""
+    thread_id = resolve_thread_id_in_snapshot(snapshot, query)
+    if thread_id is None:
+        return None
+    return build_thread_telemetry(thread_id, t3_dir, snapshot=snapshot, agy_reader=agy_reader)

@@ -345,3 +345,109 @@ def test_read_t3_state_fallback_token_usage_when_turn_token_usage_absent(tmp_pat
     assert turn.thinking_tokens == 100
     assert turn.response_tokens == 400
     assert turn.usage_status == "complete"
+
+
+def test_db_t3_exact_turn_token_usage_with_zero_tokens(tmp_path: Path):
+    """Zero reported exact usage differs from unavailable and does not trigger fallback."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = sqlite3.connect(db_file)
+    create_schema(conn)
+
+    turn_payload = {
+        "nativeTurnRef": {"driver": "claudeAgent", "nativeId": "turn-zero"},
+        "tokenUsage": {
+            "inputTokens": 5000,
+            "outputTokens": 1000
+        },
+        "turnTokenUsage": {
+            "usageStatus": "complete",
+            "inputTokens": 0,
+            "cachedInputTokens": 0,
+            "outputTokens": 0,
+            "reasoningTokens": 0
+        }
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-z", "t-z", "pt-z", "n-1", 1, "completed",
+            "2026-11-03T10:00:00Z", "2026-11-03T10:00:05Z", json.dumps(turn_payload)))
+    conn.commit()
+    conn.close()
+
+    snapshot = read_t3_state(tmp_path)
+    turn = snapshot.provider_turns_by_thread["t-z"][0]
+    assert turn.usage_provenance == "exact"
+    assert turn.usage_status == "complete"
+    assert turn.input_tokens == 0
+    assert turn.output_tokens == 0
+    assert turn.thinking_tokens == 0
+    assert turn.response_tokens == 0
+
+
+def test_db_t3_partial_turn_token_usage(tmp_path: Path):
+    """Partial turn token usage retains exact provenance with partial status."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = sqlite3.connect(db_file)
+    create_schema(conn)
+
+    turn_payload = {
+        "nativeTurnRef": {"driver": "claudeAgent", "nativeId": "turn-partial"},
+        "turnTokenUsage": {
+            "usageStatus": "partial",
+            "inputTokens": 1200,
+            "cachedInputTokens": 300,
+            "outputTokens": 0,
+            "reasoningTokens": 0
+        }
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-p", "t-p", "pt-p", "n-1", 1, "running",
+            "2026-11-03T10:00:00Z", None, json.dumps(turn_payload)))
+    conn.commit()
+    conn.close()
+
+    snapshot = read_t3_state(tmp_path)
+    turn = snapshot.provider_turns_by_thread["t-p"][0]
+    assert turn.usage_provenance == "exact"
+    assert turn.usage_status == "partial"
+    assert turn.input_tokens == 1200
+    assert turn.cache_read_tokens == 300
+    assert turn.output_tokens == 0
+
+
+def test_db_t3_fallback_token_usage_records_provenance(tmp_path: Path):
+    """Fallback token usage has cumulative_fallback provenance."""
+    db_file = tmp_path / "statev2.sqlite"
+    conn = sqlite3.connect(db_file)
+    create_schema(conn)
+
+    turn_payload = {
+        "nativeTurnRef": {"driver": "codex", "nativeId": "turn-fb-prov"},
+        "tokenUsage": {
+            "inputTokens": 8000,
+            "cachedInputTokens": 2000,
+            "outputTokens": 400,
+            "reasoningOutputTokens": 100
+        }
+    }
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-fbp", "t-fbp", "pt-fbp", "n-1", 1, "completed",
+            "2026-11-03T10:00:00Z", "2026-11-03T10:00:10Z", json.dumps(turn_payload)))
+    conn.commit()
+    conn.close()
+
+    snapshot = read_t3_state(tmp_path)
+    turn = snapshot.provider_turns_by_thread["t-fbp"][0]
+    assert turn.usage_provenance == "cumulative_fallback"
+    assert turn.usage_status == "complete"
+    assert turn.input_tokens == 8000
+    assert turn.cache_read_tokens == 2000
+    assert turn.output_tokens == 400

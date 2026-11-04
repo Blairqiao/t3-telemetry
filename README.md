@@ -22,6 +22,8 @@ uv run t3-top [options]
 
 Live watch mode monitors the most recently active thread in real time, refreshing at a configurable polling interval:
 
+Live mode opens the app-thread list. Passing a thread query opens that thread's detail screen initially. The summary strip continues to follow the latest active root thread unless `--no-follow` is set; with that option, it stays pinned to the initially resolved root.
+
 ```bash
 # Watch the latest active thread (auto-follows newly active threads)
 t3-top
@@ -80,6 +82,63 @@ By default, `t3-top` reads from `~/.t3/userdata`. You can override this location
 ```bash
 t3-top --t3-dir /path/to/custom/userdata --once
 ```
+
+### Terminal navigation and controls
+
+Live watch mode provides an interactive terminal browser with full keyboard navigation across root application threads and subagent trees:
+
+- Up / Down or k / j: Move selection in the thread list, scroll the activity stream on detail screens, or change subagent selection when the subagent pane is focused.
+- Tab: Switch focus between activity stream scrolling and the subagents table on detail screens.
+- Enter: Open the detail screen for the selected app thread, or drill down into a highlighted child subagent.
+- Escape: Return to the parent thread or navigate back to the root thread list.
+- q or Ctrl-C: Exit t3-top cleanly and restore the terminal to canonical cooked mode.
+
+#### Screens and breadcrumbs
+
+The browser supports hierarchical navigation across two primary view levels:
+
+1. Thread list screen: Displays root application threads ordered by most recent update, with model labels and status-colored titles.
+2. Detail screen: Displays the summary header, three-scope token metrics, context occupancy graph, immediate subagents table, and recent activity stream for the active thread.
+
+When drilling down into child or native subagents, a breadcrumb header (for example, `Root Thread > Child Subagent > Grandchild`) indicates the active lineage depth. Pressing Escape ascends the stack one level at a time, preserving previous cursor selections and scroll positions.
+
+#### Summary follow and selection pinning
+
+The top telemetry header operates independently of the selected screen:
+
+- In default live watch mode, the summary header automatically follows the latest active root thread across the workspace, while the detail body remains focused on whichever thread the user selected.
+- Passing a thread query on the command line initially resolves and focuses that thread in the detail view.
+- Passing `--no-follow` pins the summary header to the initial thread rather than following newly active threads.
+
+#### Metric scopes and activity kinds
+
+Token telemetry is reported across three explicit scopes:
+
+1. Current turn: Metrics for the active or latest provider turn. If an active turn is still in-flight or the provider has not yet published token counts, current turn availability is reported as unavailable rather than inventing zero usage.
+2. Whole chat · this agent: Metrics consumed directly by the inspected agent, excluding child activity.
+3. Chat + subagents: Totals for the inspected agent and its descendants. Child activity stays separate from the agent's own activity.
+
+Provider turns (Claude or Codex turn boundaries) and model inference steps (Antigravity steps) are tracked distinctly via `provider_turn_count` and `model_step_count`. Duration is the sum of recorded agent step and turn durations. Concurrent subagents can overlap, so this total is not wall-clock elapsed time.
+
+#### Context window occupancy and history
+
+The context graph visualizes memory utilization against known token limits:
+
+- Context provenance: Labeled as `Measured` when obtained from provider thread records, `Estimated` when reconstructed from Antigravity inference steps, or `Unknown` when omitted.
+- Missing and default limits: Known context limits (such as 200k for Claude or 1M for Gemini) are displayed when recorded by the provider. If the limit is unspecified, it is reported as unknown rather than displaying arbitrary defaults as measured.
+- Context drops: A decrease is labeled as a context drop. The graph retains the peak within its retained history; a drop alone does not establish that compaction occurred.
+- In-memory retention: Context history is retained across live polling ticks and navigation switches using an in-memory LRU store bounded to at most 256 samples per agent for up to 64 recently viewed agents. Unchanged poll samples are deduplicated, and no persistent data is written back to upstream databases.
+
+#### Color legend and status indicators
+
+- Green: Running thread status or context occupancy below 60%.
+- Yellow: Cancelled thread titles, context drops, or context occupancy between 60% and 85%.
+- Red: Failed thread status or context occupancy exceeding 85%.
+- Dim text: Idle or completed thread titles, unknown context limits, or secondary metadata.
+
+#### Noninteractive behavior
+
+In headless environments, CI pipelines, or when stdout is redirected to a pipe, t3-top detects the non-TTY stream and disables raw keyboard handling, printing a single snapshot or structured JSON and exiting immediately.
 
 ## Ghostty terminal integration
 
