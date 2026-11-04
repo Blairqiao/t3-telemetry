@@ -20,6 +20,7 @@ from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
+from t3_telemetry.activity import build_activity_entries, launch_targets
 from t3_telemetry.aggregator import (
     build_thread_telemetry,
     list_root_threads,
@@ -32,9 +33,24 @@ from datetime import datetime, timezone
 from t3_telemetry.context_history import ContextHistoryStore, make_agent_key
 from t3_telemetry.models import AppThreadRecord, ContextSample, ThreadTelemetryNode
 from t3_telemetry.terminal import PosixTerminalAdapter
-from t3_telemetry.tui import NavigationState, ScreenState, TelemetryBrowser, TerminalAdapter, Viewport
+from t3_telemetry.tui import (
+    NavigationState,
+    ScreenState,
+    TelemetryBrowser,
+    TerminalAdapter,
+    Viewport,
+    table_geometry,
+    table_header_lines,
+    window_start,
+)
 from t3_telemetry.ui import (
+    SELECTED_ROW_STYLE,
+    activity_range_label,
+    build_activity_detail_lines,
+    build_activity_table,
     build_dashboard_renderable,
+    context_graph_lines,
+    context_graph_min_height,
     render_context_graph,
     build_scopes_summary,
     build_scopes_table,
@@ -185,7 +201,10 @@ def run_live_loop(
             stack_sig,
             cur_screen.focus if cur_screen else None,
             cur_screen.selected_child_id if cur_screen else None,
-            cur_screen.activity_scroll if cur_screen else None,
+            cur_screen.selected_activity_id if cur_screen else None,
+            cur_screen.activity_offset if cur_screen else None,
+            cur_screen.detail_activity_id if cur_screen else None,
+            cur_screen.detail_scroll if cur_screen else None,
             cur_screen.child_scroll if cur_screen else None,
             nav.list_scroll,
             nav.notice,
@@ -272,11 +291,9 @@ def run_live_loop(
                             cur_screen = browser.navigation.current_screen
                             if cur_screen:
                                 cur_screen.title = node.title
-                                cur_screen.child_ids = [c.thread_id for c in node.subagents]
-                                if not cur_screen.selected_child_id and cur_screen.child_ids:
-                                    cur_screen.selected_child_id = cur_screen.child_ids[0]
-                                elif cur_screen.selected_child_id not in cur_screen.child_ids and cur_screen.child_ids:
-                                    cur_screen.selected_child_id = cur_screen.child_ids[0]
+                                browser.navigation.sync_children([c.thread_id for c in node.subagents])
+                                feed = build_activity_entries(node, args.max_steps)
+                                browser.navigation.sync_activities([e.entry_id for e in feed], launch_targets(feed))
                         cached_node = node
 
                         def sample_agent_context(target_node: ThreadTelemetryNode | None) -> None:
@@ -322,6 +339,8 @@ def run_live_loop(
                             )
                             cached_frame = frame
                             live.update(frame, refresh=True)
+                            # The frame may settle list offsets; record the settled state.
+                            last_signature = compute_signature(roots, summary, node, browser.navigation, last_size)
                     except (sqlite3.Error, OSError) as e:
                         frame = Panel(f"[yellow]Database unavailable: {e}[/]", title="T3 Telemetry")
                         if str(e) != last_signature:
@@ -362,11 +381,9 @@ def run_live_loop(
                         cur_screen = browser.navigation.current_screen
                         if cur_screen:
                             cur_screen.title = cached_node.title
-                            cur_screen.child_ids = [c.thread_id for c in cached_node.subagents]
-                            if not cur_screen.selected_child_id and cur_screen.child_ids:
-                                cur_screen.selected_child_id = cur_screen.child_ids[0]
-                            elif cur_screen.selected_child_id not in cur_screen.child_ids and cur_screen.child_ids:
-                                cur_screen.selected_child_id = cur_screen.child_ids[0]
+                            browser.navigation.sync_children([c.thread_id for c in cached_node.subagents])
+                            feed = build_activity_entries(cached_node, args.max_steps)
+                            browser.navigation.sync_activities([e.entry_id for e in feed], launch_targets(feed))
 
                     if cached_node is not None:
                         node_key = make_agent_key(cached_node)
@@ -439,6 +456,288 @@ def run_live_loop(
     return 0
 
 
+def _context_text(node: ThreadTelemetryNode) -> str:
+    if node.context_limit is not None and node.context_limit > 0:
+        return f"Context: {format_tokens(node.context_used_tokens)}/{format_tokens(node.context_limit)} ({node.context_pct:.0f}%)"
+    if getattr(node, "context_limit_provenance", "") == "measured":
+        return f"Context: {format_tokens(node.context_used_tokens)}/{format_tokens(node.context_max_tokens)} ({node.context_pct:.0f}%)"
+    return f"Context: {format_tokens(node.context_used_tokens)} / ? (limit unknown)"
+
+
+def _fit(text: Text, width: int) -> Text:
+    text.no_wrap = True
+    text.truncate(max(1, width), overflow="ellipsis")
+    return text
+
+
+def _root_strip(summary: ThreadTelemetryNode | None, width: int) -> Text:
+    """One-line strip for the followed root: status, context, and title first; extras only if they fit."""
+    strip = Text()
+    if not summary:
+        strip.append("T3 Telemetry  ·  No active app threads", style="bold")
+        return _fit(strip, width)
+    status = summary.status or "idle"
+    style = get_status_style(status)
+    ctx = _context_text(summary)
+    strip.append("Live ", style="bold cyan")
+    strip.append(status.upper(), style=style or "bold")
+    strip.append("  ")
+    fixed = strip.cell_len + 5 + len(ctx)
+    title = Text(summary.title or summary.thread_id[:8], style=style or "bold")
+    _fit(title, max(8, width - fixed))
+    strip.append_text(title)
+    strip.append("  ·  ")
+    strip.append(ctx, style="bold")
+    for extra, extra_style in (
+        (summary.model or "unknown", "bold yellow"),
+        (f"Act: {summary.steps[-1].action_summary}" if summary.steps else "", "magenta"),
+    ):
+        if extra and strip.cell_len + 5 + len(extra) <= width:
+            strip.append("  ·  ")
+            strip.append(extra, style=extra_style)
+    return _fit(strip, width)
+
+
+def _footer_line(nav: NavigationState, node: ThreadTelemetryNode | None, width: int) -> Text:
+    """The only place key help appears; the keys match the current focus."""
+    screen = nav.current_screen
+    if nav.detail_id and node and screen is not None:
+        if screen.detail_activity_id in screen.activity_targets:
+            keys = "E/Enter open subagent  W/S scroll  Esc back  q quit"
+        elif screen.detail_activity_id:
+            keys = "W/S scroll  Esc back  q quit"
+        elif node.subagents and screen.focus == "subagents":
+            keys = "Tab activity  W/S move  E/Enter open  Esc back  q quit"
+        elif node.subagents:
+            keys = "Tab subagents  W/S move  E/Enter details  Esc back  q quit"
+        else:
+            keys = "W/S move  E/Enter details  Esc back  q quit"
+    else:
+        keys = "W/S move  E/Enter open  Esc back  q quit"
+    foot = Text()
+    if nav.notice:
+        foot.append(nav.notice, style="bold yellow")
+        foot.append("  ·  ")
+    foot.append(keys, style="bold")
+    return _fit(foot, width)
+
+
+def _breadcrumb(nav: NavigationState, width: int) -> str:
+    """Path above the selected overview, trimmed from the left so the current agent stays visible."""
+    names = [s.title or s.node_id[:8] for s in nav.stack]
+    if len(names) <= 1:
+        return "Overview"
+    crumb = " › ".join(names)
+    if len(crumb) > width:
+        crumb = "… " + crumb[-(width - 2):]
+    return crumb
+
+
+def _identity_line(node: ThreadTelemetryNode, width: int) -> Text:
+    """Selected agent: title in status color, then textual status, driver and model."""
+    style = get_status_style(node.status)
+    tail = Text()
+    tail.append("  ")
+    tail.append(node.status.upper(), style=style or "bold")
+    meta = [node.driver, node.model or "unknown"] if width >= 76 else [node.model or "unknown"]
+    tail.append("".join(f"  ·  {m}" for m in meta), style="bold")
+    title = Text(f"{node.title} ({node.thread_id[:8]})", style=style or "bold")
+    _fit(title, max(12, width - tail.cell_len))
+    title.append_text(tail)
+    return _fit(title, width)
+
+
+def _child_table(node: ThreadTelemetryNode, screen: ScreenState, window: list, show_header: bool, focused: bool, width: int, range_label: str) -> Table:
+    table = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1), show_header=show_header, pad_edge=False, show_edge=False, header_style=SELECTED_ROW_STYLE if focused else "bold")
+    table.add_column(f"{'▌' if focused else ' '}Subagents {range_label}", ratio=2, no_wrap=True, overflow="ellipsis")
+    table.add_column("Model", ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column("Steps", justify="right", no_wrap=True)
+    wide = width >= 80
+    if wide:
+        table.add_column("In", justify="right", no_wrap=True)
+        table.add_column("Out", justify="right", no_wrap=True)
+    else:
+        table.add_column("Tokens", justify="right", no_wrap=True)
+    table.add_column("Time", justify="right", no_wrap=True)
+    for child in window:
+        is_sel = child.thread_id == screen.selected_child_id
+        highlighted = is_sel and focused
+        # On the highlight background the row style supplies bright text.
+        title = Text()
+        title.append("▶ " if is_sel else "  ", style="bold" if highlighted else "bold cyan")
+        title.append(child.title, style="" if highlighted else (get_status_style(child.status) or "bold"))
+        m = child.rollup_metrics
+        tokens = [format_tokens(m.input_tokens), format_tokens(m.output_tokens)] if wide else [format_tokens(m.total_tokens)]
+        table.add_row(
+            title,
+            child.model or "unknown",
+            str(m.step_count),
+            *tokens,
+            format_duration(m.duration_seconds),
+            style=SELECTED_ROW_STYLE if highlighted else "",
+        )
+    return table
+
+
+def _overview_body(
+    node: ThreadTelemetryNode,
+    nav: NavigationState,
+    screen: ScreenState,
+    entries: list,
+    inner_height: int,
+    inner_width: int,
+    width: int,
+) -> list:
+    """Overview for any agent (root or child): identity, scopes, graph, Subagents, Activity.
+
+    Height budget: identity and scope lines first; then each nonempty list gets
+    a heading and one row, and the graph gets its three labeled plot rows.
+    Extra lines go to the lists (up to three rows each, in a fixed order),
+    then the graph (up to its natural size, at most half of what is left),
+    then the lists again until every row is shown.
+    Every list row is one line, so the window, selection, and clip agree.
+    """
+    identity = _identity_line(node, inner_width)
+    scope_lines = [_fit(line, inner_width) for line in build_scopes_summary(node, width=inner_width)]
+
+    entry_ids = [e.entry_id for e in entries]
+    act_total = len(entries)
+    act_sel = entry_ids.index(screen.selected_activity_id) if screen.selected_activity_id in entry_ids else max(0, act_total - 1)
+    children = list(node.subagents)
+    child_ids = [c.thread_id for c in children]
+    child_sel = child_ids.index(screen.selected_child_id) if screen.selected_child_id in child_ids else 0
+    sub_focus = bool(children) and screen.focus == "subagents"
+
+    # Rows per list (an empty list still shows one message line) and how many it could use.
+    counts = ({"subagents": len(children)} if children else {}) | {"activity": act_total}
+    rows = {key: 1 for key in counts}
+    order = list(counts)
+
+    def _lines(key: str) -> int:
+        return rows[key] + table_header_lines(rows[key])
+
+    # Between the minimum (optional lines merged or dropped) and the full
+    # three-row graph, the graph would trade plot rows for optional lines, so
+    # it only ever grows to `graph_full` or beyond.
+    plot_rows = 3 if inner_height <= 20 else (5 if inner_height <= 30 else 7)
+    graph_min = context_graph_min_height(node, inner_width, 3)
+    graph_full = max(graph_min, len(context_graph_lines(node, inner_width, 3)))
+    graph_natural = max(graph_full, len(context_graph_lines(node, inner_width, plot_rows)))
+
+    section_gaps = 1 + len(counts)
+    fixed = 1 + len(scope_lines) + section_gaps
+    graph_h = graph_min
+    spare = inner_height - fixed - graph_h - sum(_lines(k) for k in counts)
+    if spare < 0:
+        # Below the supported minimum: the graph shrinks before list rows go.
+        graph_h = max(1, graph_h + spare)
+        spare = inner_height - fixed - graph_h - sum(_lines(k) for k in counts)
+
+    def _grow(cap: int) -> None:
+        nonlocal spare
+        moved = True
+        while moved:
+            moved = False
+            for key in order:
+                if rows[key] >= min(cap, counts[key]):
+                    continue
+                cost = 1 + table_header_lines(rows[key] + 1) - table_header_lines(rows[key])
+                if cost <= spare:
+                    rows[key] += 1
+                    spare -= cost
+                    moved = True
+
+    _grow(3)
+    graph_extra = min(graph_natural - graph_h, spare // 2)
+    if graph_h + graph_extra >= graph_full:
+        graph_h += graph_extra
+        spare -= graph_extra
+    _grow(10**6)
+    if node.context_samples and graph_h + spare >= graph_full:
+        # Lists are fully shown; leftover lines become taller bars.
+        graph_h += spare
+    alloc = {key: _lines(key) for key in counts}
+
+    graph = render_context_graph(node, width=inner_width, as_panel=False, height=graph_h, min_plot_rows=3)
+
+    body: list = [identity, *scope_lines, Text(""), graph]
+
+    if children:
+        lines = alloc["subagents"]
+        header_lines, rows = table_geometry(lines)
+        start = window_start(len(children), child_sel, screen.child_scroll, rows)
+        screen.child_scroll = start
+        window = children[start : start + rows]
+        table = _child_table(node, screen, window, header_lines > 0, sub_focus, width, activity_range_label(start, len(window), len(children)))
+        body.append(Text(""))
+        body.append(Viewport(table, height=lines, width=inner_width))
+
+    body.append(Text(""))
+    lines = alloc["activity"]
+    if not entries:
+        body.append(Viewport(build_activity_table([], interactive=True, focused=not sub_focus, range_label="0 of 0"), height=lines, width=inner_width))
+    else:
+        header_lines, rows = table_geometry(lines)
+        start = window_start(act_total, act_sel, screen.activity_offset, rows)
+        screen.activity_offset = start
+        window = entries[start : start + rows]
+        table = build_activity_table(
+            window, selected_id=entry_ids[act_sel], focused=not sub_focus, interactive=True, show_header=header_lines > 0,
+            range_label=activity_range_label(start, len(window), act_total)
+        )
+        body.append(Viewport(table, height=lines, width=inner_width))
+    return body
+
+
+def _activity_detail_body(node: ThreadTelemetryNode, screen: ScreenState, entry, inner_height: int, inner_width: int) -> list:
+    """Scrollable full detail for one activity; shows everything the one-line row elides."""
+    measuring = Console(width=inner_width, force_terminal=True, color_system=None)
+    opts = measuring.options.update(width=inner_width, height=None)
+    detail_group = Group(*build_activity_detail_lines(entry, node))
+    total_lines = len(list(Segment.split_lines(measuring.render(detail_group, opts))))
+    view_height = max(1, inner_height - 2)
+    screen.max_detail_scroll = max(0, total_lines - view_height)
+    screen.detail_scroll = max(0, min(screen.detail_scroll, screen.max_detail_scroll))
+    head = Text()
+    head.append("▌Activity detail", style="bold cyan")
+    top = screen.detail_scroll + 1
+    bottom = min(total_lines, screen.detail_scroll + view_height)
+    head.append(f"  lines {top}–{bottom} of {total_lines}", style="bold")
+    return [
+        _identity_line(node, inner_width),
+        _fit(head, inner_width),
+        Viewport(detail_group, height=view_height, scroll=screen.detail_scroll, width=inner_width),
+    ]
+
+
+def _root_list_body(roots: list[AppThreadRecord], nav: NavigationState, inner_height: int, inner_width: int, snapshot) -> Text:
+    body = Text()
+    if not roots:
+        body.append("No app threads found. Waiting for activity.\n", style="italic")
+        return body
+    visible_rows = inner_height
+    ids = [t.thread_id for t in roots]
+    sel_idx = ids.index(nav.selected_id) if (nav.selected_id and nav.selected_id in ids) else 0
+    start = window_start(len(roots), sel_idx, nav.list_scroll, visible_rows)
+    nav.list_scroll = start
+    for root in roots[start : start + visible_rows]:
+        is_selected = root.thread_id == nav.selected_id
+        pt = snapshot.get_provider_thread(root.thread_id) if snapshot else None
+        status = pt.status if pt else getattr(root, "status", "idle")
+        line = Text()
+        line.append("▶ " if is_selected else "  ", style="bold cyan")
+        suffix = Text(f"  [{root.model or 'unknown'}]", style="dim")  # optional metadata
+        title = Text(root.title or root.thread_id, style="" if is_selected else (get_status_style(status) or "bold"))
+        _fit(title, max(5, inner_width - 2 - suffix.cell_len))
+        line.append_text(title)
+        line.append_text(suffix)
+        if is_selected:
+            line.stylize(SELECTED_ROW_STYLE)
+        body.append_text(_fit(line, inner_width))
+        body.append("\n")
+    return body
+
+
 def _browser_frame(
     roots: list[AppThreadRecord],
     node: ThreadTelemetryNode | None,
@@ -449,341 +748,42 @@ def _browser_frame(
     max_steps: int = 20,
     snapshot=None,
 ) -> Layout:
-    """Construct Rich Layout bounded strictly to (height, width)."""
-    head = Text()
-    if summary:
-        status = summary.status or "idle"
-        title_style = get_status_style(status) or "dim"
-        status_text = f"[{title_style}]{status.upper()}[/]"
-        latest_act = summary.steps[-1].action_summary if summary.steps else "idle"
-        if summary.context_limit is not None and summary.context_limit > 0:
-            ctx_str = f"Context: {format_tokens(summary.context_used_tokens)}/{format_tokens(summary.context_limit)} ({summary.context_pct:.0f}%)"
-        elif getattr(summary, "context_limit_provenance", "") == "measured":
-            ctx_str = f"Context: {format_tokens(summary.context_used_tokens)}/{format_tokens(summary.context_max_tokens)} ({summary.context_pct:.0f}%)"
-        else:
-            ctx_str = f"Context: {format_tokens(summary.context_used_tokens)} / ? (limit unknown)"
+    """Construct Rich Layout bounded strictly to (height, width).
 
-        head.append(summary.title or summary.thread_id[:8], style=title_style)
-        head.append("  ·  ")
-        head.append(summary.model or "unknown", style="bold yellow")
-        head.append("  ·  ")
-        head.append(Text.from_markup(status_text))
-        head.append("  ·  ")
-        head.append(ctx_str, style="cyan")
-        head.append("  ·  ")
-        head.append(f"Act: {latest_act}", style="magenta")
-    else:
-        head.append("T3 Telemetry  ·  No active app threads", style="dim")
-
-    header_panel = Panel(
-        head,
-        title="[bold]T3 Code Telemetry[/]",
-        expand=True,
-        box=box.ROUNDED,
-    )
-
-    legend = "[green]●[/] running  [dim]●[/] idle/completed  [red]●[/] failed  [yellow]●[/] cancelled"
-    if nav.detail_id and node:
-        screen = nav.current_screen
-        if node.subagents:
-            if screen and screen.focus == "subagents":
-                hint = "Tab activity · ↑/↓ select child · Enter open · Esc back · q quit"
-            else:
-                hint = "Tab subagents · ↑/↓ scroll · Enter open child · Esc back · q quit"
-        else:
-            hint = "↑/↓ scroll · Esc back · q quit"
-    else:
-        hint = "↑/↓ or j/k move · Enter open · Esc back · q quit"
-
-    if nav.notice:
-        foot_text = Text.from_markup(f"[yellow]{nav.notice}[/]  ·  {hint}")
-    else:
-        foot_text = Text.from_markup(f"{hint}  {legend}")
-
-    footer_panel = Panel(foot_text, box=box.ROUNDED)
-
-    inner_height = max(1, height - 8)
+    One strip line for the followed root, a bordered body, one footer line.
+    """
+    inner_height = max(1, height - 4)
     inner_width = max(10, width - 4)
 
     if nav.detail_id and node:
         screen = nav.current_screen or ScreenState(node_id=node.thread_id)
-        node_status_color = get_status_style(node.status)
-        node_status_text = f"[{node_status_color or 'dim'}]{node.status.upper()}[/]"
-        breadcrumb = " › ".join(s.title or s.node_id[:8] for s in nav.stack)
-        panel_title = f"[bold {node_status_color or 'white'}]{node.title}[/] [dim]({node.thread_id[:8]})[/]"
-        if len(nav.stack) > 1:
-            panel_title += f"  ·  [cyan]{breadcrumb}[/]"
-
-        body_elements = []
-
-        # Info line (1 line)
-        info_line = Text()
-        info_line.append(f"Driver: {node.driver}  ·  Model: {node.model}  ·  Status: ")
-        info_line.append(Text.from_markup(node_status_text))
-        if node.context_limit is not None and node.context_limit > 0:
-            ctx_str = f"{format_tokens(node.context_used_tokens)}/{format_tokens(node.context_limit)} ({node.context_pct:.0f}%)"
-        elif getattr(node, "context_limit_provenance", "") == "measured":
-            ctx_str = f"{format_tokens(node.context_used_tokens)}/{format_tokens(node.context_max_tokens)} ({node.context_pct:.0f}%)"
+        entries = build_activity_entries(node, max_steps)
+        if nav.current_screen is screen:
+            nav.sync_activities([e.entry_id for e in entries], launch_targets(entries))
+        detail_entry = next((e for e in entries if e.entry_id == screen.detail_activity_id), None) if screen.detail_activity_id else None
+        if detail_entry is not None:
+            body = _activity_detail_body(node, screen, detail_entry, inner_height, inner_width)
         else:
-            ctx_str = f"{format_tokens(node.context_used_tokens)} / ? (limit unknown)"
-        info_line.append(f"  ·  Context: {ctx_str}")
-        body_elements.append(info_line)
-
-        measuring_console = Console(width=inner_width, force_terminal=True, color_system=None)
-        opts = measuring_console.options.update(width=inner_width, height=None)
-
-        def _count_lines(renderable: object) -> int:
-            segs = measuring_console.render(renderable, opts)
-            return len(list(Segment.split_lines(segs)))
-
-        # Summary scopes (3 scopes: Turn, Whole chat, Chat + subagents)
-        scope_lines = build_scopes_summary(node, width=inner_width)
-
-        # Context history chart
-        is_compact = (inner_height <= 20)
-        chart_renderable = render_context_graph(
-            node,
-            width=inner_width,
-            compact=is_compact,
-            as_panel=False,
-        )
-
-        top_elements = [info_line, *scope_lines, chart_renderable]
-        top_used = sum(_count_lines(el) for el in top_elements)
-
-        min_interactive = 4
-        if top_used + min_interactive > inner_height:
-            top_budget = max(2, inner_height - min_interactive)
-            body_elements = [Viewport(Group(*top_elements), height=top_budget, scroll=0, width=inner_width)]
-            top_used = top_budget
-        else:
-            body_elements = list(top_elements)
-
-        avail_for_interactive = inner_height - top_used
-
-        visible_steps = node.steps[-max_steps:] if (max_steps and len(node.steps) > max_steps) else node.steps
-        if not visible_steps:
-            act_renderable = Text("No recorded activity for this agent.", style="dim")
-        else:
-            act_table = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1), show_header=True, pad_edge=False, show_edge=False)
-            act_table.add_column("Activity", style="dim", no_wrap=True)
-            act_table.add_column("Action / Tool", ratio=2, no_wrap=True, overflow="ellipsis")
-            if width >= 80:
-                act_table.add_column("Source", style="cyan", width=8)
-                act_table.add_column("In", justify="right", no_wrap=True)
-                act_table.add_column("Cache", justify="right", no_wrap=True)
-                act_table.add_column("Think", justify="right", no_wrap=True)
-                act_table.add_column("Out", justify="right", no_wrap=True)
-            else:
-                act_table.add_column("Tokens", justify="right", no_wrap=True)
-            act_table.add_column("Latency", justify="right", no_wrap=True)
-
-            for step in visible_steps:
-                if width >= 80:
-                    act_table.add_row(
-                        step.row_label,
-                        step.action_summary,
-                        step.source,
-                        format_tokens(step.input_tokens),
-                        format_tokens(step.cache_read_tokens),
-                        format_tokens(step.thinking_tokens),
-                        format_tokens(step.output_tokens),
-                        format_duration(step.duration_seconds),
-                    )
-                else:
-                    act_table.add_row(
-                        step.row_label,
-                        step.action_summary,
-                        format_tokens(step.total_tokens),
-                        format_duration(step.duration_seconds),
-                    )
-            act_renderable = act_table
-
-        if node.subagents:
-            is_sub_focus = (screen.focus == "subagents")
-            visible_sub_rows = max(1, min(len(node.subagents), 1 if inner_height <= 18 else 5))
-            child_ids = [c.thread_id for c in node.subagents]
-            sel_idx = child_ids.index(screen.selected_child_id) if (screen.selected_child_id and screen.selected_child_id in child_ids) else 0
-
-            if sel_idx < screen.child_scroll:
-                screen.child_scroll = sel_idx
-            elif sel_idx >= screen.child_scroll + visible_sub_rows:
-                screen.child_scroll = sel_idx - visible_sub_rows + 1
-            max_child_start = max(0, len(node.subagents) - visible_sub_rows)
-            screen.child_scroll = max(0, min(screen.child_scroll, max_child_start))
-
-            sub_table = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1), show_header=True, pad_edge=False, show_edge=False)
-            sub_table.add_column(" ", width=2, no_wrap=True)
-            sub_table.add_column("Subagent / Role", ratio=2, no_wrap=True, overflow="ellipsis")
-            sub_table.add_column("Model", ratio=1, no_wrap=True, overflow="ellipsis")
-            sub_table.add_column("Steps", justify="right", no_wrap=True)
-            if width >= 80:
-                sub_table.add_column("In", justify="right", no_wrap=True)
-                sub_table.add_column("Out", justify="right", no_wrap=True)
-            else:
-                sub_table.add_column("Tokens", justify="right", no_wrap=True)
-            sub_table.add_column("Time", justify="right", no_wrap=True)
-
-            for child in node.subagents[screen.child_scroll : screen.child_scroll + visible_sub_rows]:
-                is_sel = (child.thread_id == screen.selected_child_id)
-                mark = "▶ " if is_sel else "  "
-                child_color = get_status_style(child.status)
-                title_style = f"bold {child_color}" if (is_sel and child_color) else (child_color or "")
-                title_txt = Text(child.title, style=title_style)
-
-                if width >= 80:
-                    sub_table.add_row(
-                        mark,
-                        title_txt,
-                        child.model or "unknown",
-                        str(child.rollup_metrics.step_count),
-                        format_tokens(child.rollup_metrics.input_tokens),
-                        format_tokens(child.rollup_metrics.output_tokens),
-                        format_duration(child.rollup_metrics.duration_seconds),
-                    )
-                else:
-                    sub_table.add_row(
-                        mark,
-                        title_txt,
-                        child.model or "unknown",
-                        str(child.rollup_metrics.step_count),
-                        format_tokens(child.rollup_metrics.total_tokens),
-                        format_duration(child.rollup_metrics.duration_seconds),
-                    )
-
-            if avail_for_interactive >= 8:
-                sub_head = Text()
-                if is_sub_focus:
-                    sub_head.append("▶ Immediate Subagents", style="bold cyan")
-                    sub_head.append(f" ({len(node.subagents)})", style="bold")
-                    sub_head.append("  [dim]• Tab for Activity[/]")
-                else:
-                    sub_head.append(f"  Immediate Subagents ({len(node.subagents)})  [dim]• Tab to focus[/]")
-                body_elements.append(sub_head)
-                sub_budget = min(_count_lines(sub_table), 5)
-                body_elements.append(Viewport(sub_table, height=sub_budget, scroll=0, width=inner_width))
-
-                act_head = Text()
-                if not is_sub_focus:
-                    act_head.append("▶ Recent Activity", style="bold cyan")
-                    act_head.append(f" ({len(node.steps)} steps)", style="bold")
-                    act_head.append("  [dim]• Tab for Subagents[/]")
-                else:
-                    act_head.append(f"  Recent Activity ({len(node.steps)} steps)  [dim]• Tab to focus[/]")
-                body_elements.append(act_head)
-                rem = max(1, inner_height - top_used - 1 - sub_budget - 1)
-                body_elements.append(
-                    Viewport(
-                        act_renderable,
-                        height=rem,
-                        scroll=screen.activity_scroll,
-                        width=inner_width,
-                        on_max_scroll=lambda m: setattr(screen, "max_activity_scroll", m),
-                    )
-                )
-            elif is_sub_focus:
-                sub_head = Text()
-                sub_head.append("▶ Immediate Subagents", style="bold cyan")
-                sub_head.append(f" ({len(node.subagents)})", style="bold")
-                sub_head.append("  [dim]• Tab for Activity[/]")
-                body_elements.append(sub_head)
-
-                sub_budget = max(1, avail_for_interactive - 2)
-                body_elements.append(Viewport(sub_table, height=sub_budget, scroll=0, width=inner_width))
-
-                act_head = Text(f"  Recent Activity ({len(node.steps)} steps)  [dim]• Tab to focus[/]")
-                body_elements.append(act_head)
-            else:
-                selected_child = next((c for c in node.subagents if c.thread_id == screen.selected_child_id), node.subagents[0] if node.subagents else None)
-                sub_head = Text()
-                sub_head.append(f"  Immediate Subagents ({len(node.subagents)})", style="bold")
-                if selected_child:
-                    sub_head.append(f": ▶ {selected_child.title} ({selected_child.model or 'unknown'})", style="dim")
-                sub_head.append("  [dim]• Tab to focus[/]")
-                sub_head.truncate(inner_width)
-                body_elements.append(sub_head)
-
-                act_head = Text()
-                act_head.append("▶ Recent Activity", style="bold cyan")
-                act_head.append(f" ({len(node.steps)} steps)", style="bold")
-                act_head.append("  [dim]• Tab for Subagents[/]")
-                body_elements.append(act_head)
-
-                act_viewport_height = max(1, inner_height - top_used - 2)
-                viewport = Viewport(
-                    act_renderable,
-                    height=act_viewport_height,
-                    scroll=screen.activity_scroll,
-                    width=inner_width,
-                    on_max_scroll=lambda m: setattr(screen, "max_activity_scroll", m),
-                )
-                body_elements.append(viewport)
-        else:
-            act_head = Text(f"▶ Recent Activity ({len(node.steps)} steps)")
-            body_elements.append(act_head)
-            act_viewport_height = max(1, inner_height - top_used - 1)
-            viewport = Viewport(
-                act_renderable,
-                height=act_viewport_height,
-                scroll=screen.activity_scroll,
-                width=inner_width,
-                on_max_scroll=lambda m: setattr(screen, "max_activity_scroll", m),
-            )
-            body_elements.append(viewport)
-
+            body = _overview_body(node, nav, screen, entries, inner_height, inner_width, width)
+        title = Text(_breadcrumb(nav, max(10, width - 8)), style="bold cyan")
+        body_panel = Panel(Group(*body), title=title, box=box.ROUNDED, expand=True)
+    else:
         body_panel = Panel(
-            Group(*body_elements),
-            title=panel_title,
+            _root_list_body(roots, nav, inner_height, inner_width, snapshot),
+            title="[bold]App Threads[/]",
             box=box.ROUNDED,
             expand=True,
         )
-    else:
-        body = Text()
-        if roots:
-            visible_rows = inner_height
-            ids = [t.thread_id for t in roots]
-            sel_idx = ids.index(nav.selected_id) if (nav.selected_id and nav.selected_id in ids) else 0
 
-            if sel_idx < nav.list_scroll:
-                nav.list_scroll = sel_idx
-            elif sel_idx >= nav.list_scroll + visible_rows:
-                nav.list_scroll = sel_idx - visible_rows + 1
-            max_start = max(0, len(roots) - visible_rows)
-            start = max(0, min(nav.list_scroll, max_start))
-            nav.list_scroll = start
+    return _assemble_frame(_root_strip(summary, width), body_panel, _footer_line(nav, node, width))
 
-            for root in roots[start : start + visible_rows]:
-                is_selected = (root.thread_id == nav.selected_id)
-                mark = "▶ " if is_selected else "  "
 
-                pt = snapshot.get_provider_thread(root.thread_id) if snapshot else None
-                status = pt.status if pt else getattr(root, "status", "idle")
-
-                color = get_status_style(status)
-
-                suffix = f"  [{root.model or 'unknown'}]"
-                avail_title = max(5, inner_width - len(mark) - len(suffix) - 1)
-                raw_title = root.title or root.thread_id
-                if len(raw_title) > avail_title:
-                    disp_title = raw_title[: avail_title - 1] + "…"
-                else:
-                    disp_title = raw_title
-
-                line_style = f"bold {color}" if (is_selected and color) else (color or "")
-                body.append(mark, style="bold cyan" if is_selected else "")
-                body.append(disp_title, style=line_style)
-                body.append(suffix, style="dim")
-                body.append("\n")
-        else:
-            body.append("No app threads found. Waiting for activity.\n", style="dim")
-
-        body_panel = Panel(body, title="App Threads", box=box.ROUNDED, expand=True)
-
+def _assemble_frame(header, body_panel: Panel, footer) -> Layout:
     layout = Layout()
     layout.split_column(
-        Layout(header_panel, size=3),
+        Layout(header, size=1),
         Layout(body_panel),
-        Layout(footer_panel, size=3),
+        Layout(footer, size=1),
     )
     return layout
 

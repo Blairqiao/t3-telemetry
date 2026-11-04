@@ -1033,10 +1033,10 @@ def test_live_renderer_scopes_idle_with_unavailable_turn():
     # Scope 3: Chat + subagents
     assert "Chat + subagents" in out
 
-    # Steps have explicit Model step #N labels and correct action summary
-    assert "Model step #1" in out
+    # Steps have compact #N identity and correct action summary
+    assert "· #1" in out
     assert "read_file" in out
-    assert "Model step #2" in out
+    assert "· #2" in out
     assert "think + reply" in out
 
 
@@ -1092,7 +1092,7 @@ def test_render_context_graph_states_and_transitions():
     Console(file=buf_single, width=60, color_system=None).print(chart_single)
     out_single = buf_single.getvalue()
     assert "single reading" in out_single
-    assert "●" in out_single
+    assert "█" in out_single  # single reading drawn as a bar on the auto axis
 
     # 3. No data honest display
     node_empty = ThreadTelemetryNode(
@@ -1213,9 +1213,9 @@ def test_browser_frame_60x24_usability():
     assert "RUNNING" in out
     assert "Current turn (running)" in out
     assert "Whole chat · this agent" in out
-    assert "Immediate Subagents" in out
+    assert "Subagents" in out
     assert "Worker Subage" in out
-    assert "Recent Activity" in out
+    assert "Activity" in out
     assert "Context:" in out
 
 
@@ -1342,20 +1342,21 @@ def test_browser_frame_60x24_repro_parent_claude_child_worker_scopes_context_act
     lines_act = buf.getvalue().splitlines()
     assert len(lines_act) == 24
     out_act = chr(10).join(lines_act)
-    assert "Recent Activity" in out_act
-    assert "Immediate Subagents" in out_act
+    assert "Activity" in out_act
+    assert "Subagents" in out_act
     assert "Worker Subagent" in out_act
-    assert any("tool_1" in line or "Model step #1" in line for line in lines_act)
+    # Default selection is the most recent entry
+    assert any("tool_5" in line or "Model step #5" in line for line in lines_act)
 
-    # 2. Activity scroll works: scrolling down brings later steps into view
-    nav.current_screen.activity_scroll = 2
+    # 2. Activity selection works: selecting an earlier entry brings it into view
+    nav.current_screen.selected_activity_id = nav.current_screen.activity_ids[2]
     layout_scrolled = _browser_frame([parent], node=parent, summary=parent, nav=nav, height=24, width=60)
     buf_scrolled = io.StringIO()
     Console(file=buf_scrolled, width=60, height=24, force_terminal=True, color_system=None).print(layout_scrolled)
     lines_scrolled = buf_scrolled.getvalue().splitlines()
     assert len(lines_scrolled) == 24
     assert any("tool_3" in line or "Model step #3" in line for line in lines_scrolled)
-    nav.current_screen.activity_scroll = 0
+    nav.current_screen.selected_activity_id = nav.current_screen.activity_ids[-1]
 
     # 3. 60x24 subagents focus: selected child is visible with marker ▶ and Enter usable
     nav.tab()
@@ -1367,7 +1368,7 @@ def test_browser_frame_60x24_repro_parent_claude_child_worker_scopes_context_act
     assert len(lines_sub) == 24
     out_sub = chr(10).join(lines_sub)
     assert any("▶" in line and "Worker Subagent" in line for line in lines_sub)
-    assert "Recent Activity" in out_sub
+    assert "Activity" in out_sub
 
     # 4. 120x40 geometry: both subagents and activity tables fully visible
     layout_120 = _browser_frame([parent], node=parent, summary=parent, nav=nav, height=40, width=120)
@@ -1376,8 +1377,8 @@ def test_browser_frame_60x24_repro_parent_claude_child_worker_scopes_context_act
     lines_120 = buf_120.getvalue().splitlines()
     assert len(lines_120) == 40
     out_120 = chr(10).join(lines_120)
-    assert "Immediate Subagents" in out_120
-    assert "Recent Activity" in out_120
+    assert "Subagents" in out_120
+    assert "Activity" in out_120
     assert "Worker Subagent" in out_120
     assert "tool_1" in out_120 or "Model step #1" in out_120
 
@@ -1418,7 +1419,7 @@ def test_browser_frame_content_accessibility_with_long_model_and_title():
     lines_60 = buf_60.getvalue().splitlines()
     assert len(lines_60) == 24
     out_60 = chr(10).join(lines_60)
-    assert "Recent Activity" in out_60
+    assert "Activity" in out_60
     assert "execute_task" in out_60 or "Model step #1" in out_60
 
     # 120x40 layout
@@ -1428,5 +1429,189 @@ def test_browser_frame_content_accessibility_with_long_model_and_title():
     lines_120 = buf_120.getvalue().splitlines()
     assert len(lines_120) == 40
     out_120 = chr(10).join(lines_120)
-    assert "Recent Activity" in out_120
+    assert "Activity" in out_120
     assert "execute_task" in out_120 or "Model step #1" in out_120
+
+
+def _graph_node(values, limit=None, provenances=None, timestamps=True, current=None):
+    from t3_telemetry.models import ContextSample, ThreadTelemetryNode
+
+    samples = [
+        ContextSample(
+            source_id=f"s{i}",
+            used_tokens=v,
+            limit=limit,
+            timestamp=(f"2026-11-03T10:{i // 60:02d}:{i % 60:02d}Z" if timestamps else None),
+            provenance=(provenances[i] if provenances else "measured"),
+        )
+        for i, v in enumerate(values)
+    ]
+    return ThreadTelemetryNode(
+        thread_id="th-axis",
+        title="Axis",
+        driver="codex",
+        provider_instance_id="c",
+        model="m",
+        context_used_tokens=values[-1] if current is None and values else (current or 0),
+        context_limit=limit,
+        context_provenance="measured",
+        context_samples=samples,
+    )
+
+
+def _plot(lines, rows):
+    """Return the plot rows (top first) located by their axis glyph."""
+    plot = [ln.plain for ln in lines if "┤" in ln.plain or "│" in ln.plain]
+    assert len(plot) == rows
+    return plot
+
+
+def _column_heights(plot):
+    """Count filled cells per column, from the axis glyph onward."""
+    start = plot[0].index("┤") + 1
+    width = max(len(r) for r in plot)
+    heights = []
+    for col in range(start, width):
+        cells = [r[col] if col < len(r) else " " for r in plot]
+        if any(c not in " " for c in cells):
+            heights.append(sum(1 for c in cells if c == "█"))
+    return heights
+
+
+def test_nice_ceiling_rounding():
+    from t3_telemetry.ui import nice_ceiling
+
+    assert nice_ceiling(0) == 1000  # all-zero data still gets a nonzero axis
+    assert nice_ceiling(1) == 1
+    assert nice_ceiling(3) == 5
+    assert nice_ceiling(80_000) == 100_000
+    assert nice_ceiling(40_000) == 50_000
+    assert nice_ceiling(100_000) == 100_000
+    assert nice_ceiling(150_001) == 200_000
+    assert nice_ceiling(1_200_000) == 2_000_000
+
+
+def test_context_graph_example_scale_and_geometry():
+    """25k, 80k, 40k under a 200k limit: axis tops at 100k, limit shown separately."""
+    from t3_telemetry.ui import context_graph_lines
+
+    node = _graph_node([25_000, 80_000, 40_000], limit=200_000)
+    for width, rows in ((56, 3), (116, 5)):
+        lines = context_graph_lines(node, width, rows)
+        assert all(ln.cell_len <= width for ln in lines)
+        plot = _plot(lines, rows)
+        assert plot[0].lstrip().startswith("100k┤")
+        assert plot[-1].lstrip().startswith("0┤")
+        assert plot[rows // 2].lstrip().startswith("50k┤")
+        text = "\n".join(ln.plain for ln in lines)
+        assert "Limit: 200.0k" in text and "Current: 40.0k" in text and "Peak: 80.0k" in text
+    # 5 rows of 20k: 25k -> 1 full row, 80k -> 4, 40k -> 2.
+    assert _column_heights(_plot(context_graph_lines(node, 116, 5), 5)) == [1, 4, 2]
+
+
+def test_context_graph_low_usage_visible_under_large_limit():
+    from t3_telemetry.ui import context_graph_lines
+
+    node = _graph_node([300, 500], limit=1_000_000)
+    plot = _plot(context_graph_lines(node, 60, 3), 3)
+    assert plot[0].lstrip().startswith("500┤")
+    assert _column_heights(plot)[-1] == 3  # latest reading fills the auto axis
+
+
+def test_context_graph_zero_single_and_unknown_limit():
+    from t3_telemetry.ui import context_graph_lines
+
+    zero = context_graph_lines(_graph_node([0, 0]), 60, 3)
+    plot = _plot(zero, 3)
+    assert plot[0].lstrip().startswith("1k┤")
+    assert "Limit: unknown" in "\n".join(ln.plain for ln in zero)
+
+    single = context_graph_lines(_graph_node([12_000], limit=128_000), 60, 3)
+    plot = _plot(single, 3)
+    assert plot[0].lstrip().startswith("20k┤")
+    assert _column_heights(plot) == [1]  # 12k of 20k: one full row of three plus a partial
+    assert "at 10:00:00" in "\n".join(ln.plain for ln in single)
+
+
+def test_bucket_context_samples_preserves_spikes_drops_and_latest():
+    from t3_telemetry.models import ContextSample
+    from t3_telemetry.ui import bucket_context_samples
+
+    values = [1000 * i for i in range(256)]
+    values[100] = 900_000  # spike
+    values[200] = 5  # drop
+    samples = [ContextSample(source_id=str(i), used_tokens=v) for i, v in enumerate(values)]
+    buckets = bucket_context_samples(samples, 50)
+    assert len(buckets) == 50
+    assert sum(b.count for b in buckets) == 256
+    assert [b.first_index for b in buckets] == sorted(b.first_index for b in buckets)
+    assert max(b.high for b in buckets) == 900_000
+    assert min(b.low for b in buckets) == 0
+    assert any(b.has_drop and b.low == 5 for b in buckets)
+    assert buckets[-1].latest == values[-1]
+    assert bucket_context_samples(samples, 300)[-1].count == 1  # no bucketing when it fits
+
+
+def test_context_graph_full_history_mixed_provenance_bounded():
+    from t3_telemetry.ui import context_graph_lines, render_context_graph
+
+    values = [(i * 700) % 90_000 for i in range(256)]
+    provs = ["measured"] * 200 + ["estimated"] * 56
+    node = _graph_node(values, provenances=provs, timestamps=False)
+    for width in (40, 56, 116):
+        lines = context_graph_lines(node, width, 3)
+        assert all(ln.cell_len <= width for ln in lines)
+        text = "\n".join(ln.plain for ln in lines)
+        assert "█ latest ░ col peak" in text
+        assert "↓ drop" in text and "┊ source switch" in text
+        assert "#1 … #256 (no times)" in text
+    # Exact height budget is honored, and rendering stays within console width.
+    for height in (8, 12):
+        buf = io.StringIO()
+        Console(file=buf, width=60, color_system=None).print(render_context_graph(node, width=60, as_panel=False, height=height))
+        out = buf.getvalue().splitlines()
+        assert len(out) == height
+        assert all(len(ln) <= 60 for ln in out)
+
+
+def test_context_graph_range_fills_only_half_covered_cells():
+    from t3_telemetry.ui import ContextBucket, RANGE_CHAR, _bar_cell
+
+    def bucket(high):
+        return ContextBucket(0, 2, 10_000, high, 10_000, frozenset({"measured"}), "measured", False, False)
+
+    # 3 rows on a 100k axis: the middle row spans ~33k-67k.
+    assert _bar_cell(bucket(34_000), 1, 3, 100_000)[0] == " "
+    assert _bar_cell(bucket(60_000), 1, 3, 100_000)[0] == RANGE_CHAR
+    assert _bar_cell(bucket(60_000), 2, 3, 100_000)[0] == " "
+
+
+def test_context_graph_tight_heights_exact_and_keep_scale():
+    from t3_telemetry.ui import context_graph_lines
+
+    nodes = [
+        _graph_node([25_000, 80_000, 40_000], limit=200_000),
+        _graph_node([(i * 700) % 90_000 for i in range(256)], provenances=["measured"] * 200 + ["estimated"] * 56),
+    ]
+    for node in nodes:
+        for width in (40, 60):
+            for height in range(3, 9):
+                lines = context_graph_lines(node, width, 3, height)
+                assert len(lines) == height
+                assert all(ln.cell_len <= width for ln in lines)
+                text = "\n".join(ln.plain for ln in lines)
+                assert "not limit" in text
+                assert "100k┤" in text
+                if width >= 60:
+                    assert "Limit:" in text
+
+
+def test_context_graph_single_row_labels_ceiling_and_narrow_width():
+    from t3_telemetry.ui import context_graph_lines
+
+    node = _graph_node([25_000, 80_000, 40_000], limit=200_000)
+    plot = _plot(context_graph_lines(node, 60, 1), 1)
+    assert plot[0].lstrip().startswith("100k┤")
+    for width in (8, 12, 16):
+        lines = context_graph_lines(node, width, 3)
+        assert all(ln.cell_len <= width for ln in lines)

@@ -12,6 +12,8 @@ from t3_telemetry.models import (
     ContextSample,
     ConversationTelemetry,
     ModelStep,
+    NativeLaunchRecord,
+    SubagentLaunch,
     ThreadTelemetryNode,
     TokenMetricsSummary,
     TurnMetrics,
@@ -425,6 +427,9 @@ def build_thread_telemetry(
                     started_at=turn.started_at,
                     completed_at=turn.completed_at,
                     duration_seconds=turn.duration_seconds,
+                    context_texts=list(snapshot.turn_context.get(turn.provider_turn_id, [])),
+                    usage_status=turn.usage_status,
+                    usage_provenance=turn.usage_provenance,
                 )
                 steps.append(step)
 
@@ -609,6 +614,8 @@ def build_thread_telemetry(
             )
             node.subagents.append(child_node)
 
+    node.launches = build_subagent_launches(node, subagent_links, snapshot, agy_telemetry)
+
     # Compute rollup metrics
     node.rollup_metrics = TokenMetricsSummary()
     node.rollup_metrics.add_summary(node.self_metrics)
@@ -638,6 +645,122 @@ def build_thread_telemetry(
     node.combined_steps = sorted(all_steps, key=lambda s: (s.started_at or "", s.step_index))
 
     return node
+
+
+def build_subagent_launches(
+    node: ThreadTelemetryNode,
+    subagent_links: list,
+    snapshot: T3StateSnapshot,
+    agy_telemetry: ConversationTelemetry | None,
+) -> list[SubagentLaunch]:
+    """One launch per known invocation of an immediate child, merged across Sources A/B/C.
+
+    Identity: Source A uses ``subagent_id``, so repeated links to one child stay
+    distinct. Source C uses the child conversation ID. Source B lineage has no
+    invocation ID, so it falls back to the parent/child pair (``child:<id>``) and
+    merges into any A or C launch that already targets that child. Times are only
+    copied from records; nothing is inferred.
+    """
+    present = {c.thread_id for c in node.subagents}
+    native_to_thread = {c.native_id: c.thread_id for c in node.subagents if c.native_id}
+    status_by_id = {c.thread_id: c.status for c in node.subagents}
+    launches: list[SubagentLaunch] = []
+    by_id: dict[str, SubagentLaunch] = {}
+    by_target: dict[str, SubagentLaunch] = {}
+
+    def add(launch: SubagentLaunch) -> None:
+        launch.child_present = bool(launch.child_thread_id and launch.child_thread_id in present)
+        by_id[launch.launch_id] = launch
+        if launch.child_thread_id:
+            by_target.setdefault(launch.child_thread_id, launch)
+        launches.append(launch)
+
+    # Source A: app-owned or provider-native subagent records.
+    for link_index, link in enumerate(subagent_links):
+        launch_id = (
+            f"subagent:{link.subagent_id}"
+            if link.subagent_id
+            else f"child:{link.child_thread_id or f'{node.thread_id}:unlinked:{link_index}'}"
+        )
+        if launch_id in by_id:
+            continue  # same record read twice
+        add(
+            SubagentLaunch(
+                launch_id=launch_id,
+                title=link.title or "",
+                origin=link.origin or "app_owned",
+                status=link.status or "unknown",
+                child_thread_id=link.child_thread_id,
+                launched_at=link.started_at,
+                launch_time_source="subagent record start" if link.started_at else None,
+                sources=["A"],
+            )
+        )
+
+    # Source B: thread lineage (discovery only).
+    for th in snapshot.threads.values():
+        if th.parent_thread_id != node.thread_id or th.thread_id == node.thread_id:
+            continue
+        existing = by_target.get(th.thread_id)
+        if existing is not None:
+            if "B" not in existing.sources:
+                existing.sources.append("B")
+            continue
+        add(
+            SubagentLaunch(
+                launch_id=f"child:{th.thread_id}",
+                title=th.title or "",
+                origin="lineage",
+                status=status_by_id.get(th.thread_id, "unknown"),
+                child_thread_id=th.thread_id,
+                launched_at=th.created_at,
+                launch_time_source="child thread created" if th.created_at else None,
+                sources=["B"],
+            )
+        )
+
+    # Source C: native Antigravity transcript launches.
+    if agy_telemetry is not None:
+        records = list(agy_telemetry.launches)
+        recorded = {r.child_native_id for r in records}
+        records += [
+            NativeLaunchRecord(child_native_id=cid) for cid in agy_telemetry.child_native_ids if cid not in recorded
+        ]
+        for rec in records:
+            target = native_to_thread.get(rec.child_native_id, rec.child_native_id)
+            existing = by_id.get(f"native:{rec.child_native_id}") or by_target.get(target)
+            if existing is not None:
+                if "C" not in existing.sources:
+                    existing.sources.append("C")
+                existing.child_native_id = existing.child_native_id or rec.child_native_id
+                if existing.parent_step_index is None:
+                    existing.parent_step_index = rec.step_index
+                    existing.tool_name = rec.tool_name
+                # A recorded tool-call time beats a lineage proxy (child thread creation).
+                if rec.launched_at and (
+                    existing.launched_at is None or existing.launch_time_source == "child thread created"
+                ):
+                    existing.launched_at = rec.launched_at
+                    existing.launch_time_source = "transcript tool call"
+                if not existing.title and rec.task:
+                    existing.title = rec.task
+                continue
+            add(
+                SubagentLaunch(
+                    launch_id=f"native:{rec.child_native_id}",
+                    title=rec.task or "",
+                    origin="native",
+                    status=status_by_id.get(target, "unknown"),
+                    child_thread_id=target,
+                    child_native_id=rec.child_native_id,
+                    launched_at=rec.launched_at,
+                    launch_time_source="transcript tool call" if rec.launched_at else None,
+                    parent_step_index=rec.step_index,
+                    tool_name=rec.tool_name,
+                    sources=["C"],
+                )
+            )
+    return launches
 
 
 def list_root_threads(

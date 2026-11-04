@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from rich import box
@@ -10,19 +12,26 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from t3_telemetry.activity import DETAIL_FIELD_LABELS, TOOL_VERBS, ActivityEntry, build_activity_entries, neutralize
 from t3_telemetry.models import ThreadTelemetryNode
+
+
+# Focused selection: bright text on a solid background; the ▶ marker carries it without color.
+SELECTED_ROW_STYLE = "white on grey19"
 
 
 def get_status_style(status: str | None) -> str:
     s = (status or "").lower()
     if s == "running":
-        return "bold green"
+        return "bold bright_green"
     elif s == "failed":
-        return "bold red"
+        return "bold bright_red"
     elif s == "cancelled":
-        return "bold yellow"
-    elif s in ("completed", "idle"):
-        return "dim"
+        return "bold bright_yellow"
+    elif s == "completed":
+        return "bold bright_blue"
+    elif s == "idle":
+        return "bold bright_white"
     return ""
 
 
@@ -257,30 +266,123 @@ def format_clock(ts: str | None) -> str:
     return ts[:8]
 
 
-BLOCKS = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+BLOCKS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+RANGE_CHAR = "░"
 
 
-def render_context_graph(
-    node: ThreadTelemetryNode,
-    width: int = 60,
-    compact: bool = False,
-    as_panel: bool = True,
-) -> Panel | Group:
-    """Render a terminal graph of context occupancy and history."""
-    samples = node.context_samples
-    current_val = node.context_used_tokens
-    peak_val = node.observed_peak_tokens
+def nice_ceiling(value: float) -> int:
+    """Smallest 1, 2, or 5 × 10^n at or above value; 1k for zero or negative data."""
+    if value <= 0:
+        return 1000
+    magnitude = 1
+    while True:
+        for step in (1, 2, 5):
+            if step * magnitude >= value:
+                return step * magnitude
+        magnitude *= 10
+
+
+def format_axis_tokens(value: float) -> str:
+    """Short axis label such as 0, 500, 2.5k, 100k, 1M."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:g}M"
+    if value >= 1000:
+        return f"{value / 1000:g}k"
+    return f"{value:g}"
+
+
+@dataclass(frozen=True, slots=True)
+class ContextBucket:
+    """A chronological run of samples drawn as one bar column."""
+
+    first_index: int
+    count: int
+    low: int
+    high: int
+    latest: int
+    provenances: frozenset[str]
+    latest_provenance: str
+    has_drop: bool
+    provenance_boundary: bool
+
+
+def bucket_context_samples(samples: Sequence[Any], capacity: int) -> list[ContextBucket]:
+    """Split samples into at most `capacity` contiguous chronological buckets.
+
+    Bucket i covers samples [i*n//B, (i+1)*n//B). Each keeps its min/max range,
+    its most recent value, whether it contains a drop (including the step from
+    the previous bucket), and whether provenance changes inside it or at its start.
+    """
+    n = len(samples)
+    if n == 0 or capacity <= 0:
+        return []
+    count = min(n, capacity)
+    buckets: list[ContextBucket] = []
+    for b in range(count):
+        start = b * n // count
+        end = (b + 1) * n // count
+        chunk = samples[start:end]
+        values = [s.used_tokens for s in chunk]
+        provs = [s.provenance for s in chunk]
+        drop = any(samples[i].used_tokens < samples[i - 1].used_tokens for i in range(max(1, start), end))
+        boundary = any(samples[i].provenance != samples[i - 1].provenance for i in range(max(1, start), end))
+        buckets.append(
+            ContextBucket(
+                first_index=start,
+                count=end - start,
+                low=min(values),
+                high=max(values),
+                latest=values[-1],
+                provenances=frozenset(provs),
+                latest_provenance=provs[-1],
+                has_drop=drop,
+                provenance_boundary=boundary,
+            )
+        )
+    return buckets
+
+
+def _bar_cell(bucket: ContextBucket, row: int, rows: int, ceiling: int) -> tuple[str, str]:
+    """Glyph and style for one plot cell (row 0 is the bottom).
+
+    The latest value is drawn with full and eighth blocks. The range above it,
+    up to the bucket max, is drawn with RANGE_CHAR only in cells the max covers
+    at least halfway, so a peak is never overstated by more than half a row.
+    """
+    cell = ceiling / rows
+    y_low = row * cell
+    style = "cyan" if bucket.latest_provenance == "measured" else "yellow"
+    latest = bucket.latest
+    if latest > y_low:
+        if latest >= y_low + cell:
+            return "█", style
+        # Partial cell; any nonzero value shows at least one eighth.
+        return BLOCKS[min(8, max(1, int((latest - y_low) / cell * 8)))], style
+    if bucket.high > latest and bucket.high >= y_low + cell / 2:
+        return RANGE_CHAR, style
+    return " ", ""
+
+
+def _sample_time(s: Any) -> str:
+    return format_clock(s.timestamp or getattr(s, "observed_at", None))
+
+
+def _graph_parts(node: ThreadTelemetryNode, width: int, plot_rows: int) -> dict[str, Any]:
+    """Build the graph's line groups for one width and row count.
+
+    Keys: header (lines), plot (lines), marker (line or None), marker_required
+    (drop/switch present), time (line or None), scale (str or None), extras (legend items).
+    """
+    plot_rows = max(1, plot_rows)
+    samples = list(node.context_samples)
+    current_val = node.context_used_tokens or 0
+    peak_val = node.observed_peak_tokens or 0
     limit_val = node.context_limit
 
-    has_drop = False
-    for i in range(1, len(samples)):
-        if samples[i].used_tokens < samples[i - 1].used_tokens:
-            has_drop = True
-            break
+    has_drop = any(samples[i].used_tokens < samples[i - 1].used_tokens for i in range(1, len(samples)))
     if not has_drop and samples and current_val < peak_val:
         has_drop = True
 
-    elements: list[Text] = []
     if node.context_provenance == "measured":
         prov_style = "yellow" if node.context_uncertainty else "bold cyan"
         prov_label = "Measured (uncertain recency)" if node.context_uncertainty else "Measured"
@@ -288,117 +390,455 @@ def render_context_graph(
         prov_style = "yellow"
         prov_label = "Estimated"
     else:
-        prov_style = "dim"
+        prov_style = "bold"
         prov_label = "Unknown"
 
-    if width < 75:
-        meta1 = Text()
-        meta1.append(prov_label, style=prov_style)
-        meta1.append("  ·  Current: ", style="dim")
-        meta1.append(format_tokens(current_val), style="bold")
-        meta1.append("  ·  Peak: ", style="dim")
-        meta1.append(format_tokens(peak_val), style="bold")
-        elements.append(meta1)
-
-        meta2 = Text()
-        meta2.append("Limit: ", style="dim")
+    def _limit_parts(with_drop: bool = True) -> list[tuple[str, str]]:
+        parts = [("Limit: ", "")]
         if limit_val is not None and limit_val > 0:
-            meta2.append(format_tokens(limit_val), style="bold")
+            parts.append((format_tokens(limit_val), "bold"))
         else:
-            meta2.append("unknown", style="dim")
-        if has_drop:
-            meta2.append("  ·  ", style="dim")
-            meta2.append("Context drop", style="yellow")
-        elements.append(meta2)
-    else:
-        meta = Text()
-        meta.append(prov_label, style=prov_style)
-        meta.append("  ·  Current: ", style="dim")
-        meta.append(format_tokens(current_val), style="bold")
-        meta.append("  ·  Peak: ", style="dim")
-        meta.append(format_tokens(peak_val), style="bold")
-        meta.append("  ·  Limit: ", style="dim")
-        if limit_val is not None and limit_val > 0:
-            meta.append(format_tokens(limit_val), style="bold")
-        else:
-            meta.append("unknown", style="dim")
-        if has_drop:
-            meta.append("  ·  ", style="dim")
-            meta.append("Context drop", style="yellow")
-        elements.append(meta)
+            parts.append(("unknown", "bold yellow"))
+        if has_drop and with_drop:
+            parts += [("  ·  ", "dim"), ("Context drop", "yellow")]
+        return parts
 
+    head = [
+        (prov_label, prov_style),
+        ("  ·  Current: ", ""),
+        (format_tokens(current_val), "bold"),
+    ]
+    peak = [("Peak: ", ""), (format_tokens(peak_val), "bold")]
+    head += [("  ·  ", "")] + peak
+    def _header(with_drop: bool) -> list[Text]:
+        limit = _limit_parts(with_drop)
+        if width >= 75:
+            return [Text.assemble(*head, ("  ·  ", ""), *limit)]
+        first = Text.assemble(*head)
+        if first.cell_len <= width:
+            return [first, Text.assemble(*limit)]
+        return [Text.assemble(*head[:3]), Text.assemble(*peak, ("  ·  ", ""), *limit)]
+
+    header = _header(with_drop=True)
+
+    parts: dict[str, Any] = {
+        "header": header,
+        # Same lines without the optional "Context drop" tail, so a tight
+        # budget can trade that tail for the scale and keep the limit.
+        "header_lean": _header(with_drop=False),
+        "plot": [],
+        "marker": None,
+        "marker_required": False,
+        "time": None,
+        "scale": None,
+        "extras": [],
+    }
     if not samples:
-        elements.append(Text("No context history recorded.", style="dim"))
-    elif len(samples) == 1:
-        s = samples[0]
+        parts["plot"] = [Text("No context history recorded.", style="bold")]
+        return parts
+
+    ceiling = nice_ceiling(max([current_val] + [s.used_tokens for s in samples]))
+    # Top row always carries the ceiling; with one row there is no room for 0.
+    labels = {0: "0"}
+    labels[plot_rows - 1] = format_axis_tokens(ceiling)
+    if plot_rows >= 3 and plot_rows % 2 == 1:
+        labels[plot_rows // 2] = format_axis_tokens(ceiling / 2)
+    axis_w = max(len(v) for v in labels.values()) + 1
+    if width - axis_w < 1:
+        # Too narrow for labels: keep only the plot.
+        labels, axis_w = {}, 0
+    plot_w = max(1, width - axis_w)
+
+    buckets = bucket_context_samples(samples, plot_w)
+    col_w = max(1, min(3, plot_w // len(buckets)))
+    bucketed = any(b.count > 1 for b in buckets)
+
+    def _pad(glyph: str) -> str:
+        if col_w == 1:
+            return glyph
+        if col_w == 2:
+            return glyph + " "
+        return " " + glyph + " "
+
+    for row in range(plot_rows - 1, -1, -1):
         line = Text()
-        s_style = "bold cyan" if s.provenance == "measured" else "yellow"
-        line.append("● ", style=s_style)
-        line.append(f"{format_tokens(s.used_tokens)} tokens ({s.provenance})")
-        t_str = format_clock(s.timestamp or getattr(s, "observed_at", None))
-        if t_str:
-            line.append(f"  [dim]at {t_str}[/]")
-        line.append("  [dim]• single reading[/]")
-        elements.append(line)
+        if axis_w:
+            line.append(labels.get(row, "").rjust(axis_w - 1), style="bold")
+            line.append("┤" if row in labels else "│", style="bold")
+        for b in buckets:
+            glyph, style = _bar_cell(b, row, plot_rows, ceiling)
+            line.append(_pad(glyph), style=style)
+        parts["plot"].append(line)
+
+    # Marker row: drops, provenance switches, estimated columns.
+    # With 3-cell columns a source switch sits in the gap before the column,
+    # so it stays visible alongside a drop; narrower columns show one marker.
+    markers: list[tuple[str, str, str]] = []
+    for b in buckets:
+        gap = "┊" if (col_w == 3 and b.provenance_boundary) else " "
+        if b.has_drop:
+            markers.append((gap, "↓", "bold yellow"))
+        elif b.provenance_boundary:
+            markers.append((" ", "┊", "bold"))
+        elif "estimated" in b.provenances:
+            markers.append((gap, "~", "yellow"))
+        else:
+            markers.append((gap, " ", ""))
+    glyphs = {m[0] for m in markers} | {m[1] for m in markers}
+    if glyphs - {" "}:
+        line = Text(" " * axis_w)
+        for gap, glyph, style in markers:
+            cell = (gap + glyph + " ") if col_w == 3 else _pad(glyph)
+            line.append(cell, style=style)
+        parts["marker"] = line
+        parts["marker_required"] = bool(glyphs & {"↓", "┊"})
+
+    # Time / order axis; the latest label ends under the last bar.
+    used_w = len(buckets) * col_w
+    end_col = axis_w + used_w
+    first_t, last_t = _sample_time(samples[0]), _sample_time(samples[-1])
+    right = ""
+    if len(samples) == 1:
+        left = f"at {first_t}" if first_t else "sample 1"
+    elif not (first_t or last_t):
+        left = f"#1 … #{len(samples)} (no times)"
     else:
-        chart_rows = 2 if compact else 3
-        max_scale = max(peak_val, limit_val or 0, 1)
+        left = first_t or "sample 1"
+        right = last_t or f"sample {len(samples)}"
+    time_line = Text(" " * axis_w)
+    if not right:
+        time_line.append(left, style="bold")
+    elif len(left) + 1 + len(right) <= used_w:
+        time_line.append(left, style="bold")
+        time_line.append(" " * (used_w - len(left) - len(right)))
+        time_line.append(right, style="bold")
+    else:
+        # Few columns: end the latest label under the last bar, shifting the
+        # oldest label left into the axis gutter; overflow only if both cannot fit.
+        start = max(len(left) + 1, end_col - len(right))
+        left_start = max(0, min(axis_w, start - len(left) - 1))
+        time_line = Text(" " * left_start)
+        time_line.append(left, style="bold")
+        time_line.append(" " * (start - left_start - len(left)))
+        time_line.append(right, style="bold")
+    parts["time"] = time_line
 
-        cols: list[dict[str, Any]] = []
-        for i, s in enumerate(samples):
-            if i > 0:
-                prev = samples[i - 1]
-                if s.provenance != prev.provenance:
-                    cols.append({"type": "gap", "char": "┊"})
-            is_drop = (i > 0 and s.used_tokens < samples[i - 1].used_tokens)
-            cols.append({
-                "type": "sample",
-                "used": s.used_tokens,
-                "prov": s.provenance,
-                "is_drop": is_drop,
-                "time": s.timestamp or getattr(s, "observed_at", None),
-            })
+    parts["scale"] = f"auto axis 0–{format_axis_tokens(ceiling)}, not limit"
+    extras: list[str] = []
+    if len(samples) == 1:
+        extras.append("single reading")
+    if bucketed:
+        per = -(-len(samples) // len(buckets))
+        extras.append(f"█ latest ░ col peak, ≤{per}/col")
+    extras += [label for glyph, label in (("↓", "↓ drop"), ("┊", "┊ source switch"), ("~", "~ estimated")) if glyph in glyphs]
+    parts["extras"] = extras
+    return parts
 
-        for r in range(chart_rows - 1, -1, -1):
-            row_text = Text()
-            y_low = (r / chart_rows) * max_scale
-            y_high = ((r + 1) / chart_rows) * max_scale
-            for c in cols:
-                if c["type"] == "gap":
-                    row_text.append(" ┊ ", style="dim")
-                    continue
-                val = c["used"]
-                c_style = "cyan" if c["prov"] == "measured" else "yellow"
-                if c["is_drop"]:
-                    c_style = "yellow"
 
-                if val <= y_low:
-                    row_text.append("   ")
-                elif val >= y_high:
-                    row_text.append(" █ ", style=c_style)
-                else:
-                    frac = (val - y_low) / (y_high - y_low)
-                    idx = min(8, max(1, int(frac * 8)))
-                    ch = BLOCKS[idx]
-                    row_text.append(f" {ch} ", style=c_style)
-            elements.append(row_text)
+def _pack_legend(items: list[str], width: int) -> list[Text]:
+    """Pack legend items into as few width-bounded lines as possible."""
+    if not items:
+        return []
+    lines: list[Text] = []
+    legend = Text(style="bold")
+    for item in items:
+        if legend.plain and len(legend.plain) + 3 + len(item) > width:
+            lines.append(legend)
+            legend = Text(style="bold")
+        legend.append(("  · " if legend.plain else "") + item)
+    lines.append(legend)
+    return lines
 
-        t_first = format_clock(samples[0].timestamp or getattr(samples[0], "observed_at", None))
-        t_last = format_clock(samples[-1].timestamp or getattr(samples[-1], "observed_at", None))
-        if t_first or t_last:
-            time_line = Text()
-            time_line.append(t_first or "", style="dim")
-            total_len = len(t_first) + len(t_last)
-            avail = max(4, width - total_len - 6)
-            dash_count = max(2, min(avail, 20))
-            time_line.append(" " + "─" * dash_count + " ", style="dim")
-            time_line.append(t_last or "", style="dim")
-            elements.append(time_line)
 
-    grp = Group(*elements)
+def _assemble(parts: dict[str, Any], width: int, level: int) -> list[Text]:
+    """Join parts, dropping optional lines up to `level`.
+
+    Level 1 drops an optional marker row (no drop/switch), 2 the time line,
+    3 extra legend items, 4 merges the scale onto the last header line.
+    """
+    header = [h.copy() for h in parts["header"]]
+    merge = level >= 4 and bool(parts["scale"])
+    if merge:
+        # Merge the scale onto a header line with room. Failing that, drop the
+        # optional "Context drop" tail to make room, keeping the limit; as a
+        # last resort the scale replaces the last header line.
+        def _try_merge(candidates: list[Text]) -> bool:
+            for i in range(len(candidates) - 1, -1, -1):
+                merged = candidates[i].copy()
+                merged.append("  · " + parts["scale"], style="bold")
+                if merged.cell_len <= width:
+                    header[i] = merged
+                    return True
+            return False
+
+        if not _try_merge(header) and not _try_merge(parts["header_lean"]):
+            header[-1] = Text(parts["scale"], style="bold")
+    lines = header + list(parts["plot"])
+    if parts["marker"] is not None and not (level >= 1 and not parts["marker_required"]):
+        lines.append(parts["marker"])
+    if parts["time"] is not None and level < 2:
+        lines.append(parts["time"])
+    if not merge:
+        items = ([parts["scale"]] if parts["scale"] else []) + (parts["extras"] if level < 3 else [])
+        lines += _pack_legend(items, width)
+    for line in lines:
+        line.no_wrap = True
+        line.truncate(width, overflow="ellipsis")
+    return lines
+
+
+def context_graph_min_height(node: ThreadTelemetryNode, width: int, plot_rows: int = 3) -> int:
+    """Fewest lines that keep the graph header and `plot_rows` labeled rows (legend merged)."""
+    parts = _graph_parts(node, max(1, width), plot_rows)
+    return len(_assemble(parts, max(1, width), 4))
+
+
+def context_graph_lines(
+    node: ThreadTelemetryNode,
+    width: int,
+    plot_rows: int = 3,
+    height: int | None = None,
+    min_plot_rows: int = 1,
+) -> list[Text]:
+    """Lines of the context graph, each at most `width` cells.
+
+    With `height`, returns exactly that many lines: plot rows absorb the space,
+    and optional lines are dropped (see `_assemble`) before rows go below
+    `min_plot_rows` (then below 1).
+    """
+    width = max(1, width)
+    if height is None:
+        return _assemble(_graph_parts(node, width, plot_rows), width, 0)
+    height = max(1, height)
+    best: list[Text] | None = None
+    for level in range(5):
+        # Axis width (and so buckets and markers) can depend on the row count,
+        # so build each candidate for real rather than estimating overhead.
+        for rows in range(height, 0, -1):
+            if rows < min_plot_rows and level < 4:
+                break
+            lines = _assemble(_graph_parts(node, width, rows), width, level)
+            if len(lines) == height:
+                return lines
+            if len(lines) < height and best is None:
+                best = lines
+            if len(lines) < height:
+                break
+        if best is not None:
+            break
+    if best is None:
+        best = _assemble(_graph_parts(node, width, 1), width, 4)
+    return best[:height] + [Text("") for _ in range(height - len(best))]
+
+
+class _ContextGraphBody:
+    """Renders context graph lines at the narrower of `width` and the console width."""
+
+    def __init__(self, node: ThreadTelemetryNode, width: int, plot_rows: int, height: int | None, min_plot_rows: int = 1) -> None:
+        self.min_plot_rows = min_plot_rows
+        self.node = node
+        self.width = width
+        self.plot_rows = plot_rows
+        self.height = height
+
+    def lines(self, width: int) -> list[Text]:
+        return context_graph_lines(self.node, width, self.plot_rows, self.height, self.min_plot_rows)
+
+    def __rich_console__(self, console: Any, options: Any) -> Any:
+        yield from self.lines(min(self.width, options.max_width))
+
+
+def render_context_graph(
+    node: ThreadTelemetryNode,
+    width: int = 60,
+    compact: bool = False,
+    as_panel: bool = True,
+    height: int | None = None,
+    plot_rows: int | None = None,
+    min_plot_rows: int = 1,
+) -> Panel | Group:
+    """Render context occupancy as bars on an automatic token axis.
+
+    `width` caps the line width; `height`, when given, is the exact number of
+    lines to produce (plot rows absorb the remainder). Otherwise `plot_rows`
+    applies, defaulting to 3 when compact and 5 otherwise.
+    """
+    rows = plot_rows if plot_rows is not None else (3 if compact else 5)
+    body = _ContextGraphBody(node, width - 4 if as_panel else width, rows, height, min_plot_rows)
     if as_panel:
-        return Panel(grp, title="[bold]Context History[/]", box=box.ROUNDED, expand=True)
-    return grp
+        return Panel(Group(body), title="[bold]Context History[/]", box=box.ROUNDED, expand=True)
+    return Group(body)
+
+
+def activity_range_label(start: int, shown: int, total: int) -> str:
+    """Visible range such as '4–6 of 12' (1-based, inclusive)."""
+    if total <= 0 or shown <= 0:
+        return f"0 of {total}"
+    return f"{start + 1}–{start + shown} of {total}"
+
+
+def activity_tokens_cell(entry: ActivityEntry) -> str:
+    if entry.total_tokens is None:
+        return "—"
+    approx = entry.usage_provenance == "cumulative_fallback" or entry.usage_status == "partial"
+    return format_tokens(entry.total_tokens) + ("~" if approx else "")
+
+
+def build_activity_table(
+    entries: list[ActivityEntry],
+    *,
+    selected_id: str | None = None,
+    focused: bool = False,
+    interactive: bool = False,
+    show_header: bool = True,
+    title: str | None = None,
+    box_style: box.Box = box.SIMPLE_HEAD,
+    range_label: str | None = None,
+) -> Table:
+    """Compact activity feed: descriptive title, total tokens, duration.
+
+    Shared by the live browser (``interactive`` adds the selection marker and
+    highlight) and the one-shot snapshot.
+    """
+    if interactive:
+        table = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1), show_header=show_header, pad_edge=False, show_edge=False, header_style=SELECTED_ROW_STYLE if focused else "bold")
+    else:
+        table = Table(title=title, box=box_style, expand=True, show_header=show_header)
+    header = f"{'▌' if focused else ' '}Activity {range_label}" if range_label is not None else "Activity"
+    table.add_column(header, ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column("Tokens", justify="right", no_wrap=True)
+    table.add_column("Time", justify="right", no_wrap=True)
+    for entry in entries:
+        duration = "—" if entry.is_launch else format_duration(entry.duration_seconds)
+        cells: list[Any] = [Text(entry.title), activity_tokens_cell(entry), duration]
+        if interactive:
+            is_sel = entry.entry_id == selected_id
+            highlighted = is_sel and focused
+            title = Text()
+            title.append("▶ " if is_sel else "  ", style="bold" if highlighted else "bold cyan")
+            title.append_text(cells[0])
+            table.add_row(title, *cells[1:], style=SELECTED_ROW_STYLE if highlighted else "")
+        else:
+            table.add_row(*cells)
+    if interactive and not entries:
+        table.add_row("No recorded activity for this agent.", "", "")
+    return table
+
+
+def build_activity_detail_lines(entry: ActivityEntry, node: ThreadTelemetryNode | None = None) -> list[Text]:
+    """Full detail for one activity entry; the unit of accounting is stated explicitly."""
+    step = entry.detail
+    lines: list[Text] = []
+
+    def field(label: str, value: str) -> None:
+        line = Text()
+        line.append(f"{label}: ", style="bold cyan")
+        line.append(value)
+        lines.append(line)
+
+    if entry.launch is not None:
+        return _launch_detail_lines(entry, node, field, lines)
+
+    lines.append(Text(step.row_label if step is not None else entry.title, style="bold"))
+    lines.append(Text(""))
+    if node is not None:
+        field("Agent", f"{node.title} ({node.thread_id[:8]})")
+        field("Driver / model", f"{node.driver} · {node.model or 'unknown'}")
+    field("Kind", entry.kind)
+    field("Status", entry.status)
+    if step is not None:
+        if step.provider_turn_id:
+            field("Provider turn", f"{step.provider_turn_id} (ordinal {step.step_index})")
+        else:
+            field("Step index", str(step.step_index))
+        field("Source", step.source)
+        field("Started", step.started_at or "not recorded")
+        field("Completed", step.completed_at or "not recorded")
+    field("Duration", format_duration(entry.duration_seconds))
+    lines.append(Text(""))
+    field("Unit of accounting", entry.accounting_scope)
+    lines.append(Text(entry.scope_note, style="dim"))
+    lines.append(Text(""))
+    if step is not None and entry.usage_status == "unavailable":
+        field("Tokens", "usage unavailable (not recorded; not zero)")
+    elif entry.total_tokens is None or step is None:
+        field("Tokens", "usage not recorded yet")
+    else:
+        if entry.usage_provenance == "cumulative_fallback":
+            field("Usage source", "cumulative thread usage fallback; may include earlier turns")
+        elif entry.usage_status == "partial":
+            field("Usage source", "partial usage recorded")
+        field("Total counted", f"{step.total_tokens:,}  (uncached input + cache read + output)")
+        field("Uncached input", f"{step.input_tokens:,}")
+        field("Cache read", f"{step.cache_read_tokens:,}")
+        field("Cache creation", f"{step.cache_creation_tokens:,}  (not in total)")
+        field("Output", f"{step.output_tokens:,}")
+        field("Thinking", f"{step.thinking_tokens:,}  (shown for reference; not added to the total)")
+        field("Response", f"{step.response_tokens:,}  (shown for reference; not added to the total)")
+    if step is not None:
+        lines.append(Text(""))
+        field("Tools", neutralize(", ".join(step.tool_calls), single_line=True) if step.tool_calls else "none recorded")
+        for detail in step.tool_details:
+            lines.append(Text(""))
+            verb = TOOL_VERBS.get(detail.name, detail.name)
+            lines.append(Text(neutralize(f"{verb} ({detail.name})", single_line=True), style="bold"))
+            if not detail.fields:
+                lines.append(Text("  details unavailable (only the tool name was recorded)", style="dim"))
+            for key, label in DETAIL_FIELD_LABELS:
+                if key in detail.fields:
+                    mark = " … (truncated)" if key in detail.truncated else ""
+                    field(f"  {label}", neutralize(detail.fields[key]) + mark)
+        if step.context_texts:
+            for rec in step.context_texts:
+                lines.append(Text(""))
+                label = "Recorded prompt" if rec.role == "user" else "Recorded reply"
+                lines.append(Text(f"{label}:", style="bold cyan"))
+                for text_line in neutralize(rec.text).splitlines():
+                    lines.append(Text(f"  {text_line}"))
+                if rec.truncated:
+                    lines.append(Text("  … (truncated)", style="dim"))
+        elif step.activity_kind == "provider_turn":
+            lines.append(Text("Recorded context: none associated with this turn", style="dim"))
+    return lines
+
+
+ORIGIN_LABELS = {"app_owned": "app-owned", "native": "native", "lineage": "thread lineage"}
+
+
+def _launch_detail_lines(entry: ActivityEntry, node: ThreadTelemetryNode | None, field: Any, lines: list[Text]) -> list[Text]:
+    launch = entry.launch
+    assert launch is not None
+    lines.append(Text("Subagent launch", style="bold"))
+    lines.append(Text(""))
+    if node is not None:
+        field("Parent agent", f"{neutralize(node.title, single_line=True)} ({node.thread_id[:8]})")
+    field("Task", neutralize(launch.title) if launch.title else "not recorded")
+    field("Child thread", neutralize(launch.child_thread_id, single_line=True) if launch.child_thread_id else "not recorded")
+    if launch.child_native_id and launch.child_native_id != launch.child_thread_id:
+        field("Child conversation", neutralize(launch.child_native_id, single_line=True))
+    field("Origin", ORIGIN_LABELS.get(launch.origin, neutralize(launch.origin, single_line=True)))
+    field("Status", neutralize(launch.status, single_line=True))
+    if launch.launched_at and launch.launch_time_source == "child thread created":
+        # Lineage only knows when the child thread was created, not when it was launched.
+        field("Child created", f"{neutralize(launch.launched_at, single_line=True)} (launch time not recorded)")
+    elif launch.launched_at:
+        field("Launched", f"{neutralize(launch.launched_at, single_line=True)} ({launch.launch_time_source})")
+    else:
+        field("Launched", "launch time not recorded")
+    if launch.parent_step_index is not None:
+        tool = neutralize(launch.tool_name or "tool", single_line=True)
+        field("Recorded in", f"Model step #{launch.parent_step_index} ({tool})")
+    field("Discovered via", ", ".join(f"Source {src}" for src in launch.sources) or "unknown")
+    lines.append(Text(""))
+    field("Unit of accounting", entry.accounting_scope)
+    lines.append(Text(entry.scope_note, style="dim"))
+    field("Tokens", "not applicable (launch marker)")
+    lines.append(Text(""))
+    if entry.child_thread_id:
+        lines.append(Text("Enter: Open subagent (full overview)", style="bold green"))
+    else:
+        lines.append(Text("Child telemetry not found; this launch can be inspected but not opened.", style="dim"))
+    return lines
 
 
 def build_scopes_summary(node: ThreadTelemetryNode, width: int = 80) -> list[Text]:
@@ -460,7 +900,7 @@ def build_scopes_summary(node: ThreadTelemetryNode, width: int = 80) -> list[Tex
 
 def build_dashboard_renderable(node: ThreadTelemetryNode, max_steps: int = 20) -> Group:
     """Build Rich renderable Group with Header, Metrics, Subagents, and Steps."""
-    status_str = "[bold green]RUNNING[/]" if node.status == "running" else f"[dim]{node.status.upper()}[/]"
+    status_str = f"[{get_status_style(node.status) or 'bold'}]{node.status.upper()}[/]"
     model_str = f"[bold yellow]{node.model}[/]"
     if node.thinking_level:
         model_str += f" [cyan]({node.thinking_level})[/]"
@@ -515,29 +955,12 @@ def build_dashboard_renderable(node: ThreadTelemetryNode, max_steps: int = 20) -
 
         renderables.append(subagent_table)
 
-    # 4. Step / Turn Stream Table - Node steps only (never combined_steps)
-    stream_table = Table(title="Recent Steps / Turns", expand=True, box=box.ROUNDED)
-    stream_table.add_column("Activity", style="dim", no_wrap=True)
-    stream_table.add_column("Source", style="cyan")
-    stream_table.add_column("Action / Tool")
-    stream_table.add_column("Uncached In", justify="right")
-    stream_table.add_column("Cache Read", justify="right")
-    stream_table.add_column("Thinking", justify="right")
-    stream_table.add_column("Response", justify="right")
-    stream_table.add_column("Latency", justify="right")
-
-    steps_to_show = node.steps[-max_steps:] if node.steps else []
-    for step in steps_to_show:
-        stream_table.add_row(
-            step.row_label,
-            step.source,
-            step.action_summary,
-            format_tokens(step.input_tokens),
-            format_tokens(step.cache_read_tokens),
-            format_tokens(step.thinking_tokens),
-            format_tokens(step.response_tokens),
-            format_duration(step.duration_seconds),
-        )
+    # 4. Activity feed - Node's own entries only (never combined_steps)
+    stream_table = build_activity_table(
+        build_activity_entries(node, max_steps),
+        title="Recent Steps / Turns",
+        box_style=box.ROUNDED,
+    )
 
     renderables.append(stream_table)
     return Group(*renderables)

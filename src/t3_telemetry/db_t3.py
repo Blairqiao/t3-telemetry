@@ -13,8 +13,13 @@ from t3_telemetry.models import (
     AppThreadRecord,
     ProviderThreadRecord,
     ProviderTurnRecord,
+    RecordedText,
     SubagentLinkRecord,
 )
+
+# Bounds for message text associated with provider turns.
+MAX_CONTEXT_CHARS = 2000
+CONTEXT_ID_CHUNK = 500  # well under SQLite's default 999 bound-variable limit
 
 
 def connect_readonly_sqlite(db_path: Path | str) -> sqlite3.Connection:
@@ -47,6 +52,8 @@ class T3StateSnapshot:
     provider_turns_by_thread: dict[str, list[ProviderTurnRecord]] = field(default_factory=dict)
     subagents_by_parent: dict[str, list[SubagentLinkRecord]] = field(default_factory=dict)
     provider_threads_by_thread: dict[str, list[ProviderThreadRecord]] = field(default_factory=dict)
+    # Bounded user prompt / latest assistant text per provider_turn_id, via explicit node references only.
+    turn_context: dict[str, list[RecordedText]] = field(default_factory=dict)
 
     def get_provider_thread(self, thread_id: str) -> ProviderThreadRecord | None:
         """Get the active provider thread for an app thread, or latest available."""
@@ -287,6 +294,7 @@ def read_t3_state(t3_dir: Path | str) -> T3StateSnapshot:
                     output_tokens=output_tokens,
                     usage_status=usage_status,
                     usage_provenance=usage_provenance,
+                    node_id=row["node_id"],
                 )
                 snapshot.provider_turns_by_thread.setdefault(th_id, []).append(turn_record)
 
@@ -334,7 +342,87 @@ def read_t3_state(t3_dir: Path | str) -> T3StateSnapshot:
                 )
                 snapshot.subagents_by_parent.setdefault(parent_th_id, []).append(sub_record)
 
+        # 5. Optional message text associated with provider turns
+        turn_ids = [t.provider_turn_id for turns in snapshot.provider_turns_by_thread.values() for t in turns]
+        snapshot.turn_context = _read_turn_context(cur, tables, turn_ids)
+
     finally:
         conn.close()
 
     return snapshot
+
+
+def _bounded_text(raw: object) -> RecordedText | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return RecordedText(role="", text=raw[:MAX_CONTEXT_CHARS], truncated=len(raw) > MAX_CONTEXT_CHARS)
+
+
+def _read_turn_context(
+    cur: sqlite3.Cursor, tables: set[str], turn_ids: list[str]
+) -> dict[str, list[RecordedText]]:
+    """Associate message text with the provider turns already read in this snapshot.
+
+    - user prompt: a ``user`` message whose node_id is the turn's own node_id;
+    - reply: the latest ``assistant`` message on a node whose provider_turn_id is the turn.
+
+    Both queries are scoped to ``turn_ids`` (parameterized ``IN`` in chunks under SQLite's
+    variable limit), so unrelated threads never crowd out a turn's context. Only text is read,
+    truncated in SQL to the bound (+1 char to detect truncation). Missing tables, columns,
+    or JSON support yield no context for that query; prompts survive a failed reply query.
+    """
+    msgs = "orchestration_v2_projection_messages"
+    if msgs not in tables or not turn_ids:
+        return {}
+    text_expr = f"substr(json_extract(m.payload_json, '$.text'), 1, {MAX_CONTEXT_CHARS + 1})"
+    chunks = [turn_ids[i : i + CONTEXT_ID_CHUNK] for i in range(0, len(turn_ids), CONTEXT_ID_CHUNK)]
+    prompts: dict[str, RecordedText] = {}
+    replies: dict[str, RecordedText] = {}
+    if "orchestration_v2_projection_provider_turns" in tables:
+        try:
+            for chunk in chunks:
+                marks = ",".join("?" * len(chunk))
+                cur.execute(
+                    f"""
+                    SELECT t.provider_turn_id AS turn_id, {text_expr} AS text
+                    FROM orchestration_v2_projection_provider_turns t
+                    JOIN {msgs} m ON m.node_id = t.node_id
+                    WHERE t.provider_turn_id IN ({marks}) AND t.node_id IS NOT NULL AND m.role = 'user' AND json_valid(m.payload_json)
+                    ORDER BY m.created_at DESC, m.message_id DESC
+                    """,
+                    chunk,
+                )
+                for row in cur.fetchall():
+                    rec = _bounded_text(row["text"])
+                    if rec is not None:
+                        rec.role = "user"
+                        prompts[row["turn_id"]] = rec  # descending order: earliest prompt wins
+        except sqlite3.Error:
+            prompts = {}
+    if "orchestration_v2_projection_nodes" in tables:
+        try:
+            for chunk in chunks:
+                marks = ",".join("?" * len(chunk))
+                cur.execute(
+                    f"""
+                    SELECT n.provider_turn_id AS turn_id, {text_expr} AS text
+                    FROM {msgs} m
+                    JOIN orchestration_v2_projection_nodes n ON n.node_id = m.node_id
+                    WHERE n.provider_turn_id IN ({marks}) AND m.role = 'assistant' AND json_valid(m.payload_json)
+                    ORDER BY m.created_at DESC, m.message_id DESC
+                    """,
+                    chunk,
+                )
+                for row in cur.fetchall():
+                    if row["turn_id"] in replies:
+                        continue  # keep the latest reply only
+                    rec = _bounded_text(row["text"])
+                    if rec is not None:
+                        rec.role = "assistant"
+                        replies[row["turn_id"]] = rec
+        except sqlite3.Error:
+            replies = {}
+    out: dict[str, list[RecordedText]] = {}
+    for turn_id in list(prompts) + [t for t in replies if t not in prompts]:
+        out[turn_id] = [r for r in (prompts.get(turn_id), replies.get(turn_id)) if r is not None]
+    return out

@@ -13,11 +13,18 @@ class ScreenState:
     node_id: str
     title: str = ""
     focus: str = "activity"  # "activity" or "subagents"
-    activity_scroll: int = 0
     child_ids: list[str] = field(default_factory=list)
     selected_child_id: str | None = None
     child_scroll: int = 0
-    max_activity_scroll: int = 0
+    # Activity identity is separate from node identity: an activity is never a stack entry.
+    activity_ids: list[str] = field(default_factory=list)
+    selected_activity_id: str | None = None
+    activity_offset: int = 0
+    detail_activity_id: str | None = None
+    detail_scroll: int = 0
+    max_detail_scroll: int = 0
+    # Launch entry ID -> child node ID, only for launches whose child is present.
+    activity_targets: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -43,17 +50,6 @@ class NavigationState:
             if self.stack and self.stack[-1].node_id == val:
                 return
             self.stack = [ScreenState(node_id=val)]
-
-    @property
-    def detail_scroll(self) -> int:
-        if self.stack:
-            return self.stack[-1].activity_scroll
-        return 0
-
-    @detail_scroll.setter
-    def detail_scroll(self, val: int) -> None:
-        if self.stack:
-            self.stack[-1].activity_scroll = val
 
     @property
     def current_screen(self) -> ScreenState | None:
@@ -92,12 +88,53 @@ class NavigationState:
                 break
         self.stack = new_stack
 
+    def sync_activities(self, ids: list[str], targets: dict[str, str] | None = None) -> None:
+        """Reconcile the current screen's activity selection with the latest entry IDs.
+
+        ``targets`` maps launch entries to the child they open.
+        """
+        screen = self.current_screen
+        if screen is None:
+            return
+        screen.activity_targets = dict(targets or {})
+        prior_ids = screen.activity_ids
+        screen.activity_ids = list(ids)
+        selected = screen.selected_activity_id
+        if not ids:
+            screen.selected_activity_id = None
+        elif selected in ids:
+            pass
+        elif selected is None:
+            screen.selected_activity_id = ids[-1]  # default to the most recent entry
+        else:
+            old_index = prior_ids.index(selected) if selected in prior_ids else len(ids) - 1
+            screen.selected_activity_id = ids[min(old_index, len(ids) - 1)]
+        if screen.detail_activity_id and screen.detail_activity_id not in ids:
+            screen.detail_activity_id = None
+            screen.detail_scroll = 0
+            self.notice = "Activity is no longer available"
+
+    def sync_children(self, ids: list[str]) -> None:
+        """Reconcile the current screen's subagent list; focus falls back to activity when it empties."""
+        screen = self.current_screen
+        if screen is None:
+            return
+        screen.child_ids = list(ids)
+        if not screen.child_ids:
+            screen.focus = "activity"
+        elif screen.selected_child_id not in screen.child_ids:
+            screen.selected_child_id = screen.child_ids[0]
+
     def move(self, delta: int) -> None:
         if self.stack:
             screen = self.stack[-1]
-            if screen.focus == "activity":
-                new_scroll = screen.activity_scroll + delta
-                screen.activity_scroll = max(0, min(screen.max_activity_scroll, new_scroll))
+            if screen.detail_activity_id:
+                screen.detail_scroll = max(0, min(screen.max_detail_scroll, screen.detail_scroll + delta))
+            elif screen.focus == "activity":
+                if screen.activity_ids:
+                    ids = screen.activity_ids
+                    curr_idx = ids.index(screen.selected_activity_id) if screen.selected_activity_id in ids else len(ids) - 1
+                    screen.selected_activity_id = ids[max(0, min(len(ids) - 1, curr_idx + delta))]
             elif screen.focus == "subagents":
                 if screen.child_ids:
                     curr_idx = (
@@ -114,6 +151,8 @@ class NavigationState:
     def tab(self) -> None:
         if self.stack:
             screen = self.stack[-1]
+            if screen.detail_activity_id:
+                return
             if screen.child_ids:
                 if screen.focus == "activity":
                     screen.focus = "subagents"
@@ -128,13 +167,51 @@ class NavigationState:
                 self.stack = [ScreenState(node_id=self.selected_id)]
         else:
             screen = self.stack[-1]
-            target = screen.selected_child_id
-            if target and screen.child_ids and (screen.focus == "subagents" or screen.selected_child_id):
-                self.stack.append(ScreenState(node_id=target))
+            if screen.detail_activity_id:
+                # Open subagent from a launch detail; the parent keeps its detail for Escape.
+                target = screen.activity_targets.get(screen.detail_activity_id)
+                if target and target in screen.child_ids:
+                    self.stack.append(ScreenState(node_id=target))
+                return
+            if screen.focus == "subagents":
+                target = screen.selected_child_id
+                if target and target in screen.child_ids:
+                    self.stack.append(ScreenState(node_id=target))
+            elif screen.focus == "activity":
+                target = screen.selected_activity_id
+                if target and target in screen.activity_ids:
+                    screen.detail_activity_id = target
+                    screen.detail_scroll = 0
 
     def escape(self) -> None:
         if self.stack:
-            self.stack.pop()
+            screen = self.stack[-1]
+            if screen.detail_activity_id:
+                screen.detail_activity_id = None
+                screen.detail_scroll = 0
+            else:
+                self.stack.pop()
+
+
+def table_header_lines(rows: int) -> int:
+    """Interactive lists reserve a column header and its divider."""
+    return 2
+
+
+def table_geometry(lines: int) -> tuple[int, int]:
+    """Split the budget into a header, divider, and visible data rows."""
+    if lines <= 0:
+        return 0, 0
+    return min(2, lines), max(0, lines - 2)
+
+
+def window_start(total: int, selected_index: int, offset: int, rows: int) -> int:
+    """First visible index for a list window of ``rows`` that keeps the selection visible."""
+    rows = max(1, rows)
+    start = min(max(0, offset), selected_index)
+    if selected_index >= start + rows:
+        start = selected_index - rows + 1
+    return max(0, min(start, max(0, total - rows)))
 
 
 class TerminalAdapter:
@@ -168,13 +245,13 @@ class TelemetryBrowser:
     def handle_key(self, key: str) -> bool:
         if self.navigation.notice:
             self.navigation.notice = None
-        if key in ("UP", "k"):
+        if key in ("UP", "k", "w", "W"):
             self.navigation.move(-1)
-        elif key in ("DOWN", "j"):
+        elif key in ("DOWN", "j", "s", "S"):
             self.navigation.move(1)
-        elif key in ("TAB", "	"):
+        elif key in ("TAB", "SHIFT_TAB", "	"):
             self.navigation.tab()
-        elif key in ("ENTER", chr(13), chr(10)):
+        elif key in ("ENTER", "e", "E", chr(13), chr(10)):
             self.navigation.enter()
         elif key in ("ESC", chr(27)):
             self.navigation.escape()

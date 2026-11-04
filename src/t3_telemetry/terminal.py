@@ -19,6 +19,7 @@ from .tui import TerminalAdapter
 class PosixTerminalAdapter(TerminalAdapter):
     ESC_TIMEOUT: float = 0.05
     SEQUENCES: dict[bytes, str] = {
+        b"\x1b[Z": "SHIFT_TAB",
         b"[A": "UP",
         b"OA": "UP",
         b"[B": "DOWN",

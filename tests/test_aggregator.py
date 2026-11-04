@@ -1460,3 +1460,290 @@ def test_native_subagent_context_empty_no_data(tmp_path: Path):
     assert child.context_limit_provenance == "default"
     assert len(child.context_samples) == 0
     assert child.latest_step_label is None
+
+
+# --- Recorded context carried into steps ---
+
+
+def _claude_thread_db(db_file: Path, with_context: bool) -> None:
+    conn = setup_test_db(db_file)
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-c", "proj", "Claude", "claudeAgent", "full-access", "default", "pt-c",
+          "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None, "{}", "claude_inst"))
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-c", "t-c", "n", "claudeAgent", "idle", "2026-11-03T10:05:00Z", "{}", "claudeAgent", "claude_inst"))
+    usage = {"nativeTurnRef": {"driver": "claudeAgent"},
+             "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 100, "outputTokens": 40}}
+    zero = {"nativeTurnRef": {"driver": "claudeAgent"},
+            "turnTokenUsage": {"usageStatus": "complete", "inputTokens": 0, "outputTokens": 0}}
+    for tid, node, ordn, payload in (("turn-1", "root-1", 1, usage), ("turn-2", "root-2", 2, zero)):
+        conn.execute("""
+        INSERT INTO orchestration_v2_projection_provider_turns
+        (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (tid, "t-c", "pt-c", node, ordn, "completed", "2026-11-03T10:00:00Z", "2026-11-03T10:01:00Z",
+              json.dumps(payload)))
+    if with_context:
+        conn.executescript("""
+        CREATE TABLE orchestration_v2_projection_nodes (node_id TEXT PRIMARY KEY, thread_id TEXT, kind TEXT,
+            provider_turn_id TEXT, payload_json TEXT);
+        CREATE TABLE orchestration_v2_projection_messages (message_id TEXT PRIMARY KEY, thread_id TEXT, node_id TEXT,
+            role TEXT, created_at TEXT, payload_json TEXT);
+        INSERT INTO orchestration_v2_projection_nodes VALUES ('am-1', 't-c', 'assistant_message', 'turn-1', '{}');
+        INSERT INTO orchestration_v2_projection_messages VALUES ('u1', 't-c', 'root-1', 'user', '2026-11-03T10:00:00Z', '{"text": "Run tests"}');
+        INSERT INTO orchestration_v2_projection_messages VALUES ('a1', 't-c', 'am-1', 'assistant', '2026-11-03T10:00:05Z', '{"text": "Done"}');
+        """)
+    conn.commit()
+    conn.close()
+
+
+def test_provider_turn_context_carried_and_totals_unchanged(tmp_path: Path):
+    from t3_telemetry.activity import build_activity_entries
+
+    plain_dir, ctx_dir = tmp_path / "plain", tmp_path / "ctx"
+    plain_dir.mkdir()
+    ctx_dir.mkdir()
+    _claude_thread_db(plain_dir / "statev2.sqlite", with_context=False)
+    _claude_thread_db(ctx_dir / "statev2.sqlite", with_context=True)
+    plain = build_thread_telemetry("t-c", plain_dir)
+    rich = build_thread_telemetry("t-c", ctx_dir)
+
+    assert plain.self_metrics.to_dict() == rich.self_metrics.to_dict()
+    assert plain.rollup_metrics.to_dict() == rich.rollup_metrics.to_dict()
+    assert [(r.role, r.text) for r in rich.steps[0].context_texts] == [("user", "Run tests"), ("assistant", "Done")]
+    assert rich.steps[0].tool_calls == [] and rich.steps[0].tool_details == []
+    assert rich.steps[1].context_texts == []
+
+    entries = build_activity_entries(rich)
+    assert entries[0].title == "Prompt · Run tests · #1"
+    assert entries[1].title == "Provider turn #2 · action details unavailable"
+    assert entries[1].total_tokens == 0 and entries[1].usage_status == "complete"
+    assert entries[0].usage_provenance == "exact"
+    # Existing JSON keys remain; new ones are additive.
+    step_json = rich.to_dict()["steps"][0]
+    assert {"tool_calls", "total_tokens", "action_summary", "row_label"} <= step_json.keys()
+    assert step_json["context_texts"][0]["text"] == "Run tests"
+
+
+def test_cumulative_fallback_turn_entry_labeled(tmp_path: Path):
+    from t3_telemetry.activity import build_activity_entries
+
+    conn = setup_test_db(tmp_path / "statev2.sqlite")
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_turns
+    (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("turn-f", "t-f", "pt-f", "n", 1, "completed", None, None,
+          json.dumps({"nativeTurnRef": {"driver": "codex"}, "tokenUsage": {"inputTokens": 50, "outputTokens": 5}})))
+    conn.commit()
+    conn.close()
+    node = build_thread_telemetry("t-f", tmp_path)
+    entry = build_activity_entries(node)[0]
+    assert entry.usage_provenance == "cumulative_fallback" and entry.total_tokens == 55
+
+
+def test_antigravity_root_and_native_child_retain_tool_details(tmp_path: Path):
+    from t3_telemetry.activity import build_activity_entries
+
+    root_id = "aaaaaaaa-1111-2222-3333-444444444444"
+    child_id = "bbbbbbbb-1111-2222-3333-444444444444"
+    conn = setup_test_db(tmp_path / "statev2.sqlite")
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_threads
+    (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+     active_provider_thread_id, created_at, updated_at, deleted_at, payload_json, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("t-a", "proj", "Agy", "antigravity", "full-access", "default", "pt-a",
+          "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z", None, "{}", "antigravity"))
+    conn.execute("""
+    INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json, driver, provider_instance_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("pt-a", "t-a", "n", "antigravity", "idle", "2026-11-03T10:05:00Z",
+          json.dumps({"nativeThreadRef": {"nativeId": root_id}}), "antigravity", "antigravity"))
+    conn.commit()
+    conn.close()
+
+    def transcript(native_id, records):
+        path = tmp_path / "brain" / native_id / ".system_generated" / "logs" / "transcript.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+    transcript(root_id, [
+        {"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 10, "tool_calls": [
+            {"name": "invoke_subagent", "args": {"TypeName": "reviewer"}}]},
+        {"step_index": 2, "type": "AGENCY_TOOL_CALL", "content": f"conversationId: {child_id}"},
+    ])
+    transcript(child_id, [
+        {"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 7, "tool_calls": [
+            {"name": "run_command", "args": json.dumps({"CommandLine": "uv run pytest"})}]},
+    ])
+
+    node = build_thread_telemetry("t-a", tmp_path)
+    assert build_activity_entries(node)[0].title == "Launch subagent · reviewer · #1"
+    child = node.subagents[0]
+    assert child.native_id == child_id
+    assert build_activity_entries(child)[0].title == "Run command · uv run pytest · #1"
+    assert node.rollup_metrics.input_tokens == 17
+
+
+# --- Subagent launches in the parent feed ---------------------------------
+
+from t3_telemetry.db_t3 import T3StateSnapshot
+from t3_telemetry.models import (
+    AppThreadRecord,
+    NativeLaunchRecord,
+    ProviderThreadRecord,
+    ProviderTurnRecord,
+    SubagentLinkRecord,
+)
+
+
+def _app_thread(tid, title, provider="claudeAgent", parent=None, created=None, pt=None):
+    return AppThreadRecord(
+        thread_id=tid, project_id="p", title=title, default_provider=provider, provider_instance_id=provider,
+        model="m", thinking_level=None, active_provider_thread_id=pt, parent_thread_id=parent,
+        root_thread_id=None, relationship_to_parent=None, created_at=created, updated_at=created,
+    )
+
+
+def _turn(tid, ordinal, started, tokens=100):
+    return ProviderTurnRecord(
+        provider_turn_id=f"{tid}-turn-{ordinal}", thread_id=tid, provider_thread_id=f"pt-{tid}", driver="claudeAgent",
+        native_turn_id=None, ordinal=ordinal, status="completed", started_at=started, completed_at=started,
+        input_tokens=tokens, output_tokens=10, usage_status="complete", usage_provenance="exact",
+    )
+
+
+def _link(sid, parent, child, started=None, title="review", status="completed"):
+    return SubagentLinkRecord(
+        subagent_id=sid, parent_thread_id=parent, child_thread_id=child, driver="claudeAgent",
+        provider_instance_id=None, model=None, title=title, status=status, started_at=started,
+    )
+
+
+def _launch_snapshot():
+    snap = T3StateSnapshot()
+    snap.threads["par"] = _app_thread("par", "Parent", created="2026-11-03T10:00:00Z")
+    snap.threads["kid"] = _app_thread("kid", "Kid", parent="par", created="2026-11-03T10:01:30Z")
+    snap.provider_turns_by_thread["par"] = [
+        _turn("par", 1, "2026-11-03T10:01:00Z"),
+        _turn("par", 2, "2026-11-03T10:03:00Z"),
+    ]
+    snap.provider_turns_by_thread["kid"] = [_turn("kid", 1, "2026-11-03T10:02:00Z", tokens=40)]
+    return snap
+
+
+def test_app_owned_launch_dedups_lineage_and_orders_by_time(tmp_path: Path):
+    from t3_telemetry.activity import KIND_LAUNCH, build_activity_entries
+
+    snap = _launch_snapshot()
+    snap.subagents_by_parent["par"] = [_link("s1", "par", "kid", started="2026-11-03T10:02:00Z")]
+    node = build_thread_telemetry("par", tmp_path, snapshot=snap)
+
+    assert len(node.launches) == 1  # Source A and lineage (B) found the same invocation
+    launch = node.launches[0]
+    assert launch.launch_id == "subagent:s1" and launch.sources == ["A", "B"] and launch.child_present
+    entries = build_activity_entries(node)
+    assert [e.kind for e in entries] == ["provider_turn", KIND_LAUNCH, "provider_turn"]
+    marker = entries[1]
+    assert marker.total_tokens is None and marker.child_thread_id == "kid"
+    assert "review" in marker.title
+    # Metrics are unchanged by launches: the child's turn counts once, only in rollup.
+    assert node.self_metrics.provider_turn_count == 2 and node.self_metrics.input_tokens == 200
+    assert node.rollup_metrics.input_tokens == 240
+    assert all(e.detail is None or e.detail.provider_turn_id.startswith("par-") for e in entries)
+    assert node.to_dict()["launches"][0]["launch_id"] == "subagent:s1"
+
+
+def test_repeated_invocations_stay_distinct_and_undated_is_labeled(tmp_path: Path):
+    from t3_telemetry.activity import UNDATED_LABEL, build_activity_entries
+
+    snap = _launch_snapshot()
+    snap.subagents_by_parent["par"] = [
+        _link("s1", "par", "kid", started="2026-11-03T10:02:00Z"),
+        _link("s2", "par", "kid", started=None, title="second pass"),
+        _link("s3", "par", None, title="never materialized"),
+    ]
+    node = build_thread_telemetry("par", tmp_path, snapshot=snap)
+    assert [l.launch_id for l in node.launches] == ["subagent:s1", "subagent:s2", "subagent:s3"]
+    assert len(node.subagents) == 1 and node.self_metrics.total_subagents == 1
+    entries = build_activity_entries(node)
+    titles = [e.title for e in entries]
+    assert titles[0].startswith(f"{UNDATED_LABEL} · ") and "second pass" in titles[0]
+    assert titles[1].startswith(f"{UNDATED_LABEL} · ") and "never materialized" in titles[1]
+    assert entries[1].child_thread_id is None  # no child: inspectable, not navigable
+    assert entries[1].launch.launched_at is None
+    assert len({e.entry_id for e in entries}) == len(entries)
+
+
+def test_lineage_only_child_uses_parent_child_fallback(tmp_path: Path):
+    snap = _launch_snapshot()
+    node = build_thread_telemetry("par", tmp_path, snapshot=snap)
+    assert [(l.launch_id, l.sources, l.launch_time_source) for l in node.launches] == [
+        ("child:kid", ["B"], "child thread created")
+    ]
+
+
+def test_max_steps_keeps_counted_activity_and_merges_launch_markers(tmp_path: Path):
+    from t3_telemetry.activity import KIND_LAUNCH, build_activity_entries
+
+    snap = _launch_snapshot()
+    snap.provider_turns_by_thread["par"] = [_turn("par", i, f"2026-11-03T10:0{i}:00Z") for i in range(1, 6)]
+    snap.subagents_by_parent["par"] = [
+        _link(f"s{i}", "par", None, started=f"2026-11-03T10:0{i}:30Z", title=f"job {i}") for i in range(1, 6)
+    ]
+    node = build_thread_telemetry("par", tmp_path, snapshot=snap)
+    entries = build_activity_entries(node, max_steps=2)
+    counted = [e for e in entries if e.kind != KIND_LAUNCH]
+    markers = [e for e in entries if e.kind == KIND_LAUNCH]
+    assert [e.detail.step_index for e in counted] == [4, 5]  # --max-steps unchanged for counted activity
+    assert {m.launch.launch_id for m in markers} == {launch.launch_id for launch in node.launches}
+    assert [m.launch.title for m in markers if m.launch.launch_id.startswith("subagent:")] == [
+        f"job {i}" for i in range(1, 6)
+    ]
+    assert entries[0].launch.title == "job 1" and entries[-1].launch.title == "job 5"
+    assert len(build_activity_entries(node, max_steps=0)) == 10 + 1  # + lineage child "kid"
+
+
+def test_native_launch_merges_with_app_link_by_conversation_id(tmp_path: Path):
+    snap = T3StateSnapshot()
+    snap.threads["root"] = _app_thread("root", "Root", provider="antigravity", pt="pt-root")
+    snap.provider_threads["pt-root"] = ProviderThreadRecord(
+        provider_thread_id="pt-root", thread_id="root", driver="antigravity", provider_instance_id="antigravity",
+        native_id="nat-root", status="idle",
+    )
+    snap.threads["kid"] = _app_thread("kid", "Kid", provider="antigravity", pt="pt-kid")
+    snap.provider_threads["pt-kid"] = ProviderThreadRecord(
+        provider_thread_id="pt-kid", thread_id="kid", driver="antigravity", provider_instance_id="antigravity",
+        native_id="nat-kid", status="idle",
+    )
+    snap.subagents_by_parent["root"] = [_link("s1", "root", "kid", title="")]
+
+    def reader(native_id, _dir, label):
+        if native_id == "nat-root":
+            return ConversationTelemetry(
+                native_id=native_id,
+                steps=[ModelStep(step_index=4, source=label, tool_calls=["invoke_subagent"], input_tokens=5,
+                                 started_at="2026-11-03T10:00:00Z")],
+                child_native_ids=["nat-kid", "nat-other"],
+                launches=[NativeLaunchRecord("nat-kid", 4, "2026-11-03T10:00:01Z", "reviewer", "invoke_subagent")],
+            )
+        return ConversationTelemetry(native_id=native_id, steps=[ModelStep(step_index=1, source=label, input_tokens=7)])
+
+    node = build_thread_telemetry("root", tmp_path, snapshot=snap, agy_reader=reader)
+    by_id = {l.launch_id: l for l in node.launches}
+    assert set(by_id) == {"subagent:s1", "native:nat-other"}
+    merged = by_id["subagent:s1"]
+    assert merged.sources == ["A", "C"] and merged.parent_step_index == 4 and merged.title == "reviewer"
+    assert merged.launched_at == "2026-11-03T10:00:01Z" and merged.launch_time_source == "transcript tool call"
+    other = by_id["native:nat-other"]
+    assert other.launched_at is None and other.child_present  # native child built from Source C
+    assert node.rollup_metrics.input_tokens == 5 + 7 + 7

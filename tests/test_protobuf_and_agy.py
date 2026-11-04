@@ -342,3 +342,162 @@ def test_sqlite_ro_mode(sample_agy_fixture):
     with pytest.raises(sqlite3.OperationalError):
         c.execute("INSERT INTO steps (idx, step_type, status) VALUES (999, 15, 1)")
     conn.close()
+
+
+# --- Recorded tool-call details ---
+
+
+def test_parse_tool_call_detail_structured_string_and_malformed():
+    from t3_telemetry.db_agy import MAX_FIELD_CHARS, parse_tool_call_detail
+
+    d = parse_tool_call_detail({"name": "run_command", "args": {
+        "CommandLine": "uv run pytest", "Cwd": "/repo", "WaitMsBeforeAsync": 500, "toolSummary": "run tests"}})
+    assert d.fields == {"command": "uv run pytest", "cwd": "/repo", "summary": "run tests"}
+
+    d = parse_tool_call_detail({"name": "view_file", "args": json.dumps({"AbsolutePath": "/repo/src/app.py"})})
+    assert d.fields == {"path": "/repo/src/app.py"}
+
+    # Content bodies are not retained; non-scalar and boolean values ignored.
+    d = parse_tool_call_detail({"name": "write_to_file", "args": {
+        "CodeContent": "secret body", "TargetFile": "a.py", "Overwrite": True, "Description": ["x"]}})
+    assert d.fields == {"path": "a.py"}
+
+    assert parse_tool_call_detail({"name": "x", "args": "{not json"}).fields == {}
+    assert parse_tool_call_detail({"name": "x", "args": "[1, 2]"}).fields == {}
+    assert parse_tool_call_detail({"name": "x"}).fields == {}
+    assert parse_tool_call_detail({"args": {}}) is None
+    assert parse_tool_call_detail("run_command") is None
+
+    d = parse_tool_call_detail({"name": "run_command", "args": {"CommandLine": "x" * (MAX_FIELD_CHARS + 50)}})
+    assert len(d.fields["command"]) == MAX_FIELD_CHARS and d.truncated == ["command"]
+
+
+def test_parse_tool_call_detail_double_encoded_values():
+    """Real Antigravity transcripts JSON-encode every args value; scalars are unwrapped before bounding."""
+    from t3_telemetry.activity import describe_tool
+    from t3_telemetry.db_agy import MAX_FIELD_CHARS, parse_tool_call_detail
+
+    record = {"name": "run_command", "args": json.dumps({
+        "CommandLine": json.dumps("pwd && git status\necho done"), "Cwd": json.dumps("/repo"),
+        "WaitMsBeforeAsync": json.dumps(500), "toolSummary": json.dumps("check repo")})}
+    d = parse_tool_call_detail(record)
+    assert d.fields == {"command": "pwd && git status\necho done", "cwd": "/repo", "summary": "check repo"}
+    assert describe_tool(d) == "Run command · pwd && git status echo done"
+
+    d = parse_tool_call_detail({"name": "view_file", "args": {
+        "AbsolutePath": json.dumps("/repo/src/app.py"), "StartLine": "1"}})
+    assert d.fields == {"path": "/repo/src/app.py"}
+
+    # Non-scalar decodes and undecodable strings keep the raw string.
+    d = parse_tool_call_detail({"name": "x", "args": {"Query": "[1, 2]", "Path": "plain/path"}})
+    assert d.fields == {"query": "[1, 2]", "path": "plain/path"}
+
+    # Decoded before truncation: the encoding quotes do not count toward the bound.
+    d = parse_tool_call_detail({"name": "run_command", "args": {"CommandLine": json.dumps("x" * MAX_FIELD_CHARS)}})
+    assert d.fields["command"] == "x" * MAX_FIELD_CHARS and d.truncated == []
+
+
+def _write_transcript(path: Path, records: list) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(r if isinstance(r, str) else json.dumps(r) for r in records) + "\n")
+
+
+def test_transcript_fallback_carries_tool_details(tmp_path: Path):
+    conv_id = "33333333-3333-4444-5555-666666666666"
+    _write_transcript(tmp_path / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl", [
+        {"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 10,
+         "tool_calls": [{"name": "run_command", "args": {"CommandLine": "ls -la"}}, {"name": "list_dir"}]},
+        "not json at all",
+    ])
+    tel = read_agy_conversation(conv_id, tmp_path)
+    assert tel.source == "transcript"
+    step = tel.steps[0]
+    assert step.tool_calls == ["run_command", "list_dir"]
+    assert [d.fields for d in step.tool_details] == [{"command": "ls -la"}, {}]
+
+
+def test_db_path_carries_tool_details(sample_agy_fixture):
+    base_dir, conv_id, _, _ = sample_agy_fixture
+    transcript = next(base_dir.glob(f"providers/antigravity/*/antigravity-acp/brain/{conv_id}/.system_generated/logs/transcript.jsonl"))
+    _write_transcript(transcript, [
+        {"step_index": 1, "type": "PLANNER_RESPONSE",
+         "tool_calls": [{"name": "view_file", "args": {"AbsolutePath": "/r/a.py"}}]},
+        {"step_index": 5, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "replace_file_content"}]},
+    ])
+    tel = read_agy_conversation(conv_id, base_dir)
+    assert tel.source == "db"
+    assert tel.steps[0].tool_details[0].fields == {"path": "/r/a.py"}
+    assert tel.steps[1].tool_calls == ["replace_file_content"]
+    assert tel.steps[1].tool_details[0].fields == {}
+    # DB usage is unchanged by enrichment.
+    assert tel.steps[0].input_tokens == 500 and tel.steps[1].input_tokens == 800
+
+
+def test_transcript_pairs_each_invoke_subagent_call_with_its_child(tmp_path: Path):
+    conv_id = "44444444-3333-4444-5555-666666666666"
+    kid_a = "aaaaaaaa-0000-4000-8000-000000000001"
+    kid_b = "bbbbbbbb-0000-4000-8000-000000000002"
+    stray = "cccccccc-0000-4000-8000-000000000003"
+    _write_transcript(tmp_path / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl", [
+        {"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": "2026-11-03T10:00:00Z", "input_tokens": 1,
+         "tool_calls": [{"name": "invoke_subagent", "args": {"TypeName": "reviewer", "Prompt": "secret"}}]},
+        {"step_index": 4, "type": "GENERIC", "content": json.dumps({"conversationId": kid_a})},
+        {"step_index": 5, "type": "GENERIC", "content": f"still running conversationId: {kid_a}"},  # duplicate discovery
+        {"step_index": 6, "type": "PLANNER_RESPONSE", "created_at": "2026-11-03T10:05:00Z", "input_tokens": 1,
+         "tool_calls": [{"name": "invoke_subagent", "args": {"TypeName": "reviewer"}}]},  # repeated invocation
+        {"step_index": 7, "type": "GENERIC", "content": json.dumps({"conversationId": kid_b})},
+        {"step_index": 8, "type": "GENERIC", "content": f"conversationId: {stray}"},
+    ])
+    tel = read_agy_conversation(conv_id, tmp_path)
+    assert [(l.child_native_id, l.step_index, l.launched_at, l.task) for l in tel.launches] == [
+        (kid_a, 3, "2026-11-03T10:00:00Z", "reviewer"),
+        (kid_b, 6, "2026-11-03T10:05:00Z", "reviewer"),
+        (stray, None, None, None),  # discovery only: nothing invented
+    ]
+    assert tel.child_native_ids == [kid_a, kid_b, stray]
+    assert all("secret" not in repr(l) for l in tel.launches)
+
+
+def test_failed_invoke_does_not_adopt_a_later_escaped_conversation_id(tmp_path: Path):
+    conv_id = "55555555-3333-4444-5555-666666666666"
+    other = "dddddddd-0000-4000-8000-000000000004"
+    _write_transcript(tmp_path / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl", [
+        {"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": "2026-11-03T10:00:00Z", "input_tokens": 1,
+         "tool_calls": [{"name": "invoke_subagent", "args": {"TypeName": "reviewer"}}]},
+        {"step_index": 4, "type": "GENERIC", "content": "Error: subagent failed to start"},  # its own result, no ID
+        {"step_index": 5, "type": "PLANNER_RESPONSE", "created_at": "2026-11-03T10:01:00Z", "input_tokens": 1,
+         "tool_calls": [{"name": "run_command", "args": {"CommandLine": "cat other/transcript.jsonl"}}]},
+        {"step_index": 6, "type": "GENERIC", "content": json.dumps({"conversationId": other})},  # escaped on the raw line
+    ])
+    tel = read_agy_conversation(conv_id, tmp_path)
+    assert tel.child_native_ids == []
+    assert tel.launches == []  # a failed invoke records no launch
+
+
+def test_mixed_tool_calls_pair_each_result_by_position(tmp_path: Path):
+    conv_id = "66666666-3333-4444-5555-666666666666"
+    kid = "eeeeeeee-0000-4000-8000-000000000005"
+    _write_transcript(tmp_path / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl", [
+        {"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": "2026-11-03T10:00:00Z", "input_tokens": 1,
+         "tool_calls": [{"name": "edit_file", "args": {"TargetFile": "/r/a.py"}},
+                        {"name": "invoke_subagent", "args": {"TypeName": "reviewer"}}]},
+        {"step_index": 4, "type": "GENERIC", "content": "edited /r/a.py"},  # edit_file result, no ID
+        {"step_index": 5, "type": "GENERIC", "content": json.dumps({"conversationId": kid})},  # invoke result
+    ])
+    tel = read_agy_conversation(conv_id, tmp_path)
+    assert tel.child_native_ids == [kid]
+    assert [(l.child_native_id, l.step_index, l.task) for l in tel.launches] == [(kid, 3, "reviewer")]
+
+
+def test_malformed_result_line_consumes_its_slot(tmp_path: Path):
+    conv_id = "77777777-3333-4444-5555-666666666666"
+    other = "ffffffff-0000-4000-8000-000000000006"
+    _write_transcript(tmp_path / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl", [
+        {"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": "2026-11-03T10:00:00Z", "input_tokens": 1,
+         "tool_calls": [{"name": "invoke_subagent", "args": {"TypeName": "reviewer"}}]},
+        "{not valid json",  # the invoke's own result slot
+        {"step_index": 5, "type": "GENERIC", "content": json.dumps({"conversationId": other})},  # unrelated
+    ])
+    tel = read_agy_conversation(conv_id, tmp_path)
+    assert tel.child_native_ids == []
+    assert tel.launches == []

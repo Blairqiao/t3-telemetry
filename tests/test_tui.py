@@ -273,8 +273,7 @@ def test_breadcrumb_parent_child_grandchild_navigation_and_restoration():
     screen1.child_ids = ["child-1", "child-2"]
     screen1.selected_child_id = "child-1"
     screen1.focus = "activity"
-    screen1.activity_scroll = 3
-    screen1.max_activity_scroll = 10
+    screen1.activity_offset = 3
 
     # 2. Tab to switch focus to subagents
     nav.tab()
@@ -291,8 +290,7 @@ def test_breadcrumb_parent_child_grandchild_navigation_and_restoration():
     screen2.child_ids = ["gc-1"]
     screen2.selected_child_id = "gc-1"
     screen2.focus = "activity"
-    screen2.activity_scroll = 5
-    screen2.max_activity_scroll = 10
+    screen2.activity_offset = 5
 
     # 4. Tab and enter gc-1 -> depth 3
     nav.tab()
@@ -310,7 +308,7 @@ def test_breadcrumb_parent_child_grandchild_navigation_and_restoration():
     restored2 = nav.current_screen
     assert restored2.focus == "subagents"
     assert restored2.selected_child_id == "gc-1"
-    assert restored2.activity_scroll == 5
+    assert restored2.activity_offset == 5
 
     # 6. Escape back to depth 1: exact state restored
     nav.escape()
@@ -319,7 +317,7 @@ def test_breadcrumb_parent_child_grandchild_navigation_and_restoration():
     restored1 = nav.current_screen
     assert restored1.focus == "subagents"
     assert restored1.selected_child_id == "child-2"
-    assert restored1.activity_scroll == 3
+    assert restored1.activity_offset == 3
 
     # 7. Escape back to root list: depth 0
     nav.escape()
@@ -335,11 +333,13 @@ def test_disappearance_reconciliation_to_nearest_available_ancestor():
     nav.current_screen.title = "Root Thread"
     nav.current_screen.child_ids = ["child-1"]
     nav.current_screen.selected_child_id = "child-1"
+    nav.current_screen.focus = "subagents"
 
     nav.enter()
     nav.current_screen.title = "Child 1"
     nav.current_screen.child_ids = ["gc-1"]
     nav.current_screen.selected_child_id = "gc-1"
+    nav.current_screen.focus = "subagents"
 
     nav.enter()
     nav.current_screen.title = "Grandchild 1"
@@ -375,20 +375,20 @@ def test_logical_scroll_clamping_prevents_overscroll():
     nav.reconcile(["root-1"])
     nav.enter()
     screen = nav.current_screen
-    screen.focus = "activity"
-    screen.max_activity_scroll = 5
-    screen.activity_scroll = 0
+    screen.detail_activity_id = "a1"
+    screen.max_detail_scroll = 5
+    screen.detail_scroll = 0
 
     # Overscroll downwards by 20 moves
     for _ in range(20):
         nav.move(1)
 
     # Must be clamped strictly at 5, NOT 20
-    assert screen.activity_scroll == 5
+    assert screen.detail_scroll == 5
 
     # A single Up move immediately decrements to 4
     nav.move(-1)
-    assert screen.activity_scroll == 4
+    assert screen.detail_scroll == 4
 
 
 def test_detail_viewport_row_budget_60x24_with_subagents():
@@ -817,11 +817,11 @@ def test_graph_correction_repaints_with_unchanged_count_and_peak(monkeypatch):
     assert len(capture.updates) == 2
 
 
-@pytest.mark.parametrize("change", ["metrics", "tool", "child", "limit", "provenance", "turn"])
+@pytest.mark.parametrize("change", ["metrics", "tool", "child", "limit", "provenance", "turn", "tool_detail", "context"])
 def test_live_values_repaint_without_row_count_changes(monkeypatch, change):
     from types import SimpleNamespace
     from t3_telemetry import cli
-    from t3_telemetry.models import ThreadTelemetryNode, ModelStep, TurnMetrics
+    from t3_telemetry.models import ThreadTelemetryNode, ModelStep, TurnMetrics, ToolCallDetail, RecordedText
 
     root = SimpleNamespace(thread_id="root", title="Root", model="model",
                            parent_thread_id=None, deleted_at=None,
@@ -853,6 +853,10 @@ def test_live_values_repaint_without_row_count_changes(monkeypatch, change):
                 node.context_uncertainty = True
             elif change == "turn":
                 node.current_turn_metrics.output_tokens = 200
+            elif change == "tool_detail":
+                node.steps[0].tool_details = [ToolCallDetail(name="read_file", fields={"path": "src/b.py"})]
+            elif change == "context":
+                node.steps[0].context_texts = [RecordedText(role="user", text="new prompt")]
         return node
 
     monkeypatch.setattr(cli, "build_thread_telemetry", build)
@@ -869,3 +873,546 @@ def test_live_values_repaint_without_row_count_changes(monkeypatch, change):
                          _max_iterations=3, _live_cls=lambda **kw: capture) == 0
     assert builds == 3
     assert len(capture.updates) == 2
+
+
+# --- Activity selection, detail screen, and list visibility ---
+
+
+def _activity_step(i, **kw):
+    from t3_telemetry.models import ModelStep
+
+    return ModelStep(step_index=i, source="main", tool_calls=[f"tool_{i}"], input_tokens=100,
+                     output_tokens=50, duration_seconds=1.0, **kw)
+
+
+def _activity_node(n_steps=12, n_children=5, steps=None):
+    from t3_telemetry.models import ThreadTelemetryNode
+
+    kids = [
+        ThreadTelemetryNode(thread_id=f"c{i}", title=f"Child {i}", driver="claude",
+                            provider_instance_id="x", model="m", status="running")
+        for i in range(1, n_children + 1)
+    ]
+    return ThreadTelemetryNode(
+        thread_id="th", title="Parent", driver="claude", provider_instance_id="x", model="m",
+        status="running", steps=steps if steps is not None else [_activity_step(i) for i in range(1, n_steps + 1)],
+        subagents=kids,
+    )
+
+
+def _open_overview(node):
+    nav = NavigationState()
+    nav.reconcile([node.thread_id])
+    nav.enter()
+    nav.current_screen.child_ids = [c.thread_id for c in node.subagents]
+    nav.current_screen.selected_child_id = node.subagents[0].thread_id if node.subagents else None
+    return nav
+
+
+def _render_lines(node, nav, height, width, max_steps=50):
+    buf = io.StringIO()
+    layout = _browser_frame([node], node=node, summary=node, nav=nav, height=height, width=width, max_steps=max_steps)
+    Console(file=buf, width=width, height=height, color_system=None).print(layout)
+    lines = buf.getvalue().splitlines()
+    assert len(lines) == height
+    return lines
+
+
+@pytest.mark.parametrize("height,width", [(30, 100), (24, 60), (40, 120)])
+def test_child_selection_is_visible_after_every_key_across_all_children(height, width):
+    node = _activity_node()
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    _render_lines(node, nav, height, width)
+    browser.handle_key("TAB")
+    assert nav.current_screen.focus == "subagents"
+
+    visible_rows_seen = set()
+    for expected in range(1, 6):
+        lines = _render_lines(node, nav, height, width)
+        assert any("▶" in line and f"Child {expected}" in line for line in lines), (expected, lines)
+        visible_rows_seen.add(sum(1 for line in lines if "Child " in line and " m " in line))
+        browser.handle_key("DOWN")
+    # Tall sizes expand the list to show all five rows.
+    if height >= 30:
+        assert visible_rows_seen == {5}
+    for expected in range(5, 0, -1):
+        browser.handle_key("UP") if expected < 5 else None
+        lines = _render_lines(node, nav, height, width)
+        assert any("▶" in line and f"Child {expected}" in line for line in lines)
+
+
+@pytest.mark.parametrize("height,width", [(30, 100), (24, 60)])
+def test_activity_selection_is_visible_and_range_label_tracks_window(height, width):
+    node = _activity_node(n_steps=12, n_children=0)
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    lines = _render_lines(node, nav, height, width)
+    assert any("▶" in line and "tool_12" in line for line in lines)  # defaults to the latest entry
+    assert any("of 12" in line and "Activity" in line for line in lines)
+    for step in range(11, 0, -1):
+        browser.handle_key("k")
+        lines = _render_lines(node, nav, height, width)
+        assert any("▶" in line and f"tool_{step}" in line and f"#{step}" in line for line in lines), step
+    for step in range(2, 13):
+        browser.handle_key("j")
+        lines = _render_lines(node, nav, height, width)
+        assert any("▶" in line and f"tool_{step}" in line for line in lines), step
+
+
+def test_enter_dispatches_strictly_by_focus():
+    node = _activity_node(n_steps=3, n_children=2)
+    nav = _open_overview(node)
+    _render_lines(node, nav, 30, 100)
+    screen = nav.current_screen
+    assert screen.focus == "activity" and screen.selected_child_id == "c1"
+
+    nav.enter()  # activity focus must not open the selected child
+    assert nav.detail_id == "th" and len(nav.stack) == 1
+    assert screen.detail_activity_id == screen.selected_activity_id
+    nav.enter()  # ordinary activity detail ignores Enter
+    assert len(nav.stack) == 1 and screen.detail_activity_id is not None
+    nav.tab()  # and Tab
+    assert screen.focus == "activity"
+    nav.escape()
+    assert screen.detail_activity_id is None and len(nav.stack) == 1
+
+    nav.tab()
+    nav.enter()
+    assert nav.detail_id == "c1" and len(nav.stack) == 2
+
+
+def test_activity_detail_opens_selected_entry_scrolls_and_escape_restores_overview():
+    steps = [_activity_step(i) for i in range(1, 13)]
+    steps[4].tool_calls = [f"long_tool_name_{k}" for k in range(40)]
+    node = _activity_node(steps=steps, n_children=3)
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    screen = nav.current_screen
+    _render_lines(node, nav, 24, 60)
+    browser.handle_key("TAB")
+    browser.handle_key("DOWN")
+    browser.handle_key("TAB")  # back to activity
+    for _ in range(7):
+        browser.handle_key("UP")  # select step 5
+    before = _render_lines(node, nav, 24, 60)
+    saved = (screen.focus, screen.selected_activity_id, screen.activity_offset,
+             screen.selected_child_id, screen.child_scroll)
+
+    browser.handle_key("ENTER")
+    assert len(nav.stack) == 1 and nav.detail_id == "th"
+    lines = _render_lines(node, nav, 24, 60)
+    text = "\n".join(lines)
+    assert "Activity detail" in text and "Model step #5" in text
+    assert "Child 2" not in text
+    assert "Unit of accounting" in text
+    assert screen.max_detail_scroll > 0 and screen.detail_scroll == 0
+
+    for _ in range(50):
+        browser.handle_key("j")
+    assert screen.detail_scroll == screen.max_detail_scroll
+    scrolled = "\n".join(_render_lines(node, nav, 24, 60))
+    assert scrolled != text and "long_tool_name_39" in scrolled
+    browser.handle_key("k")
+    assert screen.detail_scroll == screen.max_detail_scroll - 1
+    assert screen.selected_activity_id == saved[1]  # detail scroll never moved list selection
+
+    browser.handle_key("ESC")
+    assert (screen.focus, screen.selected_activity_id, screen.activity_offset,
+            screen.selected_child_id, screen.child_scroll) == saved
+    assert len(nav.stack) == 1 and screen.detail_activity_id is None
+    assert _render_lines(node, nav, 24, 60) == before
+
+
+def test_activity_identity_is_stable_across_updates_and_removal():
+    from t3_telemetry.activity import build_activity_entries
+
+    node = _activity_node(n_steps=5, n_children=0)
+    nav = _open_overview(node)
+    screen = nav.current_screen
+    _render_lines(node, nav, 30, 100)
+    ids = [e.entry_id for e in build_activity_entries(node, 50)]
+    assert len(set(ids)) == 5
+    screen.selected_activity_id = ids[2]
+
+    # New entries and changed values keep the selected ID and do not redirect it
+    node.steps.append(_activity_step(6))
+    node.steps[2].input_tokens = 999
+    _render_lines(node, nav, 30, 100)
+    assert screen.selected_activity_id == ids[2]
+
+    # Window sliding (--max-steps) keeps identity by ID, not position
+    assert build_activity_entries(node, 3)[0].entry_id == ids[3]
+
+    # Removing the selected entry reconciles to the nearest remaining entry
+    del node.steps[2]
+    lines = _render_lines(node, nav, 30, 100)
+    assert screen.selected_activity_id == ids[3]
+    assert any("▶" in line and "tool_4" in line for line in lines)
+
+    # An open detail whose entry disappears closes with a notice instead of crashing
+    nav.enter()
+    assert screen.detail_activity_id == ids[3]
+    del node.steps[2]
+    _render_lines(node, nav, 30, 100)
+    assert screen.detail_activity_id is None
+    assert nav.notice and "no longer available" in nav.notice
+    assert nav.detail_id == "th" and len(nav.stack) == 1  # node identity untouched
+
+    node.steps.clear()
+    lines = _render_lines(node, nav, 30, 100)
+    assert screen.selected_activity_id is None
+    assert any("No recorded activity" in line for line in lines)
+
+
+def test_activity_identity_uses_provider_turn_id_and_agent_not_position():
+    from t3_telemetry.activity import build_activity_entries
+    from t3_telemetry.models import ModelStep
+
+    a = _activity_node(steps=[ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt-1")], n_children=0)
+    b = _activity_node(steps=[ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt-1")], n_children=0)
+    b.thread_id = "other"
+    b.active_provider_thread_id = "prov-b"
+    ea, eb = build_activity_entries(a)[0], build_activity_entries(b)[0]
+    assert ea.entry_id != eb.entry_id and "pt-1" in ea.entry_id
+    assert ea.accounting_scope == "provider turn" and ea.detail is a.steps[0]
+    assert ea.child_thread_id is None
+
+
+def test_running_turn_without_usage_is_not_shown_as_zero_tokens():
+    from t3_telemetry.activity import build_activity_entries
+    from t3_telemetry.models import ModelStep
+
+    running = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="p", status="running")
+    done = ModelStep(step_index=2, activity_kind="provider_turn", provider_turn_id="q", status="completed")
+    node = _activity_node(steps=[running, done], n_children=0)
+    first, second = build_activity_entries(node)
+    assert first.total_tokens is None
+    assert second.total_tokens == 0
+
+
+def test_live_loop_activity_keys_do_not_read_data(monkeypatch):
+    from types import SimpleNamespace
+    from t3_telemetry import cli
+
+    root = SimpleNamespace(thread_id="th", title="Parent", model="m", parent_thread_id=None,
+                           deleted_at=None, updated_at="2026-11-03T10:00:00Z", created_at=None)
+    snapshot = SimpleNamespace(threads={"th": root}, get_provider_thread=lambda _: None)
+    reads = 0
+    builds = 0
+
+    def read(_):
+        nonlocal reads
+        reads += 1
+        return snapshot
+
+    def build(*args, **kwargs):
+        nonlocal builds
+        builds += 1
+        return _activity_node()
+
+    monkeypatch.setattr(cli, "read_t3_state", read)
+    monkeypatch.setattr(cli, "build_thread_telemetry", build)
+    tick = 0.0
+
+    def clock():
+        nonlocal tick
+        tick += 0.001
+        return tick
+
+    keys = ["ENTER", "k", "k", "ENTER", "j", "j", "ESC", "TAB", "j", "j", "j", "TAB", "ENTER", "ESC",
+            (( 20, 50), "j"), "UP"]
+    capture = CaptureLive()
+    args = build_parser().parse_args(["--interval", "1000"])
+    assert run_live_loop(args, _adapter=ScriptedAdapter(keys, initial_size=(30, 100)), _clock=clock,
+                         _max_iterations=5, _live_cls=lambda **kw: capture) == 0
+    assert reads == 1 and builds == 1
+    assert len(capture.updates) > len(keys) // 2
+
+
+def test_focus_falls_back_to_activity_when_subagents_disappear():
+    from t3_telemetry.activity import build_activity_entries
+
+    node = _activity_node()
+    nav = _open_overview(node)
+    nav.sync_activities([e.entry_id for e in build_activity_entries(node, 50)])
+    nav.tab()
+    assert nav.current_screen.focus == "subagents"
+
+    node.subagents.clear()
+    nav.sync_children([c.thread_id for c in node.subagents])
+    screen = nav.current_screen
+    assert screen.focus == "activity"
+    last = screen.selected_activity_id
+    nav.move(-1)
+    assert screen.selected_activity_id != last
+    nav.enter()
+    assert screen.detail_activity_id == screen.selected_activity_id
+
+
+# --- Recorded context in activity titles and detail screens ---
+
+
+def _detail_text(step, node=None):
+    from t3_telemetry.activity import build_activity_entries
+    from t3_telemetry.models import ThreadTelemetryNode
+    from t3_telemetry.ui import build_activity_detail_lines
+
+    node = node or ThreadTelemetryNode(thread_id="th", title="T", driver="codex",
+                                       provider_instance_id="codex", model="m", steps=[step])
+    entry = build_activity_entries(node)[0]
+    return entry, "\n".join(line.plain for line in build_activity_detail_lines(entry, node))
+
+
+def test_recorded_command_gives_title_and_inspectable_details():
+    from t3_telemetry.models import ModelStep, ToolCallDetail
+
+    step = ModelStep(step_index=3, tool_calls=["run_command", "view_file"], tool_details=[
+        ToolCallDetail(name="run_command", fields={"command": "uv run pytest", "cwd": "/repo"}),
+        ToolCallDetail(name="view_file", fields={"path": "src/app.py"}),
+    ])
+    entry, text = _detail_text(step)
+    assert entry.title == "Run command · uv run pytest (+1 more) · #3"
+    assert "Command: uv run pytest" in text and "Working dir: /repo" in text
+    assert "Path: src/app.py" in text
+    assert "Unit of accounting" in text
+
+
+def test_name_only_and_undescribed_turn_fallbacks():
+    from t3_telemetry.models import ModelStep
+
+    entry, text = _detail_text(ModelStep(step_index=2, tool_calls=["run_command"]))
+    assert entry.title == "run_command · details unavailable · #2"
+    turn = ModelStep(step_index=4, activity_kind="provider_turn", provider_turn_id="pt", input_tokens=5)
+    entry, text = _detail_text(turn)
+    assert entry.title == "Provider turn #4 · action details unavailable"
+    assert "none associated with this turn" in text
+    assert "not per-tool usage" in text
+
+
+def test_control_characters_neutralized_in_title_and_detail():
+    from t3_telemetry.models import ModelStep, RecordedText, ToolCallDetail
+
+    step = ModelStep(step_index=1, tool_calls=["run_command"], tool_details=[
+        ToolCallDetail(name="run_command", fields={"command": "echo \x1b[31mred\nnext\x07"}),
+    ], context_texts=[RecordedText(role="assistant", text="ok\x1b]0;title\x07\nline2\x9b")])
+    entry, text = _detail_text(step)
+    assert "\x1b" not in entry.title and "\n" not in entry.title
+    assert "\\x1b[31mred next\\x07" in entry.title
+    assert "\x1b" not in text and "\x07" not in text and "\x9b" not in text
+    assert "\\x1b]0;title" in text and "line2" in text
+
+
+def test_truncated_text_is_marked():
+    from t3_telemetry.models import ModelStep, RecordedText, ToolCallDetail
+
+    step = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt",
+                     tool_details=[ToolCallDetail(name="view_file", fields={"path": "a" * 10}, truncated=["path"])],
+                     tool_calls=["view_file"],
+                     context_texts=[RecordedText(role="user", text="long prompt", truncated=True)])
+    entry, text = _detail_text(step)
+    assert entry.title.endswith("aaaaaaaaaa… · #1")
+    assert "(truncated)" in text and "Recorded prompt:" in text
+
+
+def test_provider_turn_prompt_title_and_usage_labels():
+    from t3_telemetry.models import ModelStep, RecordedText
+
+    turn = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt", status="running",
+                     usage_status="unavailable", usage_provenance="unavailable",
+                     context_texts=[RecordedText(role="user", text="Fix the\nbug")])
+    entry, text = _detail_text(turn)
+    assert entry.title == "Prompt · Fix the bug · #1"
+    assert entry.total_tokens is None and "usage unavailable" in text
+    zero = ModelStep(step_index=2, activity_kind="provider_turn", provider_turn_id="pz")
+    entry, text = _detail_text(zero)
+    assert entry.total_tokens == 0 and "Total counted: 0" in text
+    fb = ModelStep(step_index=3, activity_kind="provider_turn", provider_turn_id="pf", input_tokens=9,
+                   usage_provenance="cumulative_fallback")
+    entry, text = _detail_text(fb)
+    assert entry.usage_provenance == "cumulative_fallback" and "cumulative thread usage fallback" in text
+
+
+def test_activity_tokens_cell_marks_approximate_totals():
+    from t3_telemetry.models import ModelStep
+    from t3_telemetry.ui import activity_tokens_cell
+
+    def cell(**kw):
+        step = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt", status="completed",
+                         input_tokens=1000, **kw)
+        return activity_tokens_cell(_detail_text(step)[0])
+
+    assert not cell(usage_status="complete", usage_provenance="exact").endswith("~")
+    assert cell(usage_status="complete", usage_provenance="cumulative_fallback").endswith("~")
+    assert cell(usage_status="partial", usage_provenance="exact").endswith("~")
+    assert cell(usage_status="unavailable", usage_provenance="unavailable") == "—"
+
+
+def _launch_node():
+    from t3_telemetry.models import SubagentLaunch
+
+    node = _activity_node(n_steps=3, n_children=2)
+    for i, step in enumerate(node.steps):
+        step.started_at = f"2026-11-03T10:0{i}:00Z"
+    node.launches = [
+        SubagentLaunch(launch_id="subagent:s1", title="review the diff", origin="app_owned", status="running",
+                       child_thread_id="c2", child_present=True, launched_at="2026-11-03T10:00:30Z",
+                       launch_time_source="subagent record start", sources=["A", "B"]),
+        SubagentLaunch(launch_id="subagent:s9", title="lost child", origin="app_owned", status="failed",
+                       child_thread_id="gone", sources=["A"]),
+    ]
+    return node
+
+
+def _select(nav, browser, entry_id):
+    screen = nav.current_screen
+    while screen.selected_activity_id != entry_id:
+        before = screen.selected_activity_id
+        browser.handle_key("UP")
+        assert screen.selected_activity_id != before, entry_id
+
+
+def test_launch_detail_opens_child_and_escape_restores_detail_then_parent():
+    node = _launch_node()
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    lines = _render_lines(node, nav, 30, 100)
+    text = "\n".join(lines)
+    assert "Subagent launched · review the diff" in text and "Undated · Subagent launched · lost child" in text
+    parent = nav.current_screen
+    launch_id = "th|launch:subagent:s1"
+    assert parent.activity_ids.index(launch_id) == 2  # after step 1 (10:00), before step 2 (10:01)
+    _select(nav, browser, launch_id)
+    saved = (parent.selected_activity_id, parent.activity_offset, parent.focus)
+
+    browser.handle_key("ENTER")
+    detail = "\n".join(_render_lines(node, nav, 30, 100))
+    for expected in ("Subagent launch", "review the diff", "Child thread: c2", "2026-11-03T10:00:30Z",
+                     "running", "not applicable", "Open subagent", "Source A, Source B"):
+        assert expected in detail, expected
+
+    browser.handle_key("ENTER")  # Open subagent
+    assert [s.node_id for s in nav.stack] == ["th", "c2"]
+    child = node.subagents[1]
+    child_text = "\n".join(_render_lines(child, nav, 30, 100))
+    assert "Child 2" in child_text and "tool_1" not in child_text  # parent steps never leak into the child
+
+    browser.handle_key("ESC")
+    assert [s.node_id for s in nav.stack] == ["th"] and parent.detail_activity_id == launch_id
+    assert "review the diff" in "\n".join(_render_lines(node, nav, 30, 100))
+    browser.handle_key("ESC")
+    assert parent.detail_activity_id is None
+    assert (parent.selected_activity_id, parent.activity_offset, parent.focus) == saved
+
+
+def test_launch_without_child_telemetry_is_inspectable_but_not_openable():
+    node = _launch_node()
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    _render_lines(node, nav, 30, 100)
+    _select(nav, browser, "th|launch:subagent:s9")
+    browser.handle_key("ENTER")
+    text = "\n".join(_render_lines(node, nav, 30, 100))
+    assert "launch time not recorded" in text and "Child telemetry not found" in text
+    browser.handle_key("ENTER")
+    assert len(nav.stack) == 1 and nav.current_screen.detail_activity_id == "th|launch:subagent:s9"
+
+
+def test_launch_status_change_repaints_and_launch_rows_show_no_tokens():
+    from t3_telemetry.activity import build_activity_entries
+    from t3_telemetry.ui import activity_tokens_cell
+
+    node = _launch_node()
+    markers = [e for e in build_activity_entries(node) if e.is_launch]
+    assert [activity_tokens_cell(e) for e in markers] == ["—", "—"]
+    before = node.to_dict()
+    node.launches[0].status = "completed"
+    assert node.to_dict() != before  # the repaint signature serializes the node
+
+
+def test_shift_tab_decodes_and_reverses_focus_without_leaving_overview():
+    master, slave = pty.openpty()
+    class Stream:
+        def fileno(self):
+            return slave
+    adapter = PosixTerminalAdapter(Stream())
+    node = _activity_node()
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(adapter, navigation=nav)
+    try:
+        adapter.begin()
+        os.write(master, b"\x1b[Z")
+        key = adapter.read_key(0.2)
+        assert key == "SHIFT_TAB"
+        browser.handle_key(key)
+        assert nav.current_screen.focus == "subagents"
+        browser.handle_key(key)
+        assert nav.current_screen.focus == "activity"
+        assert nav.detail_id == node.thread_id
+    finally:
+        adapter.end()
+        os.close(master)
+        os.close(slave)
+
+
+def test_list_ranges_and_focus_are_in_column_headers():
+    node = _activity_node(n_children=12)
+    nav = _open_overview(node)
+    for focus in ("activity", "subagents"):
+        nav.current_screen.focus = focus
+        lines = _render_lines(node, nav, 24, 60)
+        for label in ("Subagents", "Activity"):
+            headers = [line for line in lines if label in line and "of 12" in line]
+            assert len(headers) == 1
+            assert "Tokens" in headers[0] and "Time" in headers[0]
+            assert ("▌" in headers[0]) == (focus == label.lower())
+
+
+def test_focus_switch_preserves_table_capacity_and_header_dividers():
+    node = _activity_node(n_steps=40, n_children=40)
+    nav = _open_overview(node)
+    for height, width in ((24, 60), (30, 80), (40, 120), (55, 140)):
+        ranges = []
+        for focus in ("activity", "subagents", "activity"):
+            nav.current_screen.focus = focus
+            lines = _render_lines(node, nav, height, width)
+            headers = [i for i, line in enumerate(lines) if "of 40" in line]
+            assert len(headers) == 2
+            ranges.append([" ".join(lines[i].replace("▌", " ").split()) for i in headers])
+            for i in headers:
+                assert "─" in lines[i + 1]
+        # Ignore leading spaces inserted by the focus marker.
+        assert ranges[0] == ranges[1] == ranges[2]
+
+
+def test_w_s_move_selection_and_scroll_activity_details():
+    node = _activity_node()
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    _render_lines(node, nav, 24, 60)
+    original = nav.current_screen.selected_activity_id
+    browser.handle_key("w")
+    assert nav.current_screen.selected_activity_id != original
+    browser.handle_key("s")
+    assert nav.current_screen.selected_activity_id == original
+    browser.handle_key("ENTER")
+    _render_lines(node, nav, 24, 60)
+    screen = nav.current_screen
+    assert screen.max_detail_scroll > 0
+    browser.handle_key("s")
+    assert screen.detail_scroll == 1
+    browser.handle_key("w")
+    assert screen.detail_scroll == 0
+
+
+def test_e_opens_selection_and_ordinary_detail_ignores_e():
+    node = _activity_node()
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    _render_lines(node, nav, 24, 60)
+    selected = nav.current_screen.selected_activity_id
+    browser.handle_key("e")
+    assert nav.current_screen.detail_activity_id == selected
+    browser.handle_key("E")
+    assert len(nav.stack) == 1
+    assert nav.current_screen.detail_activity_id == selected

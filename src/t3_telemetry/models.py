@@ -7,6 +7,29 @@ from typing import Any
 
 
 @dataclass(slots=True)
+class ToolCallDetail:
+    """Recognized fields from one recorded tool call.
+
+    ``fields`` uses normalized keys (``command``, ``cwd``, ``path``, ``query``,
+    ``task``, ``summary``, ``recipient``) holding bounded recorded text.
+    ``truncated`` lists keys whose text was cut at the retention bound.
+    """
+
+    name: str
+    fields: dict[str, str] = field(default_factory=dict)
+    truncated: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RecordedText:
+    """Bounded message text explicitly associated with an activity (role is ``user`` or ``assistant``)."""
+
+    role: str
+    text: str
+    truncated: bool = False
+
+
+@dataclass(slots=True)
 class ModelStep:
     """A single inference step (Antigravity step_type=15 or Claude/Codex provider turn)."""
 
@@ -26,6 +49,12 @@ class ModelStep:
     completed_at: str | None = None
     duration_seconds: float = 0.0
     spawned_subagent_ids: list[str] = field(default_factory=list)
+    # Optional recorded context; tool_calls stays the list of names.
+    tool_details: list[ToolCallDetail] = field(default_factory=list)
+    context_texts: list[RecordedText] = field(default_factory=list)
+    # "complete", "partial" or "unavailable"; provenance "exact", "cumulative_fallback", "unavailable".
+    usage_status: str = "complete"
+    usage_provenance: str = "exact"
 
     @property
     def kind(self) -> str:
@@ -63,6 +92,49 @@ class ModelStep:
 
 
 @dataclass(slots=True)
+class NativeLaunchRecord:
+    """An ``invoke_subagent`` call in a parent transcript paired with the child conversation it started.
+
+    ``step_index``/``launched_at``/``task`` are None when the child ID was found
+    without a matching recorded call (discovery only).
+    """
+
+    child_native_id: str
+    step_index: int | None = None
+    launched_at: str | None = None
+    task: str | None = None
+    tool_name: str | None = None
+
+
+@dataclass(slots=True)
+class SubagentLaunch:
+    """One known invocation of an immediate child, for the parent's activity feed.
+
+    A launch is a marker, never a counted step: it carries no tokens or duration.
+    ``launch_id`` is the invocation identity: ``subagent:<subagent_id>`` (Source A),
+    ``native:<conversation id>`` (Source C), or ``child:<child thread id>`` when only
+    a parent/child link is known (Source B lineage). ``sources`` lists every source
+    that discovered this same invocation.
+    """
+
+    launch_id: str
+    title: str
+    origin: str
+    status: str
+    child_thread_id: str | None = None
+    child_native_id: str | None = None
+    child_present: bool = False
+    launched_at: str | None = None
+    launch_time_source: str | None = None
+    parent_step_index: int | None = None
+    tool_name: str | None = None
+    sources: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class ConversationTelemetry:
     """Decoded telemetry for a single Antigravity conversation (<nativeId>.db + transcript.jsonl)."""
 
@@ -72,6 +144,7 @@ class ConversationTelemetry:
     parent_native_ids: list[str] = field(default_factory=list)
     model_name: str | None = None
     source: str = "db"
+    launches: list[NativeLaunchRecord] = field(default_factory=list)
 
     @property
     def latest_context_tokens(self) -> int:
@@ -105,6 +178,7 @@ class ProviderTurnRecord:
     output_tokens: int = 0
     usage_status: str = "unavailable"
     usage_provenance: str = "unavailable"
+    node_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -344,6 +418,7 @@ class ThreadTelemetryNode:
     steps: list[ModelStep] = field(default_factory=list)
     combined_steps: list[ModelStep] = field(default_factory=list)
     subagents: list[ThreadTelemetryNode] = field(default_factory=list)
+    launches: list[SubagentLaunch] = field(default_factory=list)
 
     @property
     def provider_thread_id(self) -> str | None:
@@ -392,4 +467,5 @@ class ThreadTelemetryNode:
             "latest_step_label": self.latest_step_label,
             "steps": [s.to_dict() for s in self.steps],
             "subagents": [c.to_dict() for c in self.subagents],
+            "launches": [launch.to_dict() for launch in self.launches],
         }

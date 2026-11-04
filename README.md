@@ -38,7 +38,7 @@ t3-top --no-follow
 # Adjust polling interval (default: 0.5s)
 t3-top --interval 1.0
 
-# Limit recent step history in the stream table (default: 20)
+# Limit recent counted activity history (default: 20)
 t3-top --max-steps 15
 ```
 
@@ -87,10 +87,10 @@ t3-top --t3-dir /path/to/custom/userdata --once
 
 Live watch mode provides an interactive terminal browser with full keyboard navigation across root application threads and subagent trees:
 
-- Up / Down or k / j: Move selection in the thread list, scroll the activity stream on detail screens, or change subagent selection when the subagent pane is focused.
-- Tab: Switch focus between activity stream scrolling and the subagents table on detail screens.
-- Enter: Open the detail screen for the selected app thread, or drill down into a highlighted child subagent.
-- Escape: Return to the parent thread or navigate back to the root thread list.
+- Up / Down, k / j, or W / S: Move selection in the thread list, select activity entries on overviews or scroll an open activity detail, or change subagent selection when the subagent pane is focused.
+- Tab / Shift+Tab: Move focus forward / backward between Activity and Subagents selection on detail screens.
+- E or Enter: Open the detail screen for the selected app thread, open the focused activity detail, or drill down into a highlighted child subagent. In a launch detail, E or Enter opens the linked child when available. E or Enter in an ordinary activity detail does nothing.
+- Escape: Return one level, restoring focus, selection, and scroll position. A child opened from a launch returns to that launch detail first.
 - q or Ctrl-C: Exit t3-top cleanly and restore the terminal to canonical cooked mode.
 
 #### Screens and breadcrumbs
@@ -120,9 +120,17 @@ Token telemetry is reported across three explicit scopes:
 
 Provider turns (Claude or Codex turn boundaries) and model inference steps (Antigravity steps) are tracked distinctly via `provider_turn_count` and `model_step_count`. Duration is the sum of recorded agent step and turn durations. Concurrent subagents can overlap, so this total is not wall-clock elapsed time.
 
+#### Activity details and retention
+
+Activity rows show a recorded description, total tokens, and duration. Visible ranges indicate the list window, and selection scrolls at the visible boundary. Open details to inspect identity, status, timestamps, token breakdown, accounting scope, and supported recorded context. Provider-turn totals cover the entire turn, including any listed tools. Missing usage differs from recorded zero; approximate or partial totals are marked.
+
+Descriptions use recorded command, path, task, or explicitly associated message fields. Name-only tools and unassociated turns report unavailable details. T3 message associations require explicit references; arbitrary provider logs are not searched. Retained text is bounded and truncation is labeled. Recorded commands are displayed as text and never executed.
+
+`--max-steps` retains recent counted activities, with known immediate-child launch entries merged separately. Launches do not add child tokens or duration to the parent's own metrics. Unknown launch times remain undated. Launch details remain inspectable when child telemetry is unavailable; navigation requires an available child. Child internal activity appears on the child's overview.
+
 #### Context window occupancy and history
 
-The context graph visualizes memory utilization against known token limits:
+The context graph uses an automatic token axis, separate from recorded context capacity. The ceiling is the smallest 1, 2, or 5 times a power of ten covering displayed history and current usage. Zero and ceiling are labeled, with a midpoint when space permits. A full-height bar does not mean the context window is full. Capacity is labeled separately as Limit. Chronological buckets fit retained samples to the width; range shading preserves peaks above the latest value.
 
 - Context provenance: Labeled as `Measured` when obtained from provider thread records, `Estimated` when reconstructed from Antigravity inference steps, or `Unknown` when omitted.
 - Missing and default limits: Known context limits (such as 200k for Claude or 1M for Gemini) are displayed when recorded by the provider. If the limit is unspecified, it is reported as unknown rather than displaying arbitrary defaults as measured.
@@ -134,7 +142,7 @@ The context graph visualizes memory utilization against known token limits:
 - Green: Running thread status or context occupancy below 60%.
 - Yellow: Cancelled thread titles, context drops, or context occupancy between 60% and 85%.
 - Red: Failed thread status or context occupancy exceeding 85%.
-- Dim text: Idle or completed thread titles, unknown context limits, or secondary metadata.
+- Completed titles use bright blue; idle titles use bright white. Essential titles, values, axes, and controls remain bright. Selection has a contrasting background and a marker for terminals without color. Secondary metadata may be subdued.
 
 #### Noninteractive behavior
 
