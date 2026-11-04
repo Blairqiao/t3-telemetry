@@ -30,6 +30,19 @@ class RecordedText:
 
 
 @dataclass(slots=True)
+class TurnItem:
+    """One recorded action inside a provider turn."""
+
+    kind: str
+    text: str = ""
+    truncated: bool = False
+    status: str = "completed"
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_seconds: float = 0.0
+
+
+@dataclass(slots=True)
 class ModelStep:
     """A single inference step (Antigravity step_type=15 or Claude/Codex provider turn)."""
 
@@ -55,14 +68,25 @@ class ModelStep:
     # "complete", "partial" or "unavailable"; provenance "exact", "cumulative_fallback", "unavailable".
     usage_status: str = "complete"
     usage_provenance: str = "exact"
+    context_used_tokens: int | None = None
+    context_max_tokens: int | None = None
+    timeline: list[TurnItem] = field(default_factory=list)
 
     @property
     def kind(self) -> str:
         return self.activity_kind
 
     @property
+    def new_input_tokens(self) -> int:
+        return self.input_tokens + self.cache_creation_tokens
+
+    @property
+    def context_read_tokens(self) -> int:
+        return self.cache_read_tokens
+
+    @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.cache_read_tokens + self.output_tokens
+        return self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens + self.output_tokens
 
     @property
     def row_label(self) -> str:
@@ -86,6 +110,8 @@ class ModelStep:
         data = asdict(self)
         data["kind"] = self.activity_kind
         data["total_tokens"] = self.total_tokens
+        data["new_input_tokens"] = self.new_input_tokens
+        data["context_read_tokens"] = self.context_read_tokens
         data["action_summary"] = self.action_summary
         data["row_label"] = self.row_label
         return data
@@ -254,12 +280,20 @@ class TokenMetricsSummary:
     duration_seconds: float = 0.0
 
     @property
+    def new_input_tokens(self) -> int:
+        return self.input_tokens + self.cache_creation_tokens
+
+    @property
+    def context_read_tokens(self) -> int:
+        return self.cache_read_tokens
+
+    @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.cache_read_tokens + self.output_tokens
+        return self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens + self.output_tokens
 
     @property
     def cache_hit_pct(self) -> float:
-        denom = self.input_tokens + self.cache_read_tokens
+        denom = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
         if denom <= 0:
             return 0.0
         return (self.cache_read_tokens / denom) * 100.0
@@ -319,6 +353,8 @@ class TokenMetricsSummary:
             "response_tokens": self.response_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
+            "new_input_tokens": self.new_input_tokens,
+            "context_read_tokens": self.context_read_tokens,
             "cache_hit_pct": round(self.cache_hit_pct, 2),
             "thinking_pct": round(self.thinking_pct, 2),
             "step_count": self.step_count,

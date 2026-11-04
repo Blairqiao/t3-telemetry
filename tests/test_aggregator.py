@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 import pytest
 
-from t3_telemetry.models import ConversationTelemetry, ModelStep, ThreadTelemetryNode
+from t3_telemetry.models import ConversationTelemetry, ModelStep, ProviderTurnRecord, ThreadTelemetryNode
 from t3_telemetry.db_t3 import read_t3_state
 from t3_telemetry.aggregator import (
     build_thread_telemetry,
@@ -121,7 +121,7 @@ def test_build_thread_telemetry_claude_turns(tmp_path: Path):
         "tokenUsage": {"usedTokens": 35000, "maxTokens": 200000},
         "turnTokenUsage": {
             "usageStatus": "complete",
-            "inputTokens": 1000,
+            "inputTokens": 5500,
             "cachedInputTokens": 4000,
             "cacheCreationTokens": 500,
             "outputTokens": 800,
@@ -141,7 +141,7 @@ def test_build_thread_telemetry_claude_turns(tmp_path: Path):
         "tokenUsage": {"usedTokens": 45000, "maxTokens": 200000},
         "turnTokenUsage": {
             "usageStatus": "complete",
-            "inputTokens": 2000,
+            "inputTokens": 8000,
             "cachedInputTokens": 6000,
             "cacheCreationTokens": 0,
             "outputTokens": 1200,
@@ -177,7 +177,15 @@ def test_build_thread_telemetry_claude_turns(tmp_path: Path):
     assert node.steps[0].output_tokens == 800
     assert node.steps[0].thinking_tokens == 300
     assert node.steps[0].response_tokens == 500
-    assert node.steps[0].total_tokens == 5800
+    assert node.steps[0].total_tokens == 6300
+    assert node.steps[0].context_used_tokens == 35000
+    assert node.steps[0].context_max_tokens == 200000
+    assert node.steps[0].to_dict()["context_used_tokens"] == 35000
+    assert node.steps[0].to_dict()["context_max_tokens"] == 200000
+    assert node.steps[1].context_used_tokens == 45000
+    assert node.steps[1].context_max_tokens == 200000
+    assert node.steps[1].to_dict()["context_used_tokens"] == 45000
+    assert node.steps[1].to_dict()["context_max_tokens"] == 200000
 
     # Self metrics:
     # input = 3000, cache_read = 10000, output = 2000, thinking = 500, response = 1500
@@ -187,8 +195,8 @@ def test_build_thread_telemetry_claude_turns(tmp_path: Path):
     assert sm.output_tokens == 2000
     assert sm.thinking_tokens == 500
     assert sm.response_tokens == 1500
-    assert sm.total_tokens == 15000
-    assert pytest.approx(sm.cache_hit_pct, rel=1e-3) == (10000 / 13000) * 100
+    assert sm.total_tokens == 15500
+    assert pytest.approx(sm.cache_hit_pct, rel=1e-3) == (10000 / 13500) * 100
     assert pytest.approx(sm.thinking_pct, rel=1e-3) == (500 / 2000) * 100
 
     # Rollup matches self metrics when no subagents
@@ -202,7 +210,7 @@ def test_build_thread_telemetry_claude_turns(tmp_path: Path):
     assert data["thread_id"] == "t-claude"
     assert data["context_used_tokens"] == 45000
     assert data["context_pct"] == 22.5
-    assert data["self_metrics"]["total_tokens"] == 15000
+    assert data["self_metrics"]["total_tokens"] == 15500
 
 
 def test_build_thread_telemetry_delegated_subagent_rollup(tmp_path: Path):
@@ -264,7 +272,7 @@ def test_build_thread_telemetry_delegated_subagent_rollup(tmp_path: Path):
         "nativeTurnRef": {"driver": "claudeAgent", "nativeId": "turn-c1"},
         "turnTokenUsage": {
             "usageStatus": "complete",
-            "inputTokens": 2000,
+            "inputTokens": 3100,
             "cachedInputTokens": 1000,
             "cacheCreationTokens": 100,
             "outputTokens": 400,
@@ -329,8 +337,8 @@ def test_build_thread_telemetry_delegated_subagent_rollup(tmp_path: Path):
     assert rm.output_tokens == 600
     assert rm.thinking_tokens == 150
     assert rm.response_tokens == 450
-    assert rm.total_tokens == 5100
-    assert pytest.approx(rm.cache_hit_pct, rel=1e-3) == (1500 / 4500) * 100
+    assert rm.total_tokens == 5200
+    assert pytest.approx(rm.cache_hit_pct, rel=1e-3) == (1500 / 4600) * 100
     assert pytest.approx(rm.thinking_pct, rel=1e-3) == (150 / 600) * 100
     assert rm.total_subagents == 1
     assert rm.active_subagents == 1
@@ -1747,3 +1755,81 @@ def test_native_launch_merges_with_app_link_by_conversation_id(tmp_path: Path):
     other = by_id["native:nat-other"]
     assert other.launched_at is None and other.child_present  # native child built from Source C
     assert node.rollup_metrics.input_tokens == 5 + 7 + 7
+
+
+def test_token_metrics_include_cache_creation():
+    from t3_telemetry.models import TokenMetricsSummary
+
+    step = ModelStep(step_index=1, input_tokens=6, cache_read_tokens=241250,
+                     cache_creation_tokens=943, output_tokens=907)
+    summary = TokenMetricsSummary()
+    summary.add_step(step)
+    for metrics in (step, summary):
+        assert metrics.total_tokens == 243106
+        assert metrics.new_input_tokens == 949
+        assert metrics.context_read_tokens == 241250
+        data = metrics.to_dict()
+        assert data["total_tokens"] == 243106
+        assert data["new_input_tokens"] == 949
+        assert data["context_read_tokens"] == 241250
+    assert summary.cache_hit_pct == pytest.approx(241250 / 242199 * 100)
+    assert summary.to_dict()["cache_hit_pct"] == round(241250 / 242199 * 100, 2)
+
+
+def test_provider_turn_step_context_used_and_max_tokens(tmp_path: Path):
+    from t3_telemetry.db_t3 import T3StateSnapshot
+    from t3_telemetry.models import AppThreadRecord
+
+    snap = T3StateSnapshot()
+    snap.threads["t-test"] = AppThreadRecord(
+        thread_id="t-test",
+        project_id="proj",
+        title="Claude Turn Context",
+        default_provider="claudeAgent",
+        provider_instance_id="claude_inst",
+        model="claude-3-7-sonnet",
+        thinking_level=None,
+        active_provider_thread_id="pt-test",
+        parent_thread_id=None,
+        root_thread_id="t-test",
+        relationship_to_parent=None,
+        created_at="2026-11-03T10:00:00Z",
+        updated_at="2026-11-03T10:05:00Z",
+    )
+    snap.provider_turns_by_thread["t-test"] = [
+        ProviderTurnRecord(
+            provider_turn_id="turn-ctx-1",
+            thread_id="t-test",
+            provider_thread_id="pt-test",
+            driver="claudeAgent",
+            native_turn_id="turn-1",
+            ordinal=1,
+            status="completed",
+            started_at="2026-11-03T10:00:00Z",
+            completed_at="2026-11-03T10:00:10Z",
+            duration_seconds=10.0,
+            used_tokens=163201,
+            max_tokens=1000000,
+            input_tokens=1000,
+            output_tokens=200,
+            usage_status="complete",
+            usage_provenance="exact",
+        )
+    ]
+
+    node = build_thread_telemetry("t-test", tmp_path, snapshot=snap)
+    assert len(node.steps) == 1
+    step = node.steps[0]
+    assert step.context_used_tokens == 163201
+    assert step.context_max_tokens == 1000000
+    step_dict = step.to_dict()
+    assert step_dict["context_used_tokens"] == 163201
+    assert step_dict["context_max_tokens"] == 1000000
+
+    # Antigravity steps leave them None
+    agy_step = ModelStep(step_index=1, source="main", status="completed")
+    assert agy_step.context_used_tokens is None
+    assert agy_step.context_max_tokens is None
+    agy_dict = agy_step.to_dict()
+    assert agy_dict["context_used_tokens"] is None
+    assert agy_dict["context_max_tokens"] is None

@@ -15,11 +15,22 @@ from t3_telemetry.models import (
     ProviderTurnRecord,
     RecordedText,
     SubagentLinkRecord,
+    TurnItem,
 )
 
 # Bounds for message text associated with provider turns.
 MAX_CONTEXT_CHARS = 2000
+MAX_ITEM_TEXT_CHARS = 300
 CONTEXT_ID_CHUNK = 500  # well under SQLite's default 999 bound-variable limit
+
+
+def _usage_counts(usage: dict) -> tuple[int, int, int, int, int]:
+    cache_read = int(usage.get("cachedInputTokens") or 0)
+    cache_creation = int(usage.get("cacheCreationTokens") or 0)
+    uncached = max(0, int(usage.get("inputTokens") or 0) - cache_read - cache_creation)
+    output = int(usage.get("outputTokens") or 0)
+    thinking = int(usage.get("reasoningTokens") or usage.get("reasoningOutputTokens") or 0)
+    return uncached, cache_read, cache_creation, output, thinking
 
 
 def connect_readonly_sqlite(db_path: Path | str) -> sqlite3.Connection:
@@ -54,6 +65,7 @@ class T3StateSnapshot:
     provider_threads_by_thread: dict[str, list[ProviderThreadRecord]] = field(default_factory=dict)
     # Bounded user prompt / latest assistant text per provider_turn_id, via explicit node references only.
     turn_context: dict[str, list[RecordedText]] = field(default_factory=dict)
+    turn_items: dict[str, list[TurnItem]] = field(default_factory=dict)
 
     def get_provider_thread(self, thread_id: str) -> ProviderThreadRecord | None:
         """Get the active provider thread for an app thread, or latest available."""
@@ -226,28 +238,12 @@ def read_t3_state(t3_dir: Path | str) -> T3StateSnapshot:
                     if raw_status != "unavailable":
                         usage_status = raw_status
                         usage_provenance = "exact"
-                        input_tokens = int(turn_token_usage.get("inputTokens") or 0)
-                        cache_read = int(turn_token_usage.get("cachedInputTokens") or 0)
-                        cache_creation = int(turn_token_usage.get("cacheCreationTokens") or 0)
-                        output_tokens = int(turn_token_usage.get("outputTokens") or 0)
-                        thinking = int(
-                            turn_token_usage.get("reasoningTokens")
-                            or turn_token_usage.get("reasoningOutputTokens")
-                            or 0
-                        )
+                        input_tokens, cache_read, cache_creation, output_tokens, thinking = _usage_counts(turn_token_usage)
                         response_tokens = max(0, output_tokens - thinking)
                     else:
                         # turnTokenUsage explicitly unavailable, check fallback for non-antigravity
                         if driver != "antigravity" and (token_usage.get("inputTokens") or token_usage.get("outputTokens")):
-                            input_tokens = int(token_usage.get("inputTokens") or 0)
-                            cache_read = int(token_usage.get("cachedInputTokens") or 0)
-                            cache_creation = int(token_usage.get("cacheCreationTokens") or 0)
-                            output_tokens = int(token_usage.get("outputTokens") or 0)
-                            thinking = int(
-                                token_usage.get("reasoningTokens")
-                                or token_usage.get("reasoningOutputTokens")
-                                or 0
-                            )
+                            input_tokens, cache_read, cache_creation, output_tokens, thinking = _usage_counts(token_usage)
                             response_tokens = max(0, output_tokens - thinking)
                             usage_status = "complete"
                             usage_provenance = "cumulative_fallback"
@@ -257,15 +253,7 @@ def read_t3_state(t3_dir: Path | str) -> T3StateSnapshot:
                 else:
                     # turnTokenUsage absent, fallback to tokenUsage if non-antigravity
                     if driver != "antigravity" and (token_usage.get("inputTokens") or token_usage.get("outputTokens")):
-                        input_tokens = int(token_usage.get("inputTokens") or 0)
-                        cache_read = int(token_usage.get("cachedInputTokens") or 0)
-                        cache_creation = int(token_usage.get("cacheCreationTokens") or 0)
-                        output_tokens = int(token_usage.get("outputTokens") or 0)
-                        thinking = int(
-                            token_usage.get("reasoningTokens")
-                            or token_usage.get("reasoningOutputTokens")
-                            or 0
-                        )
+                        input_tokens, cache_read, cache_creation, output_tokens, thinking = _usage_counts(token_usage)
                         response_tokens = max(0, output_tokens - thinking)
                         usage_status = "complete"
                         usage_provenance = "cumulative_fallback"
@@ -345,6 +333,7 @@ def read_t3_state(t3_dir: Path | str) -> T3StateSnapshot:
         # 5. Optional message text associated with provider turns
         turn_ids = [t.provider_turn_id for turns in snapshot.provider_turns_by_thread.values() for t in turns]
         snapshot.turn_context = _read_turn_context(cur, tables, turn_ids)
+        snapshot.turn_items = _read_turn_items(cur, tables, turn_ids)
 
     finally:
         conn.close()
@@ -426,3 +415,55 @@ def _read_turn_context(
     for turn_id in list(prompts) + [t for t in replies if t not in prompts]:
         out[turn_id] = [r for r in (prompts.get(turn_id), replies.get(turn_id)) if r is not None]
     return out
+
+
+def _read_turn_items(
+    cur: sqlite3.Cursor, tables: set[str], turn_ids: list[str]
+) -> dict[str, list[TurnItem]]:
+    """Read bounded action metadata for explicitly associated provider turns."""
+    table = "orchestration_v2_projection_turn_items"
+    if table not in tables or not turn_ids:
+        return {}
+    kinds = {
+        "command_execution": ("run", "command"),
+        "file_change": ("edit", "file_name"),
+        "dynamic_tool": ("tool", "tool_name"),
+        "file_search": ("search", "pattern"),
+        "subagent": ("subagent", "title"),
+        "reasoning": ("think", None),
+        "error": ("error", "title"),
+        "compaction": ("compact", "title"),
+    }
+    result: dict[str, list[TurnItem]] = {}
+    try:
+        for i in range(0, len(turn_ids), CONTEXT_ID_CHUNK):
+            chunk = turn_ids[i : i + CONTEXT_ID_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            type_marks = ",".join("?" * len(kinds))
+            cur.execute(
+                f"""SELECT provider_turn_id AS turn_id, type, status, ordinal,
+                    substr(json_extract(payload_json, '$.startedAt'), 1, {MAX_ITEM_TEXT_CHARS + 1}) AS started_at,
+                    substr(json_extract(payload_json, '$.completedAt'), 1, {MAX_ITEM_TEXT_CHARS + 1}) AS completed_at,
+                    substr(json_extract(payload_json, '$.title'), 1, {MAX_ITEM_TEXT_CHARS + 1}) AS title,
+                    substr(CASE WHEN type = 'command_execution' THEN json_extract(payload_json, '$.input') END, 1, {MAX_ITEM_TEXT_CHARS + 1}) AS command,
+                    substr(json_extract(payload_json, '$.fileName'), 1, {MAX_ITEM_TEXT_CHARS + 1}) AS file_name,
+                    substr(json_extract(payload_json, '$.toolName'), 1, {MAX_ITEM_TEXT_CHARS + 1}) AS tool_name,
+                    substr(json_extract(payload_json, '$.pattern'), 1, {MAX_ITEM_TEXT_CHARS + 1}) AS pattern
+                FROM {table}
+                WHERE provider_turn_id IN ({marks}) AND type IN ({type_marks}) AND json_valid(payload_json)
+                ORDER BY provider_turn_id, ordinal ASC""",
+                [*chunk, *kinds],
+            )
+            for row in cur.fetchall():
+                kind, field_name = kinds[row["type"]]
+                raw = (row[field_name] or row["title"] or "") if field_name else ""
+                started_at, completed_at = row["started_at"], row["completed_at"]
+                item = TurnItem(
+                    kind=kind, text=raw[:MAX_ITEM_TEXT_CHARS], truncated=len(raw) > MAX_ITEM_TEXT_CHARS,
+                    status=row["status"] or "completed", started_at=started_at, completed_at=completed_at,
+                    duration_seconds=parse_iso_duration(started_at, completed_at),
+                )
+                result.setdefault(row["turn_id"], []).append(item)
+    except sqlite3.Error:
+        return {}
+    return result

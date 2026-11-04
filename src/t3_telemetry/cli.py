@@ -505,7 +505,7 @@ def _footer_line(nav: NavigationState, node: ThreadTelemetryNode | None, width: 
         if screen.detail_activity_id in screen.activity_targets:
             keys = "E/Enter open subagent  W/S scroll  Esc back  q quit"
         elif screen.detail_activity_id:
-            keys = "W/S scroll  Esc back  q quit"
+            keys = "W/S scroll  P prompt  Esc back  q quit"
         elif node.subagents and screen.focus == "subagents":
             keys = "Tab activity  W/S move  E/Enter open  Esc back  q quit"
         elif node.subagents:
@@ -552,12 +552,7 @@ def _child_table(node: ThreadTelemetryNode, screen: ScreenState, window: list, s
     table.add_column(f"{'▌' if focused else ' '}Subagents {range_label}", ratio=2, no_wrap=True, overflow="ellipsis")
     table.add_column("Model", ratio=1, no_wrap=True, overflow="ellipsis")
     table.add_column("Steps", justify="right", no_wrap=True)
-    wide = width >= 80
-    if wide:
-        table.add_column("In", justify="right", no_wrap=True)
-        table.add_column("Out", justify="right", no_wrap=True)
-    else:
-        table.add_column("Tokens", justify="right", no_wrap=True)
+    table.add_column("Tokens", justify="right", no_wrap=True)
     table.add_column("Time", justify="right", no_wrap=True)
     for child in window:
         is_sel = child.thread_id == screen.selected_child_id
@@ -567,12 +562,11 @@ def _child_table(node: ThreadTelemetryNode, screen: ScreenState, window: list, s
         title.append("▶ " if is_sel else "  ", style="bold" if highlighted else "bold cyan")
         title.append(child.title, style="" if highlighted else (get_status_style(child.status) or "bold"))
         m = child.rollup_metrics
-        tokens = [format_tokens(m.input_tokens), format_tokens(m.output_tokens)] if wide else [format_tokens(m.total_tokens)]
         table.add_row(
             title,
             child.model or "unknown",
             str(m.step_count),
-            *tokens,
+            format_tokens(m.total_tokens),
             format_duration(m.duration_seconds),
             style=SELECTED_ROW_STYLE if highlighted else "",
         )
@@ -693,7 +687,7 @@ def _activity_detail_body(node: ThreadTelemetryNode, screen: ScreenState, entry,
     """Scrollable full detail for one activity; shows everything the one-line row elides."""
     measuring = Console(width=inner_width, force_terminal=True, color_system=None)
     opts = measuring.options.update(width=inner_width, height=None)
-    detail_group = Group(*build_activity_detail_lines(entry, node))
+    detail_group = Group(*build_activity_detail_lines(entry, node, width=inner_width, prompt_expanded=screen.detail_prompt_expanded))
     total_lines = len(list(Segment.split_lines(measuring.render(detail_group, opts))))
     view_height = max(1, inner_height - 2)
     screen.max_detail_scroll = max(0, total_lines - view_height)

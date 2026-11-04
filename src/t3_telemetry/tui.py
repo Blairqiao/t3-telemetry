@@ -23,6 +23,7 @@ class ScreenState:
     detail_activity_id: str | None = None
     detail_scroll: int = 0
     max_detail_scroll: int = 0
+    detail_prompt_expanded: bool = False
     # Launch entry ID -> child node ID, only for launches whose child is present.
     activity_targets: dict[str, str] = field(default_factory=dict)
 
@@ -112,6 +113,7 @@ class NavigationState:
         if screen.detail_activity_id and screen.detail_activity_id not in ids:
             screen.detail_activity_id = None
             screen.detail_scroll = 0
+            screen.detail_prompt_expanded = False
             self.notice = "Activity is no longer available"
 
     def sync_children(self, ids: list[str]) -> None:
@@ -182,6 +184,7 @@ class NavigationState:
                 if target and target in screen.activity_ids:
                     screen.detail_activity_id = target
                     screen.detail_scroll = 0
+                    screen.detail_prompt_expanded = False
 
     def escape(self) -> None:
         if self.stack:
@@ -189,8 +192,14 @@ class NavigationState:
             if screen.detail_activity_id:
                 screen.detail_activity_id = None
                 screen.detail_scroll = 0
+                screen.detail_prompt_expanded = False
             else:
                 self.stack.pop()
+
+    def toggle_prompt(self) -> None:
+        screen = self.current_screen
+        if screen is not None and screen.detail_activity_id and screen.detail_activity_id not in screen.activity_targets:
+            screen.detail_prompt_expanded = not screen.detail_prompt_expanded
 
 
 def table_header_lines(rows: int) -> int:
@@ -253,6 +262,8 @@ class TelemetryBrowser:
             self.navigation.tab()
         elif key in ("ENTER", "e", "E", chr(13), chr(10)):
             self.navigation.enter()
+        elif key in ("p", "P"):
+            self.navigation.toggle_prompt()
         elif key in ("ESC", chr(27)):
             self.navigation.escape()
         elif key in ("q", chr(3)):

@@ -12,12 +12,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from t3_telemetry.activity import DETAIL_FIELD_LABELS, TOOL_VERBS, ActivityEntry, build_activity_entries, neutralize
-from t3_telemetry.models import ThreadTelemetryNode
+from t3_telemetry.activity import TOOL_VERBS, ActivityEntry, build_activity_entries, describe_tool, neutralize
+from t3_telemetry.models import ModelStep, ThreadTelemetryNode, ToolCallDetail, TurnItem
 
 
 # Focused selection: bright text on a solid background; the ▶ marker carries it without color.
-SELECTED_ROW_STYLE = "white on grey19"
+SELECTED_ROW_STYLE = "bold bright_yellow"
 
 
 def get_status_style(status: str | None) -> str:
@@ -725,7 +725,131 @@ def build_activity_table(
     return table
 
 
-def build_activity_detail_lines(entry: ActivityEntry, node: ThreadTelemetryNode | None = None) -> list[Text]:
+def _section_rule(title: str, width: int) -> Text:
+    return Text("─ " + title + " " + "─" * max(3, width - len(title) - 3), style="dim")
+
+
+ORDERED_TIMELINE_KINDS = [
+    ("run", "command", "commands"),
+    ("edit", "edit", "edits"),
+    ("tool", "tool", "tools"),
+    ("search", "search", "searches"),
+    ("subagent", "subagent", "subagents"),
+    ("think", "thinking", "thinking"),
+    ("error", "error", "errors"),
+    ("compact", "compaction", "compactions"),
+]
+
+
+def _timeline_item_line(item: TurnItem, width: int) -> Text:
+    clock = neutralize(format_clock(item.started_at), single_line=True)
+    clock_col = f"{clock:<8}"
+    kind_col = f"{neutralize(item.kind, single_line=True):<8}"
+
+    if item.kind == "think":
+        text = ""
+    else:
+        text = neutralize(item.text, single_line=True) if item.text else ""
+        if item.truncated and not text.endswith("…"):
+            text += "…"
+
+    dur_str = ""
+    if item.duration_seconds is not None and item.duration_seconds > 0:
+        dur_str = format_duration(item.duration_seconds)
+    dur_len = len(dur_str)
+
+    prefix = f"{clock_col}  {kind_col}  "
+    prefix_len = len(prefix)
+
+    is_running = item.status == "running"
+    running_tag = " (running)" if text else ("(running)" if is_running else "")
+    running_len = len(running_tag) if is_running else 0
+
+    if not text and not is_running and dur_len == 0:
+        return Text(f"{clock_col}  {kind_col}")
+
+    min_gap = 1 if dur_len > 0 else 0
+    avail_width = width - dur_len - min_gap if dur_len > 0 else width
+    max_text_len = avail_width - prefix_len - running_len
+
+    fitted_text = Text(text)
+    fitted_text.truncate(max(0, max_text_len), overflow="ellipsis")
+    text = fitted_text.plain
+
+    current_left_len = prefix_len + fitted_text.cell_len + running_len
+    line = Text(prefix)
+    if text:
+        line.append(text)
+    if is_running:
+        line.append(running_tag, style="yellow")
+    if dur_len > 0:
+        pad_len = max(1, width - current_left_len - dur_len)
+        line.append(" " * pad_len)
+        line.append(dur_str)
+    return line
+
+
+def _actions_lines(step: ModelStep, width: int = 80) -> list[Text]:
+    """Render 'What it did' section lines for an activity step."""
+    if step.timeline:
+        lines: list[Text] = []
+        kind_counts: dict[str, int] = {}
+        for item in step.timeline:
+            kind_counts[item.kind] = kind_counts.get(item.kind, 0) + 1
+
+        counts_parts: list[str] = []
+        for kind, singular, plural in ORDERED_TIMELINE_KINDS:
+            c = kind_counts.get(kind, 0)
+            if c > 0:
+                label = singular if c == 1 else plural
+                counts_parts.append(f"{c} {label}")
+
+        for kind, c in kind_counts.items():
+            if kind not in {k for k, _, _ in ORDERED_TIMELINE_KINDS} and c > 0:
+                counts_parts.append(f"{c} {kind}")
+
+        if counts_parts:
+            lines.append(Text(neutralize(" · ".join(counts_parts), single_line=True)))
+
+        for item in step.timeline[:30]:
+            lines.append(_timeline_item_line(item, width))
+
+        if len(step.timeline) > 30:
+            more = len(step.timeline) - 30
+            lines.append(Text(f"+{more} more", style="dim"))
+
+        return lines
+
+    if step.activity_kind == "model_step" and (step.tool_details or step.tool_calls or step.thinking_tokens > 0):
+        lines = []
+        tool_names = [d.name for d in step.tool_details] if step.tool_details else list(step.tool_calls)
+        counts: dict[str, int] = {}
+        for name in tool_names:
+            counts[name] = counts.get(name, 0) + 1
+
+        counts_parts = [f"{count} {TOOL_VERBS.get(name, name)}" for name, count in counts.items()]
+        if counts_parts:
+            lines.append(Text(neutralize(" · ".join(counts_parts), single_line=True)))
+
+        if step.thinking_tokens > 0:
+            lines.append(Text(f"think  {step.thinking_tokens:,} thinking tokens"))
+
+        if step.tool_details:
+            for detail in step.tool_details:
+                lines.append(Text(describe_tool(detail)))
+        else:
+            for name in step.tool_calls:
+                lines.append(Text(describe_tool(ToolCallDetail(name=name))))
+
+        return lines
+
+    return [Text("No actions recorded for this turn.", style="dim")]
+
+
+def build_activity_detail_lines(
+    entry: ActivityEntry, node: ThreadTelemetryNode | None = None, *,
+    width: int = 80, prompt_expanded: bool = False,
+) -> list[Text]:
     """Full detail for one activity entry; the unit of accounting is stated explicitly."""
     step = entry.detail
     lines: list[Text] = []
@@ -739,66 +863,72 @@ def build_activity_detail_lines(entry: ActivityEntry, node: ThreadTelemetryNode 
     if entry.launch is not None:
         return _launch_detail_lines(entry, node, field, lines)
 
-    lines.append(Text(step.row_label if step is not None else entry.title, style="bold"))
-    lines.append(Text(""))
+    clean = lambda value: neutralize(str(value), single_line=True)
+    header = f"{clean(step.row_label if step is not None else entry.title)} · {clean(entry.status)} · {format_duration(entry.duration_seconds)}"
+    if step is not None and step.started_at and step.completed_at:
+        header += f" · {clean(format_clock(step.started_at))}–{clean(format_clock(step.completed_at))}"
     if node is not None:
-        field("Agent", f"{node.title} ({node.thread_id[:8]})")
-        field("Driver / model", f"{node.driver} · {node.model or 'unknown'}")
-    field("Kind", entry.kind)
-    field("Status", entry.status)
-    if step is not None:
-        if step.provider_turn_id:
-            field("Provider turn", f"{step.provider_turn_id} (ordinal {step.step_index})")
-        else:
-            field("Step index", str(step.step_index))
-        field("Source", step.source)
-        field("Started", step.started_at or "not recorded")
-        field("Completed", step.completed_at or "not recorded")
-    field("Duration", format_duration(entry.duration_seconds))
-    lines.append(Text(""))
-    field("Unit of accounting", entry.accounting_scope)
-    lines.append(Text(entry.scope_note, style="dim"))
-    lines.append(Text(""))
+        header += f" · {clean(node.model or 'unknown')}"
+    lines.append(Text(header, style="bold"))
+    lines.append(_section_rule("Tokens", width))
     if step is not None and entry.usage_status == "unavailable":
-        field("Tokens", "usage unavailable (not recorded; not zero)")
+        lines.append(Text("usage unavailable (not recorded; not zero)"))
     elif entry.total_tokens is None or step is None:
-        field("Tokens", "usage not recorded yet")
+        lines.append(Text("usage not recorded yet"))
     else:
         if entry.usage_provenance == "cumulative_fallback":
             field("Usage source", "cumulative thread usage fallback; may include earlier turns")
         elif entry.usage_status == "partial":
             field("Usage source", "partial usage recorded")
-        field("Total counted", f"{step.total_tokens:,}  (uncached input + cache read + output)")
-        field("Uncached input", f"{step.input_tokens:,}")
-        field("Cache read", f"{step.cache_read_tokens:,}")
-        field("Cache creation", f"{step.cache_creation_tokens:,}  (not in total)")
-        field("Output", f"{step.output_tokens:,}")
-        field("Thinking", f"{step.thinking_tokens:,}  (shown for reference; not added to the total)")
-        field("Response", f"{step.response_tokens:,}  (shown for reference; not added to the total)")
+        total_input = step.input_tokens + step.cache_read_tokens + step.cache_creation_tokens
+        new_input = step.input_tokens + step.cache_creation_tokens
+        bar_width = max(10, min(40, width - 36))
+        read_width = round(bar_width * step.cache_read_tokens / total_input) if total_input else 0
+        bar = Text(f"{' Input':<20} {total_input:>10,}  ")
+        bar.append("█" * read_width, style="cyan")
+        bar.append("█" * (bar_width - read_width), style="yellow")
+        lines.append(bar)
+        read_pct = f"{step.cache_read_tokens / total_input * 100:.1f}%" if total_input else "—"
+        new_pct = f"{new_input / total_input * 100:.1f}%" if total_input else "—"
+        lines.append(Text(f"{'   ├ re-read context':<20} {step.cache_read_tokens:>10,}  {read_pct:>6}   cache read"))
+        breakdown = f"uncached {step.input_tokens:,}" if step.activity_kind == "model_step" else f"cache write {step.cache_creation_tokens:,} + uncached {step.input_tokens:,}"
+        lines.append(Text(f"{'   └ new this turn':<20} {new_input:>10,}  {new_pct:>6}   {breakdown}"))
+        lines.append(Text(f"{' Output':<20} {step.output_tokens:>10,}  thinking {step.thinking_tokens:,} · response {step.response_tokens:,}"))
+        lines.append(Text(f"{' Total':<20} {step.total_tokens:>10,}"))
+        if step.context_used_tokens is not None:
+            context = Text(" Context at end  ")
+            context.append_text(Text.from_markup(render_context_bar(step.context_used_tokens, step.context_max_tokens, width=20)))
+            lines.append(context)
     if step is not None:
-        lines.append(Text(""))
-        field("Tools", neutralize(", ".join(step.tool_calls), single_line=True) if step.tool_calls else "none recorded")
-        for detail in step.tool_details:
-            lines.append(Text(""))
-            verb = TOOL_VERBS.get(detail.name, detail.name)
-            lines.append(Text(neutralize(f"{verb} ({detail.name})", single_line=True), style="bold"))
-            if not detail.fields:
-                lines.append(Text("  details unavailable (only the tool name was recorded)", style="dim"))
-            for key, label in DETAIL_FIELD_LABELS:
-                if key in detail.fields:
-                    mark = " … (truncated)" if key in detail.truncated else ""
-                    field(f"  {label}", neutralize(detail.fields[key]) + mark)
-        if step.context_texts:
-            for rec in step.context_texts:
-                lines.append(Text(""))
-                label = "Recorded prompt" if rec.role == "user" else "Recorded reply"
-                lines.append(Text(f"{label}:", style="bold cyan"))
-                for text_line in neutralize(rec.text).splitlines():
-                    lines.append(Text(f"  {text_line}"))
-                if rec.truncated:
-                    lines.append(Text("  … (truncated)", style="dim"))
-        elif step.activity_kind == "provider_turn":
-            lines.append(Text("Recorded context: none associated with this turn", style="dim"))
+        lines.append(_section_rule("What it did", width))
+        lines.extend(_actions_lines(step, width))
+        user_rec = next((r for r in step.context_texts if r.role == "user"), None) if step.context_texts else None
+        if user_rec is not None and user_rec.text:
+            prompt_lines = neutralize(user_rec.text).splitlines()
+            if prompt_lines:
+                lines.append(_section_rule("Prompt", width))
+                if not prompt_expanded and len(prompt_lines) > 3:
+                    for text_line in prompt_lines[:3]:
+                        lines.append(Text(f"  {text_line}"))
+                    remaining = len(prompt_lines) - 3
+                    lines.append(Text(f"  … {remaining} more lines · P to expand", style="dim"))
+                else:
+                    for text_line in prompt_lines:
+                        lines.append(Text(f"  {text_line}"))
+                    if user_rec.truncated:
+                        lines.append(Text("  … (truncated)", style="dim"))
+    lines.append(_section_rule("Details", width))
+    if node is not None:
+        lines.append(Text(f"Agent: {clean(node.title)} ({clean(node.thread_id[:8])})", style="dim"))
+        lines.append(Text(f"Driver / model: {clean(node.driver)} · {clean(node.model or 'unknown')}", style="dim"))
+    if step is not None:
+        if step.provider_turn_id:
+            lines.append(Text(f"Provider turn id: {clean(step.provider_turn_id)} (ordinal {step.step_index})", style="dim"))
+        else:
+            lines.append(Text(f"Step index: {step.step_index}", style="dim"))
+        lines.append(Text(f"Source: {clean(step.source)}", style="dim"))
+    lines.append(Text(f"Unit of accounting: {clean(entry.accounting_scope)}", style="dim"))
+    lines.append(Text(neutralize(entry.scope_note), style="dim"))
     return lines
 
 
@@ -865,35 +995,21 @@ def build_scopes_summary(node: ThreadTelemetryNode, width: int = 80) -> list[Tex
     rollup_label = f"Chat + subagents (+{n_sub} subs)" if n_sub > 0 else "Chat + subagents"
     rollup_val = f"{node.rollup_metrics.steps_display}, {format_tokens(node.rollup_metrics.total_tokens)} tokens, {format_duration(node.rollup_metrics.duration_seconds)}"
 
+    scopes = [
+        (turn_label, turn_val),
+        ("Whole chat · this agent", self_val),
+        (rollup_label, rollup_val),
+    ]
+    label_width = max(len(label) for label, _ in scopes)
     lines: list[Text] = []
-    if width >= 90:
-        line1 = Text()
-        line1.append(f"{turn_label}: ", style="bold cyan")
-        line1.append(turn_val)
-        line1.append("  ·  ")
-        line1.append("Whole chat · this agent: ", style="bold cyan")
-        line1.append(self_val)
-        lines.append(line1)
-
-        line2 = Text()
-        line2.append(f"{rollup_label}: ", style="bold cyan")
-        line2.append(rollup_val)
-        lines.append(line2)
-    else:
-        line1 = Text()
-        line1.append(f"{turn_label}: ", style="bold cyan")
-        line1.append(turn_val)
-        lines.append(line1)
-
-        line2 = Text()
-        line2.append("Whole chat · this agent: ", style="bold cyan")
-        line2.append(self_val)
-        lines.append(line2)
-
-        line3 = Text()
-        line3.append(f"{rollup_label}: ", style="bold cyan")
-        line3.append(rollup_val)
-        lines.append(line3)
+    for label, value in scopes:
+        line = Text()
+        line.append(f"{label}:", style="bold cyan")
+        line.append(" " * (label_width - len(label) + 1))
+        line.append("│ ", style="cyan")
+        line.append(value.replace(", ", " · "))
+        line.no_wrap = True
+        lines.append(line)
 
     return lines
 

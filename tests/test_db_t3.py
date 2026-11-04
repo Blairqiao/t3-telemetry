@@ -293,7 +293,7 @@ def test_read_t3_state_synthetic_db(tmp_path: Path):
     turns2 = snapshot.provider_turns_by_thread["thread-2"]
     assert len(turns2) == 1
     tr2 = turns2[0]
-    assert tr2.input_tokens == 25000
+    assert tr2.input_tokens == 3000
     assert tr2.cache_read_tokens == 18000
     assert tr2.cache_creation_tokens == 4000
     assert tr2.output_tokens == 2500
@@ -339,7 +339,7 @@ def test_read_t3_state_fallback_token_usage_when_turn_token_usage_absent(tmp_pat
 
     snapshot = read_t3_state(tmp_path)
     turn = snapshot.provider_turns_by_thread["t-fb"][0]
-    assert turn.input_tokens == 4000
+    assert turn.input_tokens == 3000
     assert turn.cache_read_tokens == 1000
     assert turn.output_tokens == 500
     assert turn.thinking_tokens == 100
@@ -415,7 +415,7 @@ def test_db_t3_partial_turn_token_usage(tmp_path: Path):
     turn = snapshot.provider_turns_by_thread["t-p"][0]
     assert turn.usage_provenance == "exact"
     assert turn.usage_status == "partial"
-    assert turn.input_tokens == 1200
+    assert turn.input_tokens == 900
     assert turn.cache_read_tokens == 300
     assert turn.output_tokens == 0
 
@@ -448,7 +448,7 @@ def test_db_t3_fallback_token_usage_records_provenance(tmp_path: Path):
     turn = snapshot.provider_turns_by_thread["t-fbp"][0]
     assert turn.usage_provenance == "cumulative_fallback"
     assert turn.usage_status == "complete"
-    assert turn.input_tokens == 8000
+    assert turn.input_tokens == 6000
     assert turn.cache_read_tokens == 2000
     assert turn.output_tokens == 400
 
@@ -581,3 +581,114 @@ def test_turn_context_chunks_many_turn_ids(tmp_path: Path):
     conn.close()
     ctx = read_t3_state(tmp_path).turn_context
     assert len(ctx) == n and ctx[f"turn-{n - 1}"][0].text == f"prompt {n - 1}"
+
+
+@pytest.mark.parametrize("usage_location", ["exact", "fallback_absent", "fallback_unavailable"])
+def test_claude_usage_counts_real_values(tmp_path: Path, usage_location: str):
+    conn = sqlite3.connect(tmp_path / "statev2.sqlite")
+    create_schema(conn)
+    usage = {"inputTokens": 242199, "cachedInputTokens": 241250,
+             "cacheCreationTokens": 943, "outputTokens": 907}
+    payload = {"nativeTurnRef": {"driver": "claudeAgent"}}
+    if usage_location == "exact":
+        payload["turnTokenUsage"] = {**usage, "usageStatus": "complete"}
+    else:
+        payload["tokenUsage"] = usage
+        if usage_location == "fallback_unavailable":
+            payload["turnTokenUsage"] = {"usageStatus": "unavailable"}
+    conn.execute("""INSERT INTO orchestration_v2_projection_provider_turns
+        (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, started_at, completed_at, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("turn", "thread", "pt", "node", 1, "completed", None, None, json.dumps(payload)))
+    conn.commit()
+    conn.close()
+    turn = read_t3_state(tmp_path).provider_turns_by_thread["thread"][0]
+    assert (turn.input_tokens, turn.cache_read_tokens, turn.cache_creation_tokens, turn.output_tokens) == (6, 241250, 943, 907)
+    assert sum((turn.input_tokens, turn.cache_read_tokens, turn.cache_creation_tokens, turn.output_tokens)) == 243106
+    assert turn.usage_provenance == ("exact" if usage_location == "exact" else "cumulative_fallback")
+
+
+def test_usage_counts_clamps_uncached_input():
+    from t3_telemetry.db_t3 import _usage_counts
+
+    assert _usage_counts({"inputTokens": 5, "cachedInputTokens": 4, "cacheCreationTokens": 3}) == (0, 4, 3, 0, 0)
+
+ITEM_TABLE = """
+CREATE TABLE orchestration_v2_projection_turn_items (
+    turn_item_id TEXT PRIMARY KEY, thread_id TEXT, run_id TEXT, node_id TEXT,
+    provider_thread_id TEXT, provider_turn_id TEXT, parent_item_id TEXT,
+    ordinal INTEGER, type TEXT, status TEXT, updated_at TEXT, payload_json TEXT
+)
+"""
+
+
+def _item(conn, item_id, turn_id, ordinal, item_type, payload, status=None):
+    conn.execute(
+        "INSERT INTO orchestration_v2_projection_turn_items "
+        "(turn_item_id, provider_turn_id, ordinal, type, status, payload_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (item_id, turn_id, ordinal, item_type, status, json.dumps(payload)),
+    )
+
+
+def test_turn_items_mapping_order_and_aggregation(tmp_path: Path):
+    from t3_telemetry.activity import build_activity_entries
+    from t3_telemetry.aggregator import build_thread_telemetry
+
+    conn = sqlite3.connect(tmp_path / "statev2.sqlite")
+    create_schema(conn)
+    conn.execute(ITEM_TABLE)
+    _turn(conn, "turn-1", "root", 1)
+    conn.execute("UPDATE orchestration_v2_projection_provider_turns SET payload_json = ?", (
+        json.dumps({"nativeTurnRef": {"driver": "claudeAgent"}, "turnTokenUsage": {"usageStatus": "complete"}}),
+    ))
+    items = [
+        ("command_execution", {"input": "x" * 400, "startedAt": "2026-11-03T10:00:00Z", "completedAt": "2026-11-03T10:00:05Z"}),
+        ("file_change", {"fileName": "app.py"}),
+        ("dynamic_tool", {"toolName": "inspect"}),
+        ("file_search", {"pattern": "needle"}),
+        ("subagent", {"title": "review"}),
+        ("reasoning", {"title": "hidden"}),
+        ("error", {"title": "oops"}),
+        ("compaction", {"title": "compact context"}),
+        ("file_change", {"title": "fallback"}),
+    ]
+    for index in reversed(range(len(items))):
+        kind, payload = items[index]
+        _item(conn, f"i{index}", "turn-1", index, kind, payload, "running" if index == 0 else None)
+    _item(conn, "skipped", "turn-1", 99, "assistant_message", {"title": "skip"})
+    _item(conn, "orphan", None, 0, "error", {"title": "orphan"})
+    conn.execute("INSERT INTO orchestration_v2_projection_turn_items (turn_item_id, provider_turn_id, ordinal, type, payload_json) VALUES (?, ?, ?, ?, ?)", ("bad", "turn-1", 100, "error", "{"))
+    conn.commit()
+    conn.close()
+
+    snapshot = read_t3_state(tmp_path)
+    timeline = snapshot.turn_items["turn-1"]
+    assert [item.kind for item in timeline] == ["run", "edit", "tool", "search", "subagent", "think", "error", "compact", "edit"]
+    assert [item.text for item in timeline] == ["x" * 300, "app.py", "inspect", "needle", "review", "", "oops", "compact context", "fallback"]
+    assert timeline[0].truncated and timeline[0].status == "running" and timeline[0].duration_seconds == 5
+    assert all(not item.truncated for item in timeline[1:])
+    assert timeline[1].status == "completed"
+    assert set(snapshot.turn_items) == {"turn-1"}
+    node = build_thread_telemetry("th", tmp_path, snapshot=snapshot)
+    assert node.steps[0].timeline == timeline
+    assert node.steps[0].tool_calls == [] and node.steps[0].tool_details == []
+    assert build_activity_entries(node)[0].title == "Provider turn #1 · action details unavailable"
+    assert node.steps[0].to_dict()["timeline"][0]["kind"] == "run"
+
+
+def test_turn_items_missing_table_and_chunked_query(tmp_path: Path):
+    from t3_telemetry.db_t3 import CONTEXT_ID_CHUNK, _read_turn_items
+
+    conn = sqlite3.connect(tmp_path / "statev2.sqlite")
+    conn.row_factory = sqlite3.Row
+    create_schema(conn)
+    _turn(conn, "turn-1", "root", 1)
+    conn.commit()
+    assert read_t3_state(tmp_path).turn_items == {}
+    conn.execute(ITEM_TABLE)
+    _item(conn, "last", "last-turn", 1, "error", {"title": "last"})
+    ids = [f"turn-{i}" for i in range(CONTEXT_ID_CHUNK)] + ["last-turn"]
+    table = {"orchestration_v2_projection_turn_items"}
+    assert _read_turn_items(conn.cursor(), table, []) == {}
+    assert _read_turn_items(conn.cursor(), table, ids)["last-turn"][0].text == "last"
+    conn.close()

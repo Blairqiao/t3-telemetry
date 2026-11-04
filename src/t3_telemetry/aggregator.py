@@ -430,6 +430,9 @@ def build_thread_telemetry(
                     context_texts=list(snapshot.turn_context.get(turn.provider_turn_id, [])),
                     usage_status=turn.usage_status,
                     usage_provenance=turn.usage_provenance,
+                    context_used_tokens=turn.used_tokens,
+                    context_max_tokens=turn.max_tokens,
+                    timeline=list(snapshot.turn_items.get(turn.provider_turn_id, [])),
                 )
                 steps.append(step)
 

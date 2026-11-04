@@ -1005,14 +1005,13 @@ def test_activity_detail_opens_selected_entry_scrolls_and_escape_restores_overvi
     text = "\n".join(lines)
     assert "Activity detail" in text and "Model step #5" in text
     assert "Child 2" not in text
-    assert "Unit of accounting" in text
     assert screen.max_detail_scroll > 0 and screen.detail_scroll == 0
 
-    for _ in range(50):
+    for _ in range(100):
         browser.handle_key("j")
     assert screen.detail_scroll == screen.max_detail_scroll
     scrolled = "\n".join(_render_lines(node, nav, 24, 60))
-    assert scrolled != text and "long_tool_name_39" in scrolled
+    assert scrolled != text and "Unit of accounting" in scrolled
     browser.handle_key("k")
     assert screen.detail_scroll == screen.max_detail_scroll - 1
     assert screen.selected_activity_id == saved[1]  # detail scroll never moved list selection
@@ -1153,7 +1152,7 @@ def test_focus_falls_back_to_activity_when_subagents_disappear():
 # --- Recorded context in activity titles and detail screens ---
 
 
-def _detail_text(step, node=None):
+def _detail_text(step, node=None, **kwargs):
     from t3_telemetry.activity import build_activity_entries
     from t3_telemetry.models import ThreadTelemetryNode
     from t3_telemetry.ui import build_activity_detail_lines
@@ -1161,7 +1160,7 @@ def _detail_text(step, node=None):
     node = node or ThreadTelemetryNode(thread_id="th", title="T", driver="codex",
                                        provider_instance_id="codex", model="m", steps=[step])
     entry = build_activity_entries(node)[0]
-    return entry, "\n".join(line.plain for line in build_activity_detail_lines(entry, node))
+    return entry, "\n".join(line.plain for line in build_activity_detail_lines(entry, node, **kwargs))
 
 
 def test_recorded_command_gives_title_and_inspectable_details():
@@ -1173,8 +1172,8 @@ def test_recorded_command_gives_title_and_inspectable_details():
     ])
     entry, text = _detail_text(step)
     assert entry.title == "Run command · uv run pytest (+1 more) · #3"
-    assert "Command: uv run pytest" in text and "Working dir: /repo" in text
-    assert "Path: src/app.py" in text
+    assert "Run command · uv run pytest" in text
+    assert "Read file · src/app.py" in text
     assert "Unit of accounting" in text
 
 
@@ -1183,10 +1182,10 @@ def test_name_only_and_undescribed_turn_fallbacks():
 
     entry, text = _detail_text(ModelStep(step_index=2, tool_calls=["run_command"]))
     assert entry.title == "run_command · details unavailable · #2"
-    turn = ModelStep(step_index=4, activity_kind="provider_turn", provider_turn_id="pt", input_tokens=5)
+    turn = ModelStep(step_index=4, activity_kind="provider_turn", provider_turn_id="pt", input_tokens=5, thinking_tokens=10)
     entry, text = _detail_text(turn)
     assert entry.title == "Provider turn #4 · action details unavailable"
-    assert "none associated with this turn" in text
+    assert "No actions recorded for this turn." in text
     assert "not per-tool usage" in text
 
 
@@ -1195,7 +1194,7 @@ def test_control_characters_neutralized_in_title_and_detail():
 
     step = ModelStep(step_index=1, tool_calls=["run_command"], tool_details=[
         ToolCallDetail(name="run_command", fields={"command": "echo \x1b[31mred\nnext\x07"}),
-    ], context_texts=[RecordedText(role="assistant", text="ok\x1b]0;title\x07\nline2\x9b")])
+    ], context_texts=[RecordedText(role="user", text="ok\x1b]0;title\x07\nline2\x9b")])
     entry, text = _detail_text(step)
     assert "\x1b" not in entry.title and "\n" not in entry.title
     assert "\\x1b[31mred next\\x07" in entry.title
@@ -1212,7 +1211,144 @@ def test_truncated_text_is_marked():
                      context_texts=[RecordedText(role="user", text="long prompt", truncated=True)])
     entry, text = _detail_text(step)
     assert entry.title.endswith("aaaaaaaaaa… · #1")
-    assert "(truncated)" in text and "Recorded prompt:" in text
+    assert "(truncated)" in text and "─ Prompt" in text
+
+
+def test_prompt_section_collapsed_and_expanded_ten_lines():
+    from t3_telemetry.activity import build_activity_entries
+    from t3_telemetry.models import ModelStep, RecordedText, ThreadTelemetryNode
+    from t3_telemetry.ui import build_activity_detail_lines
+
+    prompt_lines = [f"line {i}" for i in range(1, 11)]
+    step = ModelStep(
+        step_index=1,
+        activity_kind="provider_turn",
+        provider_turn_id="pt-1",
+        context_texts=[RecordedText(role="user", text="\n".join(prompt_lines))],
+    )
+    node = ThreadTelemetryNode(thread_id="th", title="T", driver="codex",
+                               provider_instance_id="codex", model="m", steps=[step])
+    entry = build_activity_entries(node)[0]
+
+    # Collapsed rendering (default prompt_expanded=False)
+    lines_collapsed = build_activity_detail_lines(entry, node, prompt_expanded=False)
+    text_collapsed = "\n".join(line.plain for line in lines_collapsed)
+
+    # Section order: header -> Tokens -> What it did -> Prompt -> Details
+    tokens_idx = text_collapsed.index("─ Tokens")
+    what_idx = text_collapsed.index("─ What it did")
+    prompt_idx = text_collapsed.index("─ Prompt")
+    details_idx = text_collapsed.index("─ Details")
+    assert 0 < tokens_idx < what_idx < prompt_idx < details_idx
+
+    assert "  line 1" in text_collapsed
+    assert "  line 2" in text_collapsed
+    assert "  line 3" in text_collapsed
+    assert "  … 7 more lines · P to expand" in text_collapsed
+    assert "  line 4" not in text_collapsed
+    assert "  line 10" not in text_collapsed
+
+    hint_line = next(l for l in lines_collapsed if "more lines" in l.plain)
+    assert hint_line.style == "dim"
+
+    # Expanded rendering (prompt_expanded=True)
+    lines_expanded = build_activity_detail_lines(entry, node, prompt_expanded=True)
+    text_expanded = "\n".join(line.plain for line in lines_expanded)
+
+    assert 0 < text_expanded.index("─ Tokens") < text_expanded.index("─ What it did") < text_expanded.index("─ Prompt") < text_expanded.index("─ Details")
+    for i in range(1, 11):
+        assert f"  line {i}" in text_expanded
+    assert "more lines · P to expand" not in text_expanded
+
+
+def test_prompt_section_no_section_without_prompt():
+    from t3_telemetry.models import ModelStep, RecordedText
+
+    # 1. No context_texts
+    step1 = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt-1")
+    _, text1 = _detail_text(step1)
+    assert "─ Prompt" not in text1
+    assert "─ What it did" in text1 and "─ Details" in text1
+
+    # 2. Empty context_texts
+    step2 = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt-2", context_texts=[])
+    _, text2 = _detail_text(step2)
+    assert "─ Prompt" not in text2
+
+    # 3. Only assistant context_texts (no user role)
+    step3 = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt-3",
+                      context_texts=[RecordedText(role="assistant", text="assistant reply")])
+    _, text3 = _detail_text(step3)
+    assert "─ Prompt" not in text3
+
+    # 4. User role with empty text
+    step4 = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt-4",
+                      context_texts=[RecordedText(role="user", text="")])
+    _, text4 = _detail_text(step4)
+    assert "─ Prompt" not in text4
+
+
+def test_prompt_section_truncation_collapsed_and_expanded():
+    from t3_telemetry.activity import build_activity_entries
+    from t3_telemetry.models import ModelStep, RecordedText, ThreadTelemetryNode
+    from t3_telemetry.ui import build_activity_detail_lines
+
+    # Collapsed with truncated=True and <= 3 lines
+    short_step = ModelStep(
+        step_index=1,
+        activity_kind="provider_turn",
+        provider_turn_id="pt-1",
+        context_texts=[RecordedText(role="user", text="short prompt 1\nshort prompt 2", truncated=True)],
+    )
+    node_short = ThreadTelemetryNode(thread_id="th", title="T", driver="codex", provider_instance_id="codex", model="m", steps=[short_step])
+    entry_short = build_activity_entries(node_short)[0]
+    lines_short_col = build_activity_detail_lines(entry_short, node_short, prompt_expanded=False)
+    text_short_col = "\n".join(l.plain for l in lines_short_col)
+    assert "  short prompt 1" in text_short_col
+    assert "  short prompt 2" in text_short_col
+    assert "  … (truncated)" in text_short_col
+    assert "more lines · P to expand" not in text_short_col
+    trunc_line = next(l for l in lines_short_col if "(truncated)" in l.plain)
+    assert trunc_line.style == "dim"
+
+    # Expanded with truncated=True and 10 lines
+    long_lines = [f"line {i}" for i in range(1, 11)]
+    long_step = ModelStep(
+        step_index=1,
+        activity_kind="provider_turn",
+        provider_turn_id="pt-2",
+        context_texts=[RecordedText(role="user", text="\n".join(long_lines), truncated=True)],
+    )
+    node_long = ThreadTelemetryNode(thread_id="th", title="T", driver="codex", provider_instance_id="codex", model="m", steps=[long_step])
+    entry_long = build_activity_entries(node_long)[0]
+    lines_long_exp = build_activity_detail_lines(entry_long, node_long, prompt_expanded=True)
+    text_long_exp = "\n".join(l.plain for l in lines_long_exp)
+    for i in range(1, 11):
+        assert f"  line {i}" in text_long_exp
+    assert "  … (truncated)" in text_long_exp
+    assert "more lines · P to expand" not in text_long_exp
+    trunc_line_exp = next(l for l in lines_long_exp if "(truncated)" in l.plain)
+    assert trunc_line_exp.style == "dim"
+
+
+def test_prompt_section_picks_first_user_role():
+    from t3_telemetry.models import ModelStep, RecordedText
+
+    step = ModelStep(
+        step_index=1,
+        activity_kind="provider_turn",
+        provider_turn_id="pt-1",
+        context_texts=[
+            RecordedText(role="system", text="system prompt"),
+            RecordedText(role="user", text="first user prompt"),
+            RecordedText(role="assistant", text="assistant reply"),
+            RecordedText(role="user", text="second user prompt"),
+        ],
+    )
+    _, text = _detail_text(step)
+    assert "  first user prompt" in text
+    assert "system prompt" not in text
+    assert "second user prompt" not in text
 
 
 def test_provider_turn_prompt_title_and_usage_labels():
@@ -1226,7 +1362,8 @@ def test_provider_turn_prompt_title_and_usage_labels():
     assert entry.total_tokens is None and "usage unavailable" in text
     zero = ModelStep(step_index=2, activity_kind="provider_turn", provider_turn_id="pz")
     entry, text = _detail_text(zero)
-    assert entry.total_tokens == 0 and "Total counted: 0" in text
+    assert entry.total_tokens == 0
+    assert next(line for line in text.splitlines() if line.strip().startswith("Total")).split() == ["Total", "0"]
     fb = ModelStep(step_index=3, activity_kind="provider_turn", provider_turn_id="pf", input_tokens=9,
                    usage_provenance="cumulative_fallback")
     entry, text = _detail_text(fb)
@@ -1368,6 +1505,16 @@ def test_list_ranges_and_focus_are_in_column_headers():
             assert ("▌" in headers[0]) == (focus == label.lower())
 
 
+def test_subagent_table_shows_total_tokens_not_in_out():
+    node = _activity_node(n_children=3)
+    nav = _open_overview(node)
+    nav.current_screen.focus = "subagents"
+    lines = _render_lines(node, nav, 30, 120)
+    header = next(line for line in lines if "Subagents" in line and "Model" in line)
+    assert "Tokens" in header
+    assert " In " not in header and "Out" not in header
+
+
 def test_focus_switch_preserves_table_capacity_and_header_dividers():
     node = _activity_node(n_steps=40, n_children=40)
     nav = _open_overview(node)
@@ -1389,14 +1536,14 @@ def test_w_s_move_selection_and_scroll_activity_details():
     node = _activity_node()
     nav = _open_overview(node)
     browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
-    _render_lines(node, nav, 24, 60)
+    _render_lines(node, nav, 15, 60)
     original = nav.current_screen.selected_activity_id
     browser.handle_key("w")
     assert nav.current_screen.selected_activity_id != original
     browser.handle_key("s")
     assert nav.current_screen.selected_activity_id == original
     browser.handle_key("ENTER")
-    _render_lines(node, nav, 24, 60)
+    _render_lines(node, nav, 15, 60)
     screen = nav.current_screen
     assert screen.max_detail_scroll > 0
     browser.handle_key("s")
@@ -1416,3 +1563,253 @@ def test_e_opens_selection_and_ordinary_detail_ignores_e():
     browser.handle_key("E")
     assert len(nav.stack) == 1
     assert nav.current_screen.detail_activity_id == selected
+
+
+def test_p_toggles_prompt_on_and_off_in_activity_detail():
+    node = _activity_node()
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    _render_lines(node, nav, 24, 60)
+    browser.handle_key("ENTER")
+    screen = nav.current_screen
+    assert screen.detail_activity_id is not None
+    assert screen.detail_prompt_expanded is False
+
+    browser.handle_key("p")
+    assert screen.detail_prompt_expanded is True
+    browser.handle_key("p")
+    assert screen.detail_prompt_expanded is False
+    browser.handle_key("P")
+    assert screen.detail_prompt_expanded is True
+
+
+def test_p_noop_on_activity_list_and_launch_details():
+    # 1. Activity list: p does nothing
+    node = _activity_node()
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    _render_lines(node, nav, 24, 60)
+    screen = nav.current_screen
+    assert screen.detail_activity_id is None
+    assert screen.detail_prompt_expanded is False
+    browser.handle_key("p")
+    assert screen.detail_prompt_expanded is False
+    browser.handle_key("P")
+    assert screen.detail_prompt_expanded is False
+
+    # 2. Launch details: p does nothing
+    node_launch = _launch_node()
+    nav_launch = _open_overview(node_launch)
+    browser_launch = TelemetryBrowser(TerminalAdapter(), navigation=nav_launch)
+    _render_lines(node_launch, nav_launch, 30, 100)
+    launch_id = "th|launch:subagent:s1"
+    _select(nav_launch, browser_launch, launch_id)
+    browser_launch.handle_key("ENTER")
+    launch_screen = nav_launch.current_screen
+    assert launch_screen.detail_activity_id == launch_id
+    assert launch_id in launch_screen.activity_targets
+    assert launch_screen.detail_prompt_expanded is False
+    browser_launch.handle_key("p")
+    assert launch_screen.detail_prompt_expanded is False
+    browser_launch.handle_key("P")
+    assert launch_screen.detail_prompt_expanded is False
+
+
+def test_p_resets_after_escape_and_reentering():
+    node = _activity_node()
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    _render_lines(node, nav, 24, 60)
+    browser.handle_key("ENTER")
+    screen = nav.current_screen
+    assert screen.detail_prompt_expanded is False
+
+    browser.handle_key("p")
+    assert screen.detail_prompt_expanded is True
+
+    browser.handle_key("ESC")
+    assert screen.detail_activity_id is None
+    assert screen.detail_prompt_expanded is False
+
+    browser.handle_key("ENTER")
+    assert screen.detail_activity_id is not None
+    assert screen.detail_prompt_expanded is False
+
+
+def test_footer_line_shows_p_prompt_in_activity_detail_only():
+    node = _activity_node()
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    lines = _render_lines(node, nav, 24, 80)
+    assert "P prompt" not in lines[-1]
+
+    browser.handle_key("ENTER")
+    lines = _render_lines(node, nav, 24, 80)
+    assert "W/S scroll  P prompt  Esc back  q quit" in lines[-1]
+
+
+def test_detail_token_split_context_and_reply_filter():
+    from t3_telemetry.models import ModelStep, RecordedText
+
+    step = ModelStep(step_index=1, activity_kind="provider_turn", input_tokens=6,
+                     cache_read_tokens=241250, cache_creation_tokens=943,
+                     output_tokens=907, thinking_tokens=249,
+                     context_texts=[RecordedText(role="assistant", text="secret reply")])
+    _, text = _detail_text(step)
+    for value in ("re-read context", "241,250", "99.6%", "new this turn", "949", "Total", "243,106"):
+        assert value in text
+    assert "Context at end" not in text
+    assert "secret reply" not in text and "Recorded reply" not in text
+    step.context_used_tokens = 100
+    step.context_max_tokens = 1000
+    _, text = _detail_text(step)
+    assert "Context at end" in text
+
+
+def test_detail_view_claude_turn_with_mixed_timeline():
+    from t3_telemetry.models import ModelStep, TurnItem
+
+    items = [
+        TurnItem(kind="run", text="uv run pytest", started_at="2026-11-04T10:00:00Z", duration_seconds=1.5),
+        TurnItem(kind="edit", text="src/ui.py", started_at="2026-11-04T10:00:02Z", duration_seconds=0.8),
+        TurnItem(kind="search", text="find pattern", started_at="2026-11-04T10:00:03Z", duration_seconds=0.2),
+        TurnItem(kind="tool", text="inspect", started_at="2026-11-04T10:00:04Z", duration_seconds=0.5),
+        TurnItem(kind="subagent", text="reviewer", started_at="2026-11-04T10:00:05Z", duration_seconds=3.0),
+        TurnItem(kind="think", started_at="2026-11-04T10:00:08Z", duration_seconds=2.0),
+        TurnItem(kind="error", text="timeout", started_at="2026-11-04T10:00:10Z", duration_seconds=0.1),
+        TurnItem(kind="compact", text="context", started_at="2026-11-04T10:00:11Z", duration_seconds=0.0),
+        TurnItem(kind="run", text="git status", started_at="2026-11-04T10:00:12Z", status="running", duration_seconds=0.0),
+    ]
+    step = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt-1", timeline=items)
+    entry, text = _detail_text(step)
+
+    assert "─ What it did" in text
+    assert "2 commands · 1 edit · 1 tool · 1 search · 1 subagent · 1 thinking · 1 error · 1 compaction" in text
+    assert "10:00:00  run       uv run pytest" in text
+    assert "1.5s" in text
+    assert "10:00:02  edit      src/ui.py" in text
+    assert "0.8s" in text
+    assert "10:00:03  search    find pattern" in text
+    assert "0.2s" in text
+    assert "10:00:04  tool      inspect" in text
+    assert "0.5s" in text
+    assert "10:00:05  subagent  reviewer" in text
+    assert "3.0s" in text
+    assert "10:00:08  think" in text
+    assert "2.0s" in text
+    assert "10:00:10  error     timeout" in text
+    assert "0.1s" in text
+    assert "10:00:11  compact   context" in text
+    assert "10:00:12  run       git status (running)" in text
+
+
+def test_detail_view_thirty_five_items_capped_at_thirty():
+    from t3_telemetry.models import ModelStep, TurnItem
+    from t3_telemetry.ui import _actions_lines
+
+    items = [
+        TurnItem(kind="run", text=f"command_{i}", started_at=f"2026-11-04T10:{i:02d}:00Z", duration_seconds=1.0)
+        for i in range(35)
+    ]
+    step = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt-1", timeline=items)
+    entry, text = _detail_text(step)
+
+    lines = _actions_lines(step, width=80)
+    assert len(lines) == 32
+    assert "35 commands" in lines[0].plain
+    assert "+5 more" in lines[-1].plain
+    assert lines[-1].style == "dim"
+    assert "command_0" in text
+    assert "command_29" in text
+    assert "command_30" not in text
+
+
+def test_detail_view_antigravity_step_with_thinking_and_two_tools():
+    from t3_telemetry.models import ModelStep, ToolCallDetail
+    from t3_telemetry.ui import _actions_lines
+
+    step = ModelStep(
+        step_index=1,
+        activity_kind="model_step",
+        thinking_tokens=1500,
+        tool_calls=["run_command", "view_file"],
+        tool_details=[
+            ToolCallDetail(name="run_command", fields={"command": "cargo test"}),
+            ToolCallDetail(name="view_file", fields={"path": "src/main.rs"}),
+        ],
+    )
+    entry, text = _detail_text(step)
+    lines = _actions_lines(step, width=80)
+
+    assert len(lines) == 4
+    assert lines[0].plain == "1 Run command · 1 Read file"
+    assert lines[1].plain == "think  1,500 thinking tokens"
+    assert lines[2].plain == "Run command · cargo test"
+    assert lines[3].plain == "Read file · src/main.rs"
+
+    assert "1 Run command · 1 Read file" in text
+    assert "think  1,500 thinking tokens" in text
+    assert "Run command · cargo test" in text
+    assert "Read file · src/main.rs" in text
+
+
+def test_detail_view_timeline_row_formatting_and_gotchas():
+    from t3_telemetry.models import ModelStep, TurnItem
+    from t3_telemetry.ui import _actions_lines, _timeline_item_line
+
+    # 1. Neutralize control chars and newlines in item text
+    item_escape = TurnItem(
+        kind="run",
+        text="echo \x1b[31mred\nnewline\x07",
+        started_at="2026-11-04T10:00:00Z",
+        duration_seconds=1.2,
+    )
+    line_esc = _timeline_item_line(item_escape, width=80)
+    assert "\x1b" not in line_esc.plain and "\n" not in line_esc.plain
+    assert "\\x1b[31mred newline\\x07" in line_esc.plain
+
+    # 2. Truncated item text gets marked with …
+    item_trunc = TurnItem(
+        kind="edit",
+        text="src/very/long/path/to/some/nested/file.py",
+        truncated=True,
+        started_at="2026-11-04T10:00:00Z",
+        duration_seconds=0.5,
+    )
+    line_trunc = _timeline_item_line(item_trunc, width=80)
+    assert "file.py…" in line_trunc.plain
+
+    # 3. Text elided to fit narrow width before right-aligned duration
+    item_long = TurnItem(
+        kind="run",
+        text="a" * 100,
+        started_at="2026-11-04T10:00:00Z",
+        duration_seconds=2.5,
+    )
+    line_narrow = _timeline_item_line(item_long, width=50)
+    assert len(line_narrow.plain) == 50
+    assert line_narrow.plain.endswith("2.5s")
+    assert "…" in line_narrow.plain
+    item_long.text = "界" * 100
+    line_wide_chars = _timeline_item_line(item_long, width=50)
+    assert line_wide_chars.cell_len == 50
+    assert line_wide_chars.plain.endswith("2.5s")
+    assert "…" in line_wide_chars.plain
+
+    # 4. Running tag in yellow for both text items and think items
+    item_running_run = TurnItem(kind="run", text="cargo build", status="running", duration_seconds=0.0)
+    line_rr = _timeline_item_line(item_running_run, width=60)
+    assert "(running)" in line_rr.plain
+    assert any(span.style == "yellow" for span in line_rr.spans)
+
+    item_running_think = TurnItem(kind="think", status="running", duration_seconds=0.0)
+    line_rt = _timeline_item_line(item_running_think, width=60)
+    assert "(running)" in line_rt.plain
+    assert any(span.style == "yellow" for span in line_rt.spans)
+
+    # 5. Nothing recorded for empty step
+    empty_step = ModelStep(step_index=1, activity_kind="model_step")
+    empty_lines = _actions_lines(empty_step, width=80)
+    assert len(empty_lines) == 1
+    assert empty_lines[0].plain == "No actions recorded for this turn."
+    assert empty_lines[0].style == "dim"

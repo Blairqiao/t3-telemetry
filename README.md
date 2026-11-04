@@ -120,9 +120,11 @@ Token telemetry is reported across three explicit scopes:
 
 Provider turns (Claude or Codex turn boundaries) and model inference steps (Antigravity steps) are tracked distinctly via `provider_turn_count` and `model_step_count`. Duration is the sum of recorded agent step and turn durations. Concurrent subagents can overlap, so this total is not wall-clock elapsed time.
 
+For Claude/Codex, uncached input is now `inputTokens − cached − cache creation`, totals include cache creation, and `--json` steps and summaries include `new_input_tokens` and `context_read_tokens`.
+
 #### Activity details and retention
 
-Activity rows show a recorded description, total tokens, and duration. Visible ranges indicate the list window, and selection scrolls at the visible boundary. Open details to inspect identity, status, timestamps, token breakdown, accounting scope, and supported recorded context. Provider-turn totals cover the entire turn, including any listed tools. Missing usage differs from recorded zero; approximate or partial totals are marked.
+Activity rows show a recorded description, total tokens, and duration. Visible ranges indicate the list window, and selection scrolls at the visible boundary. Open details to inspect the detail sections (Tokens with re-read vs. new split and end-of-turn context, What it did timeline, Prompt with `P` to expand, Details footer). Provider-turn totals cover the entire turn, including any listed tools. Missing usage differs from recorded zero; approximate or partial totals are marked.
 
 Descriptions use recorded command, path, task, or explicitly associated message fields. Name-only tools and unassociated turns report unavailable details. T3 message associations require explicit references; arbitrary provider logs are not searched. Retained text is bounded and truncation is labeled. Recorded commands are displayed as text and never executed.
 
