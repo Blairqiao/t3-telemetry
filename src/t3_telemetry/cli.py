@@ -163,7 +163,7 @@ def run_live_loop(
     browser = TelemetryBrowser(adapter, history_store=history_store)
     live_factory = _live_cls or Live
 
-    usage_cache = _usage_cache if _usage_cache is not None else UsageCache()
+    usage_cache = _usage_cache if _usage_cache is not None else UsageCache(background=True)
     usage = None
     last_period = None
     cached_snapshot = None
@@ -804,6 +804,8 @@ def _root_list_body(roots: list[AppThreadRecord], nav: NavigationState, inner_he
     shown = len(roots[start : start + visible_rows])
     body.append_text(section_rule("Chats", inner_width, note=activity_range_label(start, shown, len(roots)), focused=focused))
     body.append("\n")
+    if not roots:
+        body.append("No app threads found. Waiting for activity.\n", style="italic")
     for root in roots[start : start + visible_rows]:
         is_selected = root.thread_id == nav.selected_id
         pt = snapshot.get_provider_thread(root.thread_id) if snapshot else None
@@ -822,6 +824,17 @@ def _root_list_body(roots: list[AppThreadRecord], nav: NavigationState, inner_he
     return body
 
 
+def _parse_utc(value: str | None) -> datetime | None:
+    """T3 timestamps are UTC; treat a missing offset as UTC and bad text as absent."""
+    try:
+        parsed = datetime.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+    if parsed is not None and parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def _home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, inner_width, now):
     card = []
     if summary:
@@ -836,10 +849,12 @@ def _home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, 
         turns = snapshot.provider_turns_by_thread.get(summary.thread_id, []) if snapshot else []
         running = next((t for t in reversed(turns) if t.status == "running" and t.started_at), None)
         clock = ""
-        if running:
-            clock = "Turn running " + format_duration((now - datetime.fromisoformat(running.started_at)).total_seconds())
-        elif turns and turns[-1].completed_at:
-            clock = "Last turn " + datetime.fromisoformat(turns[-1].completed_at).astimezone(now.tzinfo).strftime("%H:%M")
+        started = _parse_utc(running.started_at) if running else None
+        completed = _parse_utc(turns[-1].completed_at) if turns and not running else None
+        if started:
+            clock = "Turn running " + format_duration(max(0.0, (now - started).total_seconds()))
+        elif completed:
+            clock = "Last turn " + completed.astimezone(now.tzinfo).strftime("%H:%M")
         if usage:
             clock += ("  ·  " if clock else "") + "Today " + format_tokens(usage.root_total("today", summary.thread_id))
         if clock:
@@ -863,7 +878,8 @@ def _home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, 
         line = Text(("▶ " if selected else "  ") + PERIOD_LABELS[key].ljust(11))
         if usage:
             window = usage.periods[key].window
-            date_range = f"{window.start:%b %d}–{(window.end - timedelta(days=1)):%b %d}"
+            last_day = window.end - timedelta(days=1)
+            date_range = f"{window.start:%b %d}" if key == "today" else f"{window.start:%b %d}–{last_day:%b %d}"
             if line.cell_len + len(date_range) + len(total) + 2 <= inner_width:
                 line.append(date_range, style="dim")
         line.append(" " * max(1, inner_width - line.cell_len - len(total)) + total)
@@ -909,14 +925,20 @@ def _period_body(usage, nav, inner_height, inner_width, now) -> list:
     nav.top_scroll = start_idx
     window = threads[start_idx:start_idx + rows]
     result = [header, section_rule("Usage over time", inner_width), *graph, section_rule("Providers", inner_width), table, section_rule("Top threads", inner_width, note=activity_range_label(start_idx, len(window), len(threads)), focused=True)]
-    for thread in window:
-        suffix = f"  {'+'.join(thread.providers)}  {format_tokens(thread.tokens.total)}"
+    # Fixed provider and token columns so titles all end at the same place.
+    provider_labels = ["+".join(t.providers) for t in window]
+    token_labels = [format_tokens(t.tokens.total) for t in window]
+    token_w = max((len(x) for x in token_labels), default=0)
+    provider_w = min(max((len(x) for x in provider_labels), default=0), max(0, (inner_width - 2) // 3))
+    title_w = max(1, inner_width - 2 - (2 + provider_w) - (2 + token_w))
+    for thread, providers, tokens in zip(window, provider_labels, token_labels):
         line = Text("▶ " if thread.thread_id == nav.selected_top_id else "  ", style="bold cyan")
-        title = Text(thread.title, style=get_status_style(thread.status))
-        _fit(title, max(1, inner_width - 2 - len(suffix)))
+        title = _fit(Text(thread.title, style=get_status_style(thread.status)), title_w)
         line.append_text(title)
-        line.append(" " * max(0, inner_width - line.cell_len - len(suffix)))
-        line.append(suffix, style="dim")
+        line.append(" " * (title_w - title.cell_len))
+        line.append_text(_fit(Text("  " + providers, style="dim"), 2 + provider_w) if provider_w else Text())
+        line.append(" " * max(0, inner_width - token_w - line.cell_len))
+        line.append(tokens.rjust(token_w))
         result.append(_fit(line, inner_width))
     if not threads:
         result.append(Text("No usage recorded", style="italic"))

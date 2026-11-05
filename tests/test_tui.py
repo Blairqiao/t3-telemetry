@@ -780,7 +780,7 @@ def test_graph_correction_repaints_with_unchanged_count_and_peak(monkeypatch):
     from t3_telemetry.models import ThreadTelemetryNode, ContextSample
     from types import SimpleNamespace
     from t3_telemetry import cli
-    monkeypatch.setattr(cli, "UsageCache", lambda: _EmptyUsageCache())
+    monkeypatch.setattr(cli, "UsageCache", lambda **kw: _EmptyUsageCache())
 
     root = SimpleNamespace(active_provider_thread_id=None, thread_id="root", title="Root", model="model",
                            parent_thread_id=None, deleted_at=None,
@@ -822,7 +822,7 @@ def test_graph_correction_repaints_with_unchanged_count_and_peak(monkeypatch):
 def test_live_values_repaint_without_row_count_changes(monkeypatch, change):
     from types import SimpleNamespace
     from t3_telemetry import cli
-    monkeypatch.setattr(cli, "UsageCache", lambda: _EmptyUsageCache())
+    monkeypatch.setattr(cli, "UsageCache", lambda **kw: _EmptyUsageCache())
     from t3_telemetry.models import ThreadTelemetryNode, ModelStep, TurnMetrics, ToolCallDetail, RecordedText
 
     root = SimpleNamespace(active_provider_thread_id=None, thread_id="root", title="Root", model="model",
@@ -1096,7 +1096,7 @@ def test_running_turn_without_usage_is_not_shown_as_zero_tokens():
 def test_live_loop_activity_keys_do_not_read_data(monkeypatch):
     from types import SimpleNamespace
     from t3_telemetry import cli
-    monkeypatch.setattr(cli, "UsageCache", lambda: _EmptyUsageCache())
+    monkeypatch.setattr(cli, "UsageCache", lambda **kw: _EmptyUsageCache())
 
     root = SimpleNamespace(active_provider_thread_id=None, thread_id="th", title="Parent", model="m", parent_thread_id=None,
                            deleted_at=None, updated_at="2026-11-03T10:00:00Z", created_at=None)
@@ -2083,3 +2083,48 @@ def test_idle_home_does_not_repaint_on_unchanged_polls(monkeypatch):
     run_live_loop(args, _adapter=ScriptedAdapter([None, None, None]), _clock=lambda: next(tick) * 0.05,
                   _max_iterations=3, _live_cls=lambda **kw: capture, _usage_cache=_EmptyUsageCache())
     assert len(capture.updates) == 1
+
+
+def test_home_polish_empty_list_naive_clock_and_single_today_date():
+    from datetime import datetime, timezone, timedelta
+    from types import SimpleNamespace
+    from t3_telemetry.models import ThreadTelemetryNode, ModelStep
+    from t3_telemetry.usage import build_usage_report
+    from t3_telemetry.ui import format_duration
+
+    now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+    summary = ThreadTelemetryNode(thread_id="root", title="Live chat", driver="codex", provider_instance_id="codex", model="m")
+    naive_start = (now - timedelta(seconds=134)).replace(tzinfo=None).isoformat()
+    turn = ModelStep(step_index=1, status="running", started_at=naive_start)
+    snapshot = SimpleNamespace(provider_turns_by_thread={"root": [turn]}, get_provider_thread=lambda _: None)
+    frame = _browser_frame([], None, summary, NavigationState(), 24, 80, snapshot=snapshot,
+                           usage=build_usage_report([], now), now=now, running_ids=[])
+    buf = io.StringIO()
+    Console(file=buf, width=80, height=24, force_terminal=True, color_system=None).print(frame)
+    output = buf.getvalue()
+    assert "Turn running " + format_duration(134) in output
+    assert "No app threads found" in output
+    today = next(line for line in output.splitlines() if "Today " in line and "Nov" in line)
+    assert "Nov 04" in today and "–" not in today
+
+
+def test_period_top_threads_align_columns():
+    from datetime import datetime, timezone
+    from t3_telemetry.usage import build_usage_report, ThreadUsage, TokenBreakdown
+
+    now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+    report = build_usage_report([], now)
+    report.periods["week"].threads = [
+        ThreadUsage("a", "Alpha", "idle", ["Codex", "Antigravity"], TokenBreakdown(input_tokens=139_210_000)),
+        ThreadUsage("b", "A much longer thread title that must be cut", "idle", ["Claude"], TokenBreakdown(input_tokens=45_370_000)),
+    ]
+    nav = NavigationState(period="week")
+    nav.sync_top(["a", "b"])
+    for width in (60, 120):
+        frame = _browser_frame([], None, None, nav, 30, width, usage=report, now=now)
+        buf = io.StringIO()
+        Console(file=buf, width=width, height=30, force_terminal=True, color_system=None).print(frame)
+        rows = [line for line in buf.getvalue().splitlines() if "139.21M" in line or "45.37M" in line]
+        assert len(rows) == 2
+        assert rows[0].index("Codex") == rows[1].index("Claude")
+        assert rows[0].index("139.21M") + len("139.21M") == rows[1].index("45.37M") + len("45.37M")

@@ -87,3 +87,68 @@ def test_usage_cache_ttl_force_and_failure(tmp_path):
     assert len(calls) == 4
     empty = UsageCache(reader=lambda *_: (_ for _ in ()).throw(OSError()))
     assert empty.get(tmp_path, None) is None
+
+
+def test_usage_cache_backs_off_after_failure(tmp_path):
+    from t3_telemetry.usage import UsageCache
+
+    now = [0.0]
+    calls = []
+
+    def reader(*_):
+        calls.append(now[0])
+        raise OSError("locked")
+
+    cache = UsageCache(max_age=5, clock=lambda: now[0], reader=reader)
+    assert cache.get(tmp_path, None) is None
+    now[0] = 1
+    assert cache.get(tmp_path, None) is None
+    assert calls == [0.0]
+    now[0] = 5
+    cache.get(tmp_path, None)
+    assert calls == [0.0, 5]
+
+
+def test_usage_cache_background_refresh_keeps_old_report(tmp_path):
+    import threading
+    from t3_telemetry.usage import UsageCache
+
+    now = [0.0]
+    release = threading.Event()
+    reports = iter(["first", "second"])
+
+    def reader(*_):
+        report = next(reports)
+        if report == "second":
+            release.wait(5)
+        return report
+
+    cache = UsageCache(max_age=5, clock=lambda: now[0], reader=reader, background=True)
+    assert cache.get(tmp_path, None) == "first"  # no report yet: synchronous
+    now[0] = 6
+    assert cache.get(tmp_path, None) == "first"  # refresh runs in the background
+    assert cache.get(tmp_path, None) == "first"  # one worker at a time
+    release.set()
+    cache._worker.join(5)
+    assert cache.get(tmp_path, None) == "second"
+
+
+def test_usage_cache_background_worker_swallows_unexpected_errors(tmp_path):
+    from t3_telemetry.usage import UsageCache
+
+    now = [0.0]
+    calls = []
+
+    def reader(*_):
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("bad row")
+        return "first"
+
+    cache = UsageCache(max_age=5, clock=lambda: now[0], reader=reader, background=True)
+    cache.get(tmp_path, None)
+    now[0] = 6
+    cache.get(tmp_path, None)
+    cache._worker.join(5)
+    assert cache.get(tmp_path, None) == "first"
+    assert len(calls) == 2  # the failure also waits max_age before retrying

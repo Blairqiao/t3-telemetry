@@ -1,5 +1,6 @@
 """Pure calendar-based aggregation of telemetry usage."""
 import sqlite3
+import threading
 import time as clock_time
 from pathlib import Path
 from typing import Callable
@@ -155,21 +156,58 @@ def read_usage_report(t3_dir: Path | str, snapshot: T3StateSnapshot, now: dateti
 
 
 class UsageCache:
+    """Rebuild the usage report at most every ``max_age`` seconds.
+
+    A failed read is also held for ``max_age`` so a broken database is not re-read on
+    every poll. With ``background=True``, refreshes after the first successful report
+    run on a daemon thread and ``get`` returns the previous report until it finishes.
+    """
+
     def __init__(self, max_age: float = 5.0, clock: Callable[[], float] = clock_time.monotonic,
-                 reader: Callable[[Path, T3StateSnapshot], UsageReport] | None = None) -> None:
+                 reader: Callable[[Path, T3StateSnapshot], UsageReport] | None = None,
+                 background: bool = False) -> None:
         self.max_age = max_age
         self.clock = clock
         self.reader = reader or read_usage_report
+        self.background = background
         self.report: UsageReport | None = None
-        self.built_at = 0.0
+        self.built_at: float | None = None  # time of the last attempt, successful or not
+        self._lock = threading.Lock()
+        self._worker: threading.Thread | None = None
 
     def get(self, t3_dir: Path, snapshot: T3StateSnapshot, force: bool = False) -> UsageReport | None:
-        if self.report is not None and not force and self.clock() - self.built_at < self.max_age:
+        with self._lock:
+            stale = force or self.built_at is None or self.clock() - self.built_at >= self.max_age
+            have_report = self.report is not None
+        if stale:
+            if self.background and have_report:
+                self._start_worker(t3_dir, snapshot)
+            else:
+                self._refresh(t3_dir, snapshot)
+        with self._lock:
             return self.report
+
+    def _refresh(self, t3_dir: Path, snapshot: T3StateSnapshot) -> None:
         try:
             report = self.reader(t3_dir, snapshot)
         except (sqlite3.Error, OSError):
-            return self.report
-        self.report = report
-        self.built_at = self.clock()
-        return report
+            report = None
+        with self._lock:
+            self.built_at = self.clock()
+            if report is not None:
+                self.report = report
+
+    def _start_worker(self, t3_dir: Path, snapshot: T3StateSnapshot) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+
+        def run() -> None:
+            try:
+                self._refresh(t3_dir, snapshot)
+            except Exception:
+                # A traceback on stderr would corrupt the live screen; keep the old report.
+                with self._lock:
+                    self.built_at = self.clock()
+
+        self._worker = threading.Thread(target=run, name="usage-refresh", daemon=True)
+        self._worker.start()
