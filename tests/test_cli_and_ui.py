@@ -1615,3 +1615,39 @@ def test_context_graph_single_row_labels_ceiling_and_narrow_width():
     for width in (8, 12, 16):
         lines = context_graph_lines(node, width, 3)
         assert all(ln.cell_len <= width for ln in lines)
+
+
+def test_usage_graph_helpers_and_rendering():
+    from datetime import datetime, timedelta, timezone
+    from io import StringIO
+
+    from rich.console import Console
+
+    from t3_telemetry.ui import merge_buckets, stack_column, usage_graph_lines
+    from t3_telemetry.usage import PeriodUsage, TokenBreakdown, period_window
+
+    now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+    starts = [now + timedelta(days=i) for i in range(31)]
+    merged = merge_buckets([{"Claude": 1, "Codex": 2}] * 31, starts, 27)
+    assert len(merged) <= 27
+    assert merged[0][0] == starts[0]
+    assert sum(values["Claude"] for _, values in merged) == 31
+    assert sum(values["Codex"] for _, values in merged) == 62
+    assert stack_column({"Claude": 75, "Codex": 25}, 100, 4) == ["Claude", "Claude", "Claude", "Codex"]
+    assert stack_column({"Codex": 1}, 100, 4) == ["Codex", None, None, None]
+    assert stack_column({}, 100, 4) == [None] * 4
+
+    for key in ("week", "month"):
+        window = period_window(key, now)
+        period = PeriodUsage(window, TokenBreakdown(input_tokens=10), {"Claude": TokenBreakdown(input_tokens=10)},
+                             [{"Claude": 10} for _ in window.bucket_starts], [])
+        lines = usage_graph_lines(period, 60, 5, now)
+        assert len(lines) == 7
+        output = StringIO()
+        console = Console(file=output, width=60, color_system=None)
+        for line in lines:
+            console.print(line)
+        rendered = output.getvalue().splitlines()
+        assert len(rendered) == 7
+        assert all(len(line) <= 60 for line in rendered)
+        assert "·" in rendered[-2]

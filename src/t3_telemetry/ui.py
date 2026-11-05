@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
+import textwrap
 from typing import Any
 
 from rich import box
@@ -12,8 +14,10 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from t3_telemetry.activity import TOOL_VERBS, ActivityEntry, build_activity_entries, describe_tool, neutralize
+from t3_telemetry.activity import DETAIL_FIELD_LABELS, TOOL_VERBS, ActivityEntry, build_activity_entries, describe_tool, neutralize
 from t3_telemetry.models import ModelStep, ThreadTelemetryNode, ToolCallDetail, TurnItem
+from t3_telemetry.tui import window_start
+from t3_telemetry.usage import PROVIDER_ORDER, PeriodUsage
 
 
 # Focused selection: bright text on a solid background; the ▶ marker carries it without color.
@@ -289,6 +293,93 @@ def format_axis_tokens(value: float) -> str:
     if value >= 1000:
         return f"{value / 1000:g}k"
     return f"{value:g}"
+
+
+PROVIDER_STYLES = {"Claude": "dark_orange", "Codex": "green3", "Antigravity": "medium_purple1", "Other": "grey62"}
+PROVIDER_GLYPHS = {"Claude": "█", "Codex": "▓", "Antigravity": "▒", "Other": "░"}
+
+
+def merge_buckets(buckets: list[dict[str, int]], starts: list[datetime], max_columns: int) -> list[tuple[datetime, dict[str, int]]]:
+    """Combine adjacent buckets, retaining the first start and provider sums."""
+    if not buckets or max_columns <= 0:
+        return []
+    size = (len(buckets) + max_columns - 1) // max_columns
+    result = []
+    for i in range(0, len(buckets), size):
+        totals: dict[str, int] = {}
+        for bucket in buckets[i:i + size]:
+            for provider, value in bucket.items():
+                totals[provider] = totals.get(provider, 0) + value
+        result.append((starts[i], totals))
+    return result
+
+
+def stack_column(values: dict[str, int], ceiling: int, rows: int) -> list[str | None]:
+    """Assign each row, bottom first, to the provider covering its midpoint."""
+    result: list[str | None] = [None] * rows
+    if ceiling <= 0 or rows <= 0:
+        return result
+    low = 0.0
+    for provider in PROVIDER_ORDER:
+        high = low + values.get(provider, 0) / ceiling * rows
+        for row in range(rows):
+            if low <= row + 0.5 < high:
+                result[row] = provider
+        low = high
+    if values and sum(values.values()) > 0 and not any(result):
+        result[0] = max(PROVIDER_ORDER, key=lambda provider: values.get(provider, 0))
+    return result
+
+
+def usage_graph_lines(period: PeriodUsage, width: int, plot_rows: int, now: datetime) -> list[Text]:
+    """Render a legend, stacked usage plot, and time labels."""
+    legend = Text()
+    for provider in PROVIDER_ORDER:
+        if provider in period.by_provider:
+            if legend:
+                legend.append("   ")
+            legend.append("■", style=PROVIDER_STYLES[provider])
+            legend.append(f" {provider} ({PROVIDER_GLYPHS[provider]}) {format_tokens(period.by_provider[provider].total)}")
+    if not legend:
+        legend.append("No usage recorded")
+    legend.truncate(width, overflow="ellipsis")
+    merged = merge_buckets(period.buckets, period.window.bucket_starts, max(1, (width - 6) // 2))
+    ceiling = nice_ceiling(max((sum(values.values()) for _, values in merged), default=0))
+    n = len(merged)
+    bar_w = min(3, max(1, (width - 6) // n - 1)) if n else 1
+    columns = [stack_column(values, ceiling, plot_rows) for _, values in merged]
+    lines = [legend]
+    for row in range(plot_rows - 1, -1, -1):
+        labels = {0: "0", plot_rows - 1: format_axis_tokens(ceiling)}
+        if plot_rows >= 5:
+            labels[plot_rows // 2] = format_axis_tokens(ceiling / 2)
+        label = labels.get(row)
+        line = Text((label or "")[-5:].rjust(5), style="bold")
+        line.append("┤" if label is not None else "│", style="bold")
+        for (start, _), column in zip(merged, columns):
+            provider = column[row]
+            if start >= now:
+                line.append("·" * bar_w if row == 0 else " " * bar_w, style="dim")
+            elif provider:
+                line.append(PROVIDER_GLYPHS[provider] * bar_w, style=PROVIDER_STYLES[provider])
+            else:
+                line.append(" " * bar_w)
+            line.append(" ")
+        line.truncate(width)
+        lines.append(line)
+    labels_line = Text(" " * 6)
+    for i, (start, _) in enumerate(merged):
+        offset = 6 + i * (bar_w + 1)
+        if period.window.bucket == "hour":
+            label = str(start.hour) if start.hour in (0, 6, 12, 18) else ""
+        elif period.window.key == "week":
+            label = start.strftime("%a")
+        else:
+            label = str(start.day)
+        if label and offset >= labels_line.cell_len and offset + len(label) <= width:
+            labels_line.append(" " * (offset - labels_line.cell_len) + label)
+    lines.append(labels_line)
+    return lines
 
 
 @dataclass(frozen=True, slots=True)
@@ -701,10 +792,11 @@ def build_activity_table(
     highlight) and the one-shot snapshot.
     """
     if interactive:
-        table = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1), show_header=show_header, pad_edge=False, show_edge=False, header_style=SELECTED_ROW_STYLE if focused else "bold")
+        # The section rule above carries the name, range and focus; the header names columns only.
+        table = Table(box=None, expand=True, padding=(0, 1), show_header=show_header, pad_edge=False, show_edge=False, header_style="dim")
     else:
         table = Table(title=title, box=box_style, expand=True, show_header=show_header)
-    header = f"{'▌' if focused else ' '}Activity {range_label}" if range_label is not None else "Activity"
+    header = "" if interactive else "Activity"
     table.add_column(header, ratio=1, no_wrap=True, overflow="ellipsis")
     table.add_column("Tokens", justify="right", no_wrap=True)
     table.add_column("Time", justify="right", no_wrap=True)
@@ -725,8 +817,24 @@ def build_activity_table(
     return table
 
 
+def section_rule(title: str, width: int, *, note: str = "", focused: bool = False) -> Text:
+    """The one section separator used across the live TUI: ``─ Title · note ─────``.
+
+    A focused section (the one W/S acts on) starts with ``▌`` and is drawn in
+    bold cyan; every other rule is dim. The rule always fills ``width``.
+    """
+    label = f" {title}" + (f" · {note}" if note else "") + " "
+    style = "bold cyan" if focused else "dim"
+    rule = Text("▌" if focused else "─", style=style)
+    rule.append(label, style=style)
+    rule.append("─" * max(3, width - 1 - len(label)), style=style)
+    rule.no_wrap = True
+    rule.truncate(max(1, width), overflow="ellipsis")
+    return rule
+
+
 def _section_rule(title: str, width: int) -> Text:
-    return Text("─ " + title + " " + "─" * max(3, width - len(title) - 3), style="dim")
+    return section_rule(title, width)
 
 
 ORDERED_TIMELINE_KINDS = [
@@ -739,6 +847,11 @@ ORDERED_TIMELINE_KINDS = [
     ("error", "error", "errors"),
     ("compact", "compaction", "compactions"),
 ]
+
+
+TIMELINE_DURATION_GAP = 4
+# Durations right-align in a fixed column ("59m59s"), so every row's text stops at the same place.
+TIMELINE_DURATION_COL = 6
 
 
 def _timeline_item_line(item: TurnItem, width: int) -> Text:
@@ -768,8 +881,9 @@ def _timeline_item_line(item: TurnItem, width: int) -> Text:
     if not text and not is_running and dur_len == 0:
         return Text(f"{clock_col}  {kind_col}")
 
-    min_gap = 1 if dur_len > 0 else 0
-    avail_width = width - dur_len - min_gap if dur_len > 0 else width
+    # Keep a clear gutter between the text and the duration column.
+    min_gap = TIMELINE_DURATION_GAP if dur_len > 0 else 0
+    avail_width = width - max(dur_len, TIMELINE_DURATION_COL) - min_gap if dur_len > 0 else width
     max_text_len = avail_width - prefix_len - running_len
 
     fitted_text = Text(text)
@@ -783,72 +897,206 @@ def _timeline_item_line(item: TurnItem, width: int) -> Text:
     if is_running:
         line.append(running_tag, style="yellow")
     if dur_len > 0:
-        pad_len = max(1, width - current_left_len - dur_len)
+        pad_len = max(min_gap, width - current_left_len - dur_len)
         line.append(" " * pad_len)
         line.append(dur_str)
     return line
 
 
-def _actions_lines(step: ModelStep, width: int = 80) -> list[Text]:
-    """Render 'What it did' section lines for an activity step."""
+def _wrap_plain(text: str, width: int) -> list[str]:
+    """Hard-wrap recorded text (newlines kept) into lines of at most ``width`` cells."""
+    width = max(1, width)
+    out: list[str] = []
+    for para in text.splitlines() or [""]:
+        out.extend(textwrap.wrap(para, width, break_long_words=True, break_on_hyphens=False) or [""])
+    return out
+
+
+TIMELINE_TEXT_LABELS = {
+    "run": "Command",
+    "edit": "Edit",
+    "tool": "Tool call",
+    "search": "Search",
+    "subagent": "Task",
+    "think": "Thinking",
+    "error": "Error",
+    "compact": "Compaction",
+}
+
+
+def _full_text_lines(text: str, truncated: bool) -> list[Text]:
+    """Recorded text in full, newlines kept; Rich wraps long lines to the page width."""
+    lines = [Text(line) for line in neutralize(text).rstrip().splitlines()] or [Text("")]
+    if truncated:
+        lines.append(Text("… recorded text was cut at the retention limit", style="dim"))
+    return lines
+
+
+def _timeline_item_detail(item: TurnItem, width: int) -> list[Text]:
+    clean = lambda value: neutralize(str(value), single_line=True)
+    header = f"{clean(item.kind)} · {clean(item.status)}"
+    if item.duration_seconds:
+        header += f" · {format_duration(item.duration_seconds)}"
+    if item.started_at:
+        span = clean(format_clock(item.started_at))
+        if item.completed_at:
+            span += f"–{clean(format_clock(item.completed_at))}"
+        header += f" · {span}"
+    lines = [Text(header, style="bold")]
+    lines.append(section_rule(TIMELINE_TEXT_LABELS.get(item.kind, "Recorded text"), width))
+    if item.text and item.kind != "think":
+        lines.extend(_full_text_lines(item.text, item.truncated))
+    else:
+        lines.append(Text("No text recorded for this action.", style="dim"))
+    return lines
+
+
+def _tool_detail_page(detail: ToolCallDetail | None, text: str, width: int) -> list[Text]:
+    if detail is None:  # the thinking summary line of a model step
+        return [Text("Thinking", style="bold"), section_rule("Recorded", width), Text(text)]
+    lines = [Text(neutralize(TOOL_VERBS.get(detail.name, detail.name), single_line=True), style="bold")]
+    recorded = [(key, label) for key, label in DETAIL_FIELD_LABELS if detail.fields.get(key)]
+    if not recorded:
+        lines.append(section_rule("Recorded", width))
+        lines.append(Text("details unavailable (no fields recorded)", style="dim"))
+    for key, label in recorded:
+        lines.append(section_rule(label, width))
+        lines.extend(_full_text_lines(detail.fields[key], key in detail.truncated))
+    lines.append(section_rule("Details", width))
+    lines.append(Text(f"Tool: {neutralize(detail.name, single_line=True)}", style="dim"))
+    return lines
+
+
+@dataclass
+class ActionsView:
+    """Selection state for the scrollable 'What it did' list.
+
+    Inputs: ``selected`` item index, ``scroll`` (first visible item), ``rows``
+    (line budget for items), ``focused``. After rendering, ``selected`` and
+    ``scroll`` are clamped, ``count`` is the item total, and ``selected_line``
+    / ``selected_height`` locate the selected item within the returned lines.
+    """
+
+    selected: int = 0
+    scroll: int = 0
+    rows: int = 10
+    focused: bool = True
+    count: int = 0
+    selected_line: int | None = None
+    selected_height: int = 0
+    range_label: str = ""
+
+
+def _action_items(step: ModelStep, width: int) -> tuple[str | None, list[tuple[Text, Any]]]:
+    """Counts summary plus (one-line row, full-detail page builder) per action item."""
     if step.timeline:
-        lines: list[Text] = []
         kind_counts: dict[str, int] = {}
         for item in step.timeline:
             kind_counts[item.kind] = kind_counts.get(item.kind, 0) + 1
-
         counts_parts: list[str] = []
         for kind, singular, plural in ORDERED_TIMELINE_KINDS:
             c = kind_counts.get(kind, 0)
             if c > 0:
-                label = singular if c == 1 else plural
-                counts_parts.append(f"{c} {label}")
-
-        for kind, c in kind_counts.items():
-            if kind not in {k for k, _, _ in ORDERED_TIMELINE_KINDS} and c > 0:
-                counts_parts.append(f"{c} {kind}")
-
-        if counts_parts:
-            lines.append(Text(neutralize(" · ".join(counts_parts), single_line=True)))
-
-        for item in step.timeline[:30]:
-            lines.append(_timeline_item_line(item, width))
-
-        if len(step.timeline) > 30:
-            more = len(step.timeline) - 30
-            lines.append(Text(f"+{more} more", style="dim"))
-
-        return lines
+                counts_parts.append(f"{c} {singular if c == 1 else plural}")
+        known = {k for k, _, _ in ORDERED_TIMELINE_KINDS}
+        counts_parts.extend(f"{c} {kind}" for kind, c in kind_counts.items() if kind not in known and c > 0)
+        items = [
+            (_timeline_item_line(item, width), (lambda w, it=item: _timeline_item_detail(it, w)))
+            for item in step.timeline
+        ]
+        return (" · ".join(counts_parts) or None), items
 
     if step.activity_kind == "model_step" and (step.tool_details or step.tool_calls or step.thinking_tokens > 0):
-        lines = []
         tool_names = [d.name for d in step.tool_details] if step.tool_details else list(step.tool_calls)
         counts: dict[str, int] = {}
         for name in tool_names:
             counts[name] = counts.get(name, 0) + 1
-
-        counts_parts = [f"{count} {TOOL_VERBS.get(name, name)}" for name, count in counts.items()]
-        if counts_parts:
-            lines.append(Text(neutralize(" · ".join(counts_parts), single_line=True)))
-
+        entries: list[tuple[ToolCallDetail | None, str]] = []
         if step.thinking_tokens > 0:
-            lines.append(Text(f"think  {step.thinking_tokens:,} thinking tokens"))
+            entries.append((None, f"think  {step.thinking_tokens:,} thinking tokens"))
+        details = step.tool_details or [ToolCallDetail(name=name) for name in step.tool_calls]
+        entries.extend((d, describe_tool(d)) for d in details)
 
-        if step.tool_details:
-            for detail in step.tool_details:
-                lines.append(Text(describe_tool(detail)))
-        else:
-            for name in step.tool_calls:
-                lines.append(Text(describe_tool(ToolCallDetail(name=name))))
+        def collapsed(t: str) -> Text:
+            line = Text(t)
+            line.truncate(width, overflow="ellipsis")
+            return line
 
-        return lines
+        items = [(collapsed(t), (lambda w, d=d, t=t: _tool_detail_page(d, t, w))) for d, t in entries]
+        summary = " · ".join(f"{count} {TOOL_VERBS.get(name, name)}" for name, count in counts.items())
+        return (summary or None), items
 
-    return [Text("No actions recorded for this turn.", style="dim")]
+    return None, []
+
+
+def build_action_detail_lines(step: ModelStep | None, index: int, width: int = 80) -> list[Text] | None:
+    """Full page for one 'What it did' item, or None when that item no longer exists."""
+    if step is None:
+        return None
+    _, items = _action_items(step, width)
+    if not 0 <= index < len(items):
+        return None
+    return items[index][1](width)
+
+
+def _actions_lines(step: ModelStep, width: int = 80, view: ActionsView | None = None) -> list[Text]:
+    """Render 'What it did' for an activity step: one truncated line per item.
+
+    With a view, only a window of ``view.rows`` items is shown, each row gets a
+    selection marker column, and the selected row is highlighted while the list
+    is focused. Selected and unselected rows truncate identically; the full
+    text lives on the action detail page.
+    """
+    if view is not None:
+        width = max(10, width - 2)  # room for the "▶ " marker column
+    summary, items = _action_items(step, width)
+    if not items:
+        if view is not None:
+            view.count = 0
+            view.selected_line = None
+        return [Text("No actions recorded for this turn.", style="dim")]
+
+    summary = neutralize(summary, single_line=True) if summary else ""
+    if view is None:
+        return ([Text(summary)] if summary else []) + [collapsed for collapsed, _ in items]
+
+    count = len(items)
+    view.count = count
+    sel = max(0, min(count - 1, view.selected))
+    view.selected = sel
+    rows = max(1, view.rows)
+    start = window_start(count, sel, view.scroll, rows)
+    view.scroll = start
+    shown = items[start : start + rows]
+    # Summary: at most two lines, so it never pushes the list off screen.
+    head = _wrap_plain(summary, width + 2) if summary else []
+    if len(head) > 2:
+        head = head[:2]
+        head[1] = head[1][: max(0, width + 1)] + "…"
+    lines = [Text(h) for h in head]
+    if count <= len(shown):
+        view.range_label = ""
+    elif len(shown) == 1:
+        view.range_label = f"{start + 1} of {count}"
+    else:
+        view.range_label = f"{start + 1}–{start + len(shown)} of {count}"
+    for offset, (collapsed, _) in enumerate(shown):
+        is_sel = start + offset == sel
+        highlighted = is_sel and view.focused
+        row = Text("▶ " if is_sel else "  ", style="bold" if highlighted else "bold cyan")
+        row.append_text(collapsed)
+        if highlighted:
+            row.stylize(SELECTED_ROW_STYLE)
+        if is_sel:
+            view.selected_line = len(lines)
+            view.selected_height = 1
+        lines.append(row)
+    return lines
 
 
 def build_activity_detail_lines(
     entry: ActivityEntry, node: ThreadTelemetryNode | None = None, *,
-    width: int = 80, prompt_expanded: bool = False,
+    width: int = 80, prompt_expanded: bool = False, actions_view: ActionsView | None = None,
 ) -> list[Text]:
     """Full detail for one activity entry; the unit of accounting is stated explicitly."""
     step = entry.detail
@@ -900,8 +1148,17 @@ def build_activity_detail_lines(
             context.append_text(Text.from_markup(render_context_bar(step.context_used_tokens, step.context_max_tokens, width=20)))
             lines.append(context)
     if step is not None:
+        rule_index = len(lines)
         lines.append(_section_rule("What it did", width))
-        lines.extend(_actions_lines(step, width))
+        actions_start = len(lines)
+        lines.extend(_actions_lines(step, width, actions_view))
+        if actions_view is not None:
+            lines[rule_index] = section_rule(
+                "What it did", width, note=actions_view.range_label,
+                focused=actions_view.focused and actions_view.count > 0,
+            )
+            if actions_view.selected_line is not None:
+                actions_view.selected_line += actions_start
         user_rec = next((r for r in step.context_texts if r.role == "user"), None) if step.context_texts else None
         if user_rec is not None and user_rec.text:
             prompt_lines = neutralize(user_rec.text).splitlines()

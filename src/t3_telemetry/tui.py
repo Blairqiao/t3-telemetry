@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from t3_telemetry.context_history import ContextHistoryStore
+from t3_telemetry.usage import PERIODS
 
 
 @dataclass
@@ -24,8 +25,32 @@ class ScreenState:
     detail_scroll: int = 0
     max_detail_scroll: int = 0
     detail_prompt_expanded: bool = False
+    # "What it did" list inside the detail: W/S moves the highlighted item while
+    # focus is "actions"; Tab switches to "page", where W/S scrolls the page.
+    detail_focus: str = "actions"
+    detail_item: int = 0
+    detail_item_scroll: int = 0
+    detail_item_count: int = 0
+    # Full-text page for the highlighted action (E/Enter opens, Esc closes).
+    action_open: bool = False
+    action_scroll: int = 0
+    max_action_scroll: int = 0
     # Launch entry ID -> child node ID, only for launches whose child is present.
     activity_targets: dict[str, str] = field(default_factory=dict)
+
+    def reset_detail(self) -> None:
+        self.detail_scroll = 0
+        self.detail_prompt_expanded = False
+        self.detail_focus = "actions"
+        self.detail_item = 0
+        self.detail_item_scroll = 0
+        self.detail_item_count = 0
+        self.close_action()
+
+    def close_action(self) -> None:
+        self.action_open = False
+        self.action_scroll = 0
+        self.max_action_scroll = 0
 
 
 @dataclass
@@ -36,6 +61,12 @@ class NavigationState:
     pinned_summary_id: str | None = None
     list_scroll: int = 0
     notice: str | None = None
+    home_focus: str = "threads"
+    selected_period: str = "today"
+    period: str | None = None
+    top_ids: list[str] = field(default_factory=list)
+    selected_top_id: str | None = None
+    top_scroll: int = 0
 
     @property
     def detail_id(self) -> str | None:
@@ -112,8 +143,7 @@ class NavigationState:
             screen.selected_activity_id = ids[min(old_index, len(ids) - 1)]
         if screen.detail_activity_id and screen.detail_activity_id not in ids:
             screen.detail_activity_id = None
-            screen.detail_scroll = 0
-            screen.detail_prompt_expanded = False
+            screen.reset_detail()
             self.notice = "Activity is no longer available"
 
     def sync_children(self, ids: list[str]) -> None:
@@ -127,11 +157,27 @@ class NavigationState:
         elif screen.selected_child_id not in screen.child_ids:
             screen.selected_child_id = screen.child_ids[0]
 
+    def sync_top(self, ids: list[str]) -> None:
+        prior = self.selected_top_id
+        old_index = self.top_ids.index(prior) if prior in self.top_ids else 0
+        self.top_ids = list(ids)
+        if prior in ids:
+            self.selected_top_id = prior
+        elif ids:
+            self.selected_top_id = ids[min(old_index, len(ids) - 1)]
+        else:
+            self.selected_top_id = None
+
     def move(self, delta: int) -> None:
         if self.stack:
             screen = self.stack[-1]
-            if screen.detail_activity_id:
-                screen.detail_scroll = max(0, min(screen.max_detail_scroll, screen.detail_scroll + delta))
+            if screen.detail_activity_id and screen.action_open:
+                screen.action_scroll = max(0, min(screen.max_action_scroll, screen.action_scroll + delta))
+            elif screen.detail_activity_id:
+                if screen.detail_focus == "actions" and screen.detail_item_count > 0:
+                    screen.detail_item = max(0, min(screen.detail_item_count - 1, screen.detail_item + delta))
+                else:
+                    screen.detail_scroll = max(0, min(screen.max_detail_scroll, screen.detail_scroll + delta))
             elif screen.focus == "activity":
                 if screen.activity_ids:
                     ids = screen.activity_ids
@@ -146,6 +192,13 @@ class NavigationState:
                     )
                     new_idx = max(0, min(len(screen.child_ids) - 1, curr_idx + delta))
                     screen.selected_child_id = screen.child_ids[new_idx]
+        elif self.period:
+            if self.top_ids:
+                i = self.top_ids.index(self.selected_top_id) if self.selected_top_id in self.top_ids else 0
+                self.selected_top_id = self.top_ids[max(0, min(len(self.top_ids) - 1, i + delta))]
+        elif self.home_focus == "usage":
+            i = PERIODS.index(self.selected_period)
+            self.selected_period = PERIODS[max(0, min(len(PERIODS) - 1, i + delta))]
         elif self.ids:
             i = self.ids.index(self.selected_id) if (self.selected_id and self.selected_id in self.ids) else 0
             self.selected_id = self.ids[max(0, min(len(self.ids) - 1, i + delta))]
@@ -154,6 +207,8 @@ class NavigationState:
         if self.stack:
             screen = self.stack[-1]
             if screen.detail_activity_id:
+                if screen.detail_item_count > 0 and not screen.action_open:
+                    screen.detail_focus = "page" if screen.detail_focus == "actions" else "actions"
                 return
             if screen.child_ids:
                 if screen.focus == "activity":
@@ -163,9 +218,19 @@ class NavigationState:
                 else:
                     screen.focus = "activity"
 
+        elif not self.period:
+            self.home_focus = "threads" if self.home_focus == "usage" else "usage"
+
     def enter(self) -> None:
         if not self.stack:
-            if self.selected_id:
+            if self.period:
+                if self.selected_top_id:
+                    self.stack = [ScreenState(node_id=self.selected_top_id)]
+            elif self.home_focus == "usage":
+                self.period = self.selected_period
+                self.selected_top_id = None
+                self.top_scroll = 0
+            elif self.selected_id:
                 self.stack = [ScreenState(node_id=self.selected_id)]
         else:
             screen = self.stack[-1]
@@ -174,6 +239,9 @@ class NavigationState:
                 target = screen.activity_targets.get(screen.detail_activity_id)
                 if target and target in screen.child_ids:
                     self.stack.append(ScreenState(node_id=target))
+                elif not screen.action_open and screen.detail_focus == "actions" and screen.detail_item_count > 0:
+                    screen.action_open = True
+                    screen.action_scroll = 0
                 return
             if screen.focus == "subagents":
                 target = screen.selected_child_id
@@ -183,35 +251,37 @@ class NavigationState:
                 target = screen.selected_activity_id
                 if target and target in screen.activity_ids:
                     screen.detail_activity_id = target
-                    screen.detail_scroll = 0
-                    screen.detail_prompt_expanded = False
+                    screen.reset_detail()
 
     def escape(self) -> None:
         if self.stack:
             screen = self.stack[-1]
-            if screen.detail_activity_id:
+            if screen.detail_activity_id and screen.action_open:
+                screen.close_action()  # back to the list, highlight unchanged
+            elif screen.detail_activity_id:
                 screen.detail_activity_id = None
-                screen.detail_scroll = 0
-                screen.detail_prompt_expanded = False
+                screen.reset_detail()
             else:
                 self.stack.pop()
+        elif self.period:
+            self.period = None
 
     def toggle_prompt(self) -> None:
         screen = self.current_screen
-        if screen is not None and screen.detail_activity_id and screen.detail_activity_id not in screen.activity_targets:
+        if screen is not None and screen.detail_activity_id and not screen.action_open and screen.detail_activity_id not in screen.activity_targets:
             screen.detail_prompt_expanded = not screen.detail_prompt_expanded
 
 
 def table_header_lines(rows: int) -> int:
-    """Interactive lists reserve a column header and its divider."""
-    return 2
+    """Interactive lists reserve one column-header line; the section rule above is counted separately."""
+    return 1
 
 
 def table_geometry(lines: int) -> tuple[int, int]:
-    """Split the budget into a header, divider, and visible data rows."""
+    """Split the budget into a column header and visible data rows."""
     if lines <= 0:
         return 0, 0
-    return min(2, lines), max(0, lines - 2)
+    return min(1, lines), max(0, lines - 1)
 
 
 def window_start(total: int, selected_index: int, offset: int, rows: int) -> int:

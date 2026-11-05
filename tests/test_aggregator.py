@@ -1833,3 +1833,25 @@ def test_provider_turn_step_context_used_and_max_tokens(tmp_path: Path):
     agy_dict = agy_step.to_dict()
     assert agy_dict["context_used_tokens"] is None
     assert agy_dict["context_max_tokens"] is None
+
+
+def test_snapshot_status_triggers_and_running_roots():
+    from types import SimpleNamespace
+    from t3_telemetry.aggregator import running_root_ids, snapshot_thread_status
+    from t3_telemetry.db_t3 import T3StateSnapshot
+
+    snapshot = T3StateSnapshot()
+    def thread(identifier, parent=None, deleted=None):
+        return SimpleNamespace(thread_id=identifier, parent_thread_id=parent, deleted_at=deleted,
+                               active_provider_thread_id=None)
+    snapshot.threads = {t.thread_id: t for t in [thread('provider'), thread('turn'), thread('link'),
+                        thread('deleted', deleted='yes'), thread('child', parent='provider')]}
+    snapshot.provider_turns_by_thread['turn'] = [SimpleNamespace(status='running', provider_thread_id='missing')]
+    snapshot.subagents_by_parent['link'] = [SimpleNamespace(status='running')]
+    snapshot.subagents_by_parent['deleted'] = [SimpleNamespace(status='running')]
+    snapshot.subagents_by_parent['child'] = [SimpleNamespace(status='running')]
+    snapshot.provider_threads['pt'] = SimpleNamespace(provider_thread_id='pt', status='running', thread_id='provider')
+    snapshot.threads['provider'].active_provider_thread_id = 'pt'
+    for identifier in ('provider', 'turn', 'link'):
+        assert snapshot_thread_status(snapshot, identifier) == 'running'
+    assert running_root_ids(snapshot) == ['provider', 'turn', 'link']

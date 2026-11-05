@@ -780,11 +780,12 @@ def test_graph_correction_repaints_with_unchanged_count_and_peak(monkeypatch):
     from t3_telemetry.models import ThreadTelemetryNode, ContextSample
     from types import SimpleNamespace
     from t3_telemetry import cli
+    monkeypatch.setattr(cli, "UsageCache", lambda: _EmptyUsageCache())
 
-    root = SimpleNamespace(thread_id="root", title="Root", model="model",
+    root = SimpleNamespace(active_provider_thread_id=None, thread_id="root", title="Root", model="model",
                            parent_thread_id=None, deleted_at=None,
                            updated_at="2026-11-03T10:00:00Z", created_at=None)
-    snapshot = SimpleNamespace(threads={"root": root},
+    snapshot = SimpleNamespace(provider_turns_by_thread={}, subagents_by_parent={}, provider_threads={}, threads={"root": root},
                                get_provider_thread=lambda _: None)
     monkeypatch.setattr(cli, "read_t3_state", lambda _: snapshot)
     builds = 0
@@ -821,12 +822,13 @@ def test_graph_correction_repaints_with_unchanged_count_and_peak(monkeypatch):
 def test_live_values_repaint_without_row_count_changes(monkeypatch, change):
     from types import SimpleNamespace
     from t3_telemetry import cli
+    monkeypatch.setattr(cli, "UsageCache", lambda: _EmptyUsageCache())
     from t3_telemetry.models import ThreadTelemetryNode, ModelStep, TurnMetrics, ToolCallDetail, RecordedText
 
-    root = SimpleNamespace(thread_id="root", title="Root", model="model",
+    root = SimpleNamespace(active_provider_thread_id=None, thread_id="root", title="Root", model="model",
                            parent_thread_id=None, deleted_at=None,
                            updated_at="2026-11-03T10:00:00Z", created_at=None)
-    snapshot = SimpleNamespace(threads={"root": root}, get_provider_thread=lambda _: None)
+    snapshot = SimpleNamespace(provider_turns_by_thread={}, subagents_by_parent={}, provider_threads={}, threads={"root": root}, get_provider_thread=lambda _: None)
     monkeypatch.setattr(cli, "read_t3_state", lambda _: snapshot)
     builds = 0
 
@@ -1007,6 +1009,7 @@ def test_activity_detail_opens_selected_entry_scrolls_and_escape_restores_overvi
     assert "Child 2" not in text
     assert screen.max_detail_scroll > 0 and screen.detail_scroll == 0
 
+    browser.handle_key("TAB")  # from the action list to page scrolling
     for _ in range(100):
         browser.handle_key("j")
     assert screen.detail_scroll == screen.max_detail_scroll
@@ -1093,10 +1096,11 @@ def test_running_turn_without_usage_is_not_shown_as_zero_tokens():
 def test_live_loop_activity_keys_do_not_read_data(monkeypatch):
     from types import SimpleNamespace
     from t3_telemetry import cli
+    monkeypatch.setattr(cli, "UsageCache", lambda: _EmptyUsageCache())
 
-    root = SimpleNamespace(thread_id="th", title="Parent", model="m", parent_thread_id=None,
+    root = SimpleNamespace(active_provider_thread_id=None, thread_id="th", title="Parent", model="m", parent_thread_id=None,
                            deleted_at=None, updated_at="2026-11-03T10:00:00Z", created_at=None)
-    snapshot = SimpleNamespace(threads={"th": root}, get_provider_thread=lambda _: None)
+    snapshot = SimpleNamespace(provider_turns_by_thread={}, subagents_by_parent={}, provider_threads={}, threads={"th": root}, get_provider_thread=lambda _: None)
     reads = 0
     builds = 0
 
@@ -1492,17 +1496,28 @@ def test_shift_tab_decodes_and_reverses_focus_without_leaving_overview():
         os.close(slave)
 
 
-def test_list_ranges_and_focus_are_in_column_headers():
+def test_list_ranges_and_focus_are_in_section_rules():
     node = _activity_node(n_children=12)
     nav = _open_overview(node)
     for focus in ("activity", "subagents"):
         nav.current_screen.focus = focus
         lines = _render_lines(node, nav, 24, 60)
         for label in ("Subagents", "Activity"):
-            headers = [line for line in lines if label in line and "of 12" in line]
-            assert len(headers) == 1
-            assert "Tokens" in headers[0] and "Time" in headers[0]
-            assert ("▌" in headers[0]) == (focus == label.lower())
+            rules = [i for i, line in enumerate(lines) if f" {label} · " in line and "of 12" in line]
+            assert len(rules) == 1
+            rule = lines[rules[0]]
+            assert "───" in rule
+            assert ("▌" in rule) == (focus == label.lower())
+            # Column names sit on the line directly under the rule.
+            assert "Tokens" in lines[rules[0] + 1] and "Time" in lines[rules[0] + 1]
+
+
+def test_every_overview_section_uses_the_standard_rule():
+    node = _activity_node(n_children=3)
+    nav = _open_overview(node)
+    text = "\n".join(_render_lines(node, nav, 40, 100))
+    for label in ("─ Usage ─", "─ Context ─", "─ Subagents · ", "▌ Activity · "):
+        assert label in text
 
 
 def test_subagent_table_shows_total_tokens_not_in_out():
@@ -1510,12 +1525,12 @@ def test_subagent_table_shows_total_tokens_not_in_out():
     nav = _open_overview(node)
     nav.current_screen.focus = "subagents"
     lines = _render_lines(node, nav, 30, 120)
-    header = next(line for line in lines if "Subagents" in line and "Model" in line)
+    header = next(line for line in lines if "Model" in line and "Steps" in line)
     assert "Tokens" in header
     assert " In " not in header and "Out" not in header
 
 
-def test_focus_switch_preserves_table_capacity_and_header_dividers():
+def test_focus_switch_preserves_table_capacity_and_section_rules():
     node = _activity_node(n_steps=40, n_children=40)
     nav = _open_overview(node)
     for height, width in ((24, 60), (30, 80), (40, 120), (55, 140)):
@@ -1525,15 +1540,17 @@ def test_focus_switch_preserves_table_capacity_and_header_dividers():
             lines = _render_lines(node, nav, height, width)
             headers = [i for i, line in enumerate(lines) if "of 40" in line]
             assert len(headers) == 2
-            ranges.append([" ".join(lines[i].replace("▌", " ").split()) for i in headers])
+            ranges.append([" ".join(lines[i].replace("▌", "─").split()) for i in headers])
             for i in headers:
-                assert "─" in lines[i + 1]
-        # Ignore leading spaces inserted by the focus marker.
+                assert "───" in lines[i] and "Time" in lines[i + 1]
+        # Ignore the focus marker, which replaces the rule's first dash.
         assert ranges[0] == ranges[1] == ranges[2]
 
 
 def test_w_s_move_selection_and_scroll_activity_details():
     node = _activity_node()
+    for step in node.steps:
+        step.tool_calls = [f"tool_{step.step_index}_{k}" for k in range(3)]
     nav = _open_overview(node)
     browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
     _render_lines(node, nav, 15, 60)
@@ -1546,10 +1563,22 @@ def test_w_s_move_selection_and_scroll_activity_details():
     _render_lines(node, nav, 15, 60)
     screen = nav.current_screen
     assert screen.max_detail_scroll > 0
+    # W/S first move the highlighted action in "What it did".
+    assert screen.detail_focus == "actions" and screen.detail_item_count > 1
+    page_scroll = screen.detail_scroll
     browser.handle_key("s")
-    assert screen.detail_scroll == 1
+    assert screen.detail_item == 1 and screen.detail_scroll == page_scroll
     browser.handle_key("w")
+    assert screen.detail_item == 0
+    # Tab hands W/S back to page scrolling.
+    browser.handle_key("TAB")
+    browser.handle_key("w")
+    _render_lines(node, nav, 15, 60)
+    browser.handle_key("w")
+    _render_lines(node, nav, 15, 60)
     assert screen.detail_scroll == 0
+    browser.handle_key("s")
+    assert screen.detail_scroll == 1 and screen.detail_item == 0
 
 
 def test_e_opens_selection_and_ordinary_detail_ignores_e():
@@ -1645,7 +1674,10 @@ def test_footer_line_shows_p_prompt_in_activity_detail_only():
 
     browser.handle_key("ENTER")
     lines = _render_lines(node, nav, 24, 80)
-    assert "W/S scroll  P prompt  Esc back  q quit" in lines[-1]
+    assert "W/S select  E/Enter full text  Tab page  P prompt" in lines[-1]
+    browser.handle_key("TAB")
+    lines = _render_lines(node, nav, 24, 80)
+    assert "W/S scroll  Tab actions  P prompt" in lines[-1]
 
 
 def test_detail_token_split_context_and_reply_filter():
@@ -1703,7 +1735,7 @@ def test_detail_view_claude_turn_with_mixed_timeline():
     assert "10:00:12  run       git status (running)" in text
 
 
-def test_detail_view_thirty_five_items_capped_at_thirty():
+def test_detail_view_lists_every_item_without_a_view():
     from t3_telemetry.models import ModelStep, TurnItem
     from t3_telemetry.ui import _actions_lines
 
@@ -1712,16 +1744,107 @@ def test_detail_view_thirty_five_items_capped_at_thirty():
         for i in range(35)
     ]
     step = ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt-1", timeline=items)
-    entry, text = _detail_text(step)
-
     lines = _actions_lines(step, width=80)
-    assert len(lines) == 32
+    assert len(lines) == 36
     assert "35 commands" in lines[0].plain
-    assert "+5 more" in lines[-1].plain
-    assert lines[-1].style == "dim"
-    assert "command_0" in text
-    assert "command_29" in text
-    assert "command_30" not in text
+    assert "command_34" in lines[-1].plain
+
+
+def _long_timeline_step():
+    from t3_telemetry.models import ModelStep, TurnItem
+
+    long_text = "pytest " + " ".join(f"tests/test_module_{i}.py" for i in range(30))
+    items = [
+        TurnItem(kind="run", text=(long_text if i == 20 else f"command_{i}"),
+                 started_at=f"2026-11-04T10:{i:02d}:00Z", duration_seconds=1.0)
+        for i in range(35)
+    ]
+    return ModelStep(step_index=1, activity_kind="provider_turn", provider_turn_id="pt-1", timeline=items), long_text
+
+
+def test_action_window_scrolls_and_truncates_selected_rows_like_the_rest():
+    from t3_telemetry.ui import ActionsView, SELECTED_ROW_STYLE, _actions_lines
+
+    step, _ = _long_timeline_step()
+    view = ActionsView(selected=0, rows=8)
+    lines = _actions_lines(step, width=60, view=view)
+    assert view.count == 35 and view.scroll == 0
+    assert view.range_label == "1–8 of 35"
+    assert len(lines) == 9  # summary + 8 rows
+    assert all(line.cell_len <= 60 for line in lines)
+
+    view = ActionsView(selected=25, scroll=0, rows=8)
+    lines = _actions_lines(step, width=60, view=view)
+    assert view.scroll == 18 and view.range_label == "19–26 of 35"
+    row20 = next(line for line in lines if "10:20:00" in line.plain)
+    assert row20.plain.rstrip().endswith("1.0s") and "…" in row20.plain
+    # A clear gutter separates the cut-off text from the duration column.
+    assert row20.plain.index("…") <= 60 - len("1.0s") - 4 - 1
+
+    # Selecting the long row keeps it on one identically truncated line, highlighted.
+    view = ActionsView(selected=20, scroll=18, rows=8)
+    selected = _actions_lines(step, width=60, view=view)
+    assert len(selected) == 9 and view.selected_height == 1
+    sel = selected[view.selected_line]
+    assert sel.plain.startswith("▶ ") and sel.plain[2:] == row20.plain[2:]
+    assert any(span.style == SELECTED_ROW_STYLE for span in sel.spans)
+
+    view = ActionsView(selected=20, scroll=18, rows=8, focused=False)
+    lines = _actions_lines(step, width=60, view=view)
+    assert not any(span.style == SELECTED_ROW_STYLE for line in lines for span in line.spans)
+
+
+def test_action_detail_page_shows_full_command_and_tool_fields():
+    from t3_telemetry.models import ModelStep, ToolCallDetail
+    from t3_telemetry.ui import build_action_detail_lines
+
+    step, long_text = _long_timeline_step()
+    lines = build_action_detail_lines(step, 20, width=60)
+    plain = "\n".join(line.plain for line in lines)
+    assert lines[0].plain.startswith("run · completed · 1.0s")
+    assert "─ Command ─" in plain and long_text in plain
+    assert build_action_detail_lines(step, 35, width=60) is None
+
+    tool_step = ModelStep(step_index=1, activity_kind="model_step", tool_calls=["run_command"], tool_details=[
+        ToolCallDetail(name="run_command", fields={"command": "cargo test --all", "cwd": "/repo"}, truncated=["command"]),
+    ])
+    plain = "\n".join(line.plain for line in build_action_detail_lines(tool_step, 0, width=60))
+    assert "─ Command ─" in plain and "cargo test --all" in plain
+    assert "─ Working dir ─" in plain and "/repo" in plain
+    assert "cut at the retention limit" in plain
+
+
+def test_enter_opens_action_page_and_escape_returns_to_the_same_row():
+    from t3_telemetry.models import ThreadTelemetryNode
+
+    step, long_text = _long_timeline_step()
+    node = ThreadTelemetryNode(thread_id="th", title="Parent", driver="claude", provider_instance_id="x",
+                               model="m", status="idle", steps=[step])
+    nav = _open_overview(node)
+    browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
+    _render_lines(node, nav, 24, 60)
+    browser.handle_key("ENTER")  # open the activity detail
+    _render_lines(node, nav, 24, 60)
+    screen = nav.current_screen
+    for _ in range(20):
+        browser.handle_key("s")
+    assert screen.detail_item == 20
+
+    browser.handle_key("ENTER")
+    assert screen.action_open
+    page = "\n".join(_render_lines(node, nav, 24, 60))
+    assert "Action detail · 21 of 35" in page and "tests/test_module_1.py" in page
+    assert "W/S scroll  Esc back" in page
+    for _ in range(50):
+        browser.handle_key("s")
+    assert screen.action_scroll == screen.max_action_scroll
+    assert screen.detail_item == 20  # scrolling the page never moves the selection
+
+    browser.handle_key("ESC")
+    assert not screen.action_open and screen.detail_activity_id is not None
+    assert screen.detail_item == 20
+    browser.handle_key("ESC")
+    assert screen.detail_activity_id is None
 
 
 def test_detail_view_antigravity_step_with_thinking_and_two_tools():
@@ -1813,3 +1936,143 @@ def test_detail_view_timeline_row_formatting_and_gotchas():
     assert len(empty_lines) == 1
     assert empty_lines[0].plain == "No actions recorded for this turn."
     assert empty_lines[0].style == "dim"
+
+
+def test_usage_navigation_round_trip():
+    nav = NavigationState()
+    nav.tab()
+    nav.move(1)
+    nav.enter()
+    assert nav.period == "week"
+    nav.sync_top(["first", "second"])
+    nav.move(1)
+    nav.enter()
+    assert nav.detail_id == "second"
+    nav.escape()
+    assert nav.period == "week"
+    assert nav.selected_top_id == "second"
+    nav.escape()
+    assert nav.period is None
+    assert nav.home_focus == "usage"
+    assert nav.selected_period == "week"
+
+
+def test_usage_navigation_clamps_and_tabs():
+    nav = NavigationState()
+    nav.tab()
+    nav.move(-10)
+    assert nav.selected_period == "today"
+    nav.move(10)
+    assert nav.selected_period == "month"
+    nav.tab()
+    assert nav.home_focus == "threads"
+    nav.tab()
+    nav.enter()
+    nav.tab()
+    assert nav.home_focus == "usage"
+    nav.enter()
+    assert not nav.stack
+    nav.sync_top(["a", "b"])
+    nav.move(-10)
+    assert nav.selected_top_id == "a"
+    nav.move(10)
+    assert nav.selected_top_id == "b"
+
+
+def test_sync_top_preserves_selection_and_nearest_index():
+    nav = NavigationState()
+    nav.sync_top(["a", "b", "c"])
+    nav.selected_top_id = "b"
+    nav.sync_top(["c", "a", "b"])
+    assert nav.selected_top_id == "b"
+    nav.sync_top(["c", "a"])
+    assert nav.selected_top_id == "a"
+    nav.sync_top([])
+    assert nav.selected_top_id is None
+    nav.sync_top(["x"])
+    assert nav.selected_top_id == "x"
+
+
+def test_reconcile_missing_period_thread_preserves_period():
+    nav = NavigationState(period="week")
+    nav.sync_top(["a"])
+    nav.enter()
+    nav.reconcile([])
+    assert not nav.stack
+    assert nav.period == "week"
+    assert nav.selected_top_id == "a"
+
+
+class _EmptyUsageCache:
+    def get(self, *args, **kwargs):
+        return None
+
+
+def test_period_live_flow_and_frame_size(monkeypatch):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from t3_telemetry import cli
+    from t3_telemetry.usage import build_usage_report, ThreadUsage, TokenBreakdown
+
+    now = datetime(2026, 11, 4, tzinfo=timezone.utc)
+    report = build_usage_report([], now)
+    for period in report.periods.values():
+        period.threads.append(ThreadUsage("th", "Parent", "idle", ["Codex"], TokenBreakdown(input_tokens=100)))
+    class FakeCache:
+        def get(self, *args, **kwargs):
+            return report
+    root = SimpleNamespace(active_provider_thread_id=None, thread_id="th", title="Parent", model="m", parent_thread_id=None, deleted_at=None, updated_at="", created_at=None)
+    snapshot = SimpleNamespace(provider_turns_by_thread={}, subagents_by_parent={}, provider_threads={}, threads={"th": root}, get_provider_thread=lambda _: None)
+    monkeypatch.setattr(cli, "read_t3_state", lambda _: snapshot)
+    monkeypatch.setattr(cli, "build_thread_telemetry", lambda *a, **kw: _activity_node())
+    capture = CaptureLive()
+    tick = iter(range(1000))
+    args = build_parser().parse_args(["--interval", "1000"])
+    assert run_live_loop(args, _adapter=ScriptedAdapter(["TAB", "DOWN", "ENTER", "ENTER", "ESC", "ESC"]), _clock=lambda: next(tick) / 1000, _max_iterations=5, _live_cls=lambda **kw: capture, _usage_cache=FakeCache()) == 0
+    def render(frame, width=80, height=24):
+        output = io.StringIO()
+        Console(file=output, width=width, height=height, force_terminal=True, color_system=None).print(frame)
+        return output.getvalue()
+    frames = [render(frame) for frame in capture.updates]
+    assert any("This week" in f and "Providers" in f and "Top threads" in f for f in frames)
+    assert any("This week ›" in f for f in frames)
+    assert "Top threads" in frames[-2] and "App Threads" in frames[-1]
+    for width, height in [(60, 24), (120, 40)]:
+        nav = NavigationState(period="month")
+        frame = cli._browser_frame([], None, None, nav, height, width, usage=report, now=now)
+        assert len(render(frame, width, height).splitlines()) == height
+
+@pytest.mark.parametrize("width,height", [(60, 24), (120, 40)])
+def test_home_sections_and_running_clock(width, height):
+    from datetime import datetime, timezone, timedelta
+    from types import SimpleNamespace
+    from t3_telemetry.models import ThreadTelemetryNode, ModelStep
+    from t3_telemetry.usage import build_usage_report
+    from t3_telemetry.ui import format_duration
+
+    now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+    summary = ThreadTelemetryNode(thread_id="root", title="Live chat", driver="codex", provider_instance_id="codex", model="m")
+    turn = ModelStep(step_index=1, status="running", started_at=(now - timedelta(seconds=134)).isoformat())
+    snapshot = SimpleNamespace(provider_turns_by_thread={"root": [turn]}, get_provider_thread=lambda _: None)
+    nav = NavigationState()
+    frame = _browser_frame([], None, summary, nav, height, width, snapshot=snapshot,
+                           usage=build_usage_report([], now), now=now, running_ids=["root", "a", "b"])
+    buf = io.StringIO()
+    Console(file=buf, width=width, height=height, force_terminal=True, color_system=None).print(frame)
+    output = buf.getvalue()
+    assert len(output.splitlines()) == height
+    for text in ("Live", "Usage", "Today", "This week", "This month", "Chats", "Turn running " + format_duration(134), "+2 other threads running"):
+        assert text in output
+
+
+def test_idle_home_does_not_repaint_on_unchanged_polls(monkeypatch):
+    from types import SimpleNamespace
+    from t3_telemetry import cli
+    snapshot = SimpleNamespace(threads={}, provider_turns_by_thread={}, subagents_by_parent={}, provider_threads={}, get_provider_thread=lambda _: None)
+    monkeypatch.setattr(cli, "read_t3_state", lambda _: snapshot)
+    capture = CaptureLive()
+    tick = iter(range(1000))
+    args = build_parser().parse_args(["--interval", "0.01"])
+    run_live_loop(args, _adapter=ScriptedAdapter([None, None, None]), _clock=lambda: next(tick) * 0.05,
+                  _max_iterations=3, _live_cls=lambda **kw: capture, _usage_cache=_EmptyUsageCache())
+    assert len(capture.updates) == 1

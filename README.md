@@ -87,20 +87,28 @@ t3-top --t3-dir /path/to/custom/userdata --once
 
 Live watch mode provides an interactive terminal browser with full keyboard navigation across root application threads and subagent trees:
 
-- Up / Down, k / j, or W / S: Move selection in the thread list, select activity entries on overviews or scroll an open activity detail, or change subagent selection when the subagent pane is focused.
-- Tab / Shift+Tab: Move focus forward / backward between Activity and Subagents selection on detail screens.
-- E or Enter: Open the detail screen for the selected app thread, open the focused activity detail, or drill down into a highlighted child subagent. In a launch detail, E or Enter opens the linked child when available. E or Enter in an ordinary activity detail does nothing.
-- Escape: Return one level, restoring focus, selection, and scroll position. A child opened from a launch returns to that launch detail first.
+- Up / Down, k / j, or W / S: Move selection in the home Chats list or Usage periods, select top threads on a period screen, select activity entries on overviews or scroll an open activity detail, or change subagent selection when the subagent pane is focused.
+- Tab / Shift+Tab: Move focus between Usage and Chats sections on the home screen, between Activity and Subagents selection on detail screens, or between the actions list and page on action details.
+- E or Enter: Open the detail screen for the selected app thread, open the period screen for a selected usage period, open a top thread from a period screen, drill down into a highlighted child subagent, or open the focused activity detail. In a launch detail, E or Enter opens the linked child when available. E or Enter in an ordinary activity detail does nothing.
+- Escape: Return one level, restoring focus, selection, and scroll position. From a period screen, Escape returns home with the period selection preserved. A child opened from a launch returns to that launch detail first.
 - q or Ctrl-C: Exit t3-top cleanly and restore the terminal to canonical cooked mode.
 
 #### Screens and breadcrumbs
 
-The browser supports hierarchical navigation across two primary view levels:
+The browser supports hierarchical navigation across primary view levels:
 
-1. Thread list screen: Displays root application threads ordered by most recent update, with model labels and status-colored titles.
-2. Detail screen: Displays the summary header, three-scope token metrics, context occupancy graph, immediate subagents table, and recent activity stream for the active thread.
+1. Home screen: Combines real-time workspace activity, aggregated token usage, and recent chats:
+   - Live card: Displays the active root thread's status (`RUNNING`, `IDLE`, etc.), title, model, driver, and context window gauge bar. Also displays the turn clock ("Turn running <duration>" for an active turn or "Last turn HH:MM"), today's token total for that thread, latest recorded activity description (`Act: ...`), active subagent count with titles, and the count of other concurrently running threads. When no threads are active, reports "No active app threads".
+   - Usage section: Displays token consumption across local calendar periods: Today, This week (starting Monday), and This month, along with each period's date range. Totals sum input + cache read + cache creation + output tokens across all threads. The usage report is cached and refreshes at most every 5 seconds. Pressing Tab toggles focus between the Usage and Chats sections; Up / Down selects a period, and Enter opens the period screen.
+   - Chats section: Displays root application threads ordered by most recent update, with model labels and status-colored titles.
+2. Period screen: Detailed breakdown for a selected calendar period (Today, This week, or This month):
+   - Usage over time: Stacked bar chart broken into hourly buckets (Today) or daily buckets (This week and This month; merged when terminal width requires). Bars stack provider tokens with distinct glyphs and colors: Claude (`█`, dark orange), Codex (`▓`, green), Antigravity (`▒`, medium purple), and Other (`░`, grey). A legend displays each provider's glyph, color, and total tokens. Future time buckets display `·`.
+   - Providers table: Lists token breakdown by provider family with Input, Cache read, Cache write (cache creation), Output, and Total.
+   - Top threads: Root threads ranked by in-period token usage, with descendant subagents rolled into the root app thread. Displays the root thread title, active provider families, and total tokens.
+   - Navigation: Up / Down selects a thread; Enter opens the thread's detail screen with a breadcrumb starting with the period name (for example, `This week › Root Thread`). Pressing Escape returns to the period screen with the top thread selection preserved; pressing Escape again returns home with the period row still selected.
+3. Detail screen: Displays the summary header, three-scope token metrics, context occupancy graph, immediate subagents table, and recent activity stream for the active thread.
 
-When drilling down into child or native subagents, a breadcrumb header (for example, `Root Thread > Child Subagent > Grandchild`) indicates the active lineage depth. Pressing Escape ascends the stack one level at a time, preserving previous cursor selections and scroll positions.
+When drilling down into child or native subagents, a breadcrumb header (for example, `Root Thread > Child Subagent > Grandchild` or `This week › Root Thread › Child Subagent`) indicates the active lineage depth. Pressing Escape ascends the stack one level at a time, preserving previous cursor selections and scroll positions.
 
 #### Summary follow and selection pinning
 

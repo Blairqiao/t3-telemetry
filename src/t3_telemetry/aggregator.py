@@ -20,6 +20,24 @@ from t3_telemetry.models import (
 )
 
 
+def snapshot_thread_status(snapshot: T3StateSnapshot, thread_id: str) -> str:
+    """Resolve status using only the already loaded snapshot."""
+    app_thread = snapshot.threads.get(thread_id)
+    pt = snapshot.get_provider_thread(thread_id)
+    turns = snapshot.provider_turns_by_thread.get(thread_id, [])
+    active_id = (app_thread.active_provider_thread_id if app_thread else None) or (pt.provider_thread_id if pt else None) or (turns[-1].provider_thread_id if turns else None)
+    if active_id and (not pt or pt.provider_thread_id != active_id):
+        pt = snapshot.provider_threads.get(active_id) or pt
+    base_status = pt.status if pt else "idle"
+    if base_status == "running" or any(t.status == "running" for t in turns) or any(s.status == "running" for s in snapshot.subagents_by_parent.get(thread_id, [])):
+        return "running"
+    return base_status if base_status in ("idle", "completed", "failed", "cancelled") else "completed"
+
+
+def running_root_ids(snapshot: T3StateSnapshot) -> list[str]:
+    return [t.thread_id for t in snapshot.threads.values() if t.parent_thread_id is None and t.deleted_at is None and snapshot_thread_status(snapshot, t.thread_id) == "running"]
+
+
 def parse_iso_timestamp(ts: str | None) -> float | None:
     """Parse ISO-8601 timestamp string into epoch float timestamp, or None."""
     if not ts:
@@ -357,20 +375,12 @@ def build_thread_telemetry(
         if not provider_instance_id:
             provider_instance_id = pt.provider_instance_id
         native_id = pt.native_id
-        base_status = pt.status
     else:
         native_id = None
-        base_status = "idle"
 
     subagent_links = snapshot.subagents_by_parent.get(thread_id, [])
 
-    # Determine status
-    is_running = (
-        base_status == "running"
-        or any(t.status == "running" for t in turns)
-        or any(s.status == "running" for s in subagent_links)
-    )
-    status = "running" if is_running else (base_status if base_status in ("idle", "completed", "failed", "cancelled") else "completed")
+    status = snapshot_thread_status(snapshot, thread_id)
 
     # Step extraction
     steps: list[ModelStep] = []
