@@ -1651,3 +1651,9 @@ def test_usage_graph_helpers_and_rendering():
         assert len(rendered) == 7
         assert all(len(line) <= 60 for line in rendered)
         assert "·" in rendered[-2]
+
+    # At 80 columns the month gets 1-cell bars; day labels must stay separated.
+    window = period_window("month", now)
+    period = PeriodUsage(window, TokenBreakdown(), {}, [{} for _ in window.bucket_starts], [])
+    x_labels = usage_graph_lines(period, 80, 4, now)[-1].plain.split()
+    assert all(label.isdigit() and int(label) <= 31 for label in x_labels)

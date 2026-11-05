@@ -893,7 +893,9 @@ def _period_body(usage, nav, inner_height, inner_width, now) -> list:
     show_header = 1 + 1 + len(graph) + 1 + 1 + max(1, len(providers)) + 2 <= inner_height
     provider_rows = max(1, min(max(1, len(providers)), inner_height - (1 + 1 + len(graph) + 1 + int(show_header) + 2)))
     table = Table(box=None, expand=True, padding=(0, 1), show_header=show_header, pad_edge=False, show_edge=False, header_style="dim")
-    for col in ("Provider", "Input", "Cache read", "Cache write", "Output", "Total"):
+    # Short headers below 70 columns so token values are never cut off.
+    columns = ("Provider", "Input", "Cache read", "Cache write", "Output", "Total") if inner_width >= 70 else ("Provider", "In", "Cache R", "Cache W", "Out", "Total")
+    for col in columns:
         table.add_column(col, justify="left" if col == "Provider" else "right", no_wrap=True, overflow="ellipsis")
     for name, tokens in providers[:provider_rows]:
         table.add_row(name, *(format_tokens(v) for v in (tokens.input_tokens, tokens.cache_read_tokens, tokens.cache_creation_tokens, tokens.output_tokens, tokens.total)))

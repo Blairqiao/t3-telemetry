@@ -2042,6 +2042,13 @@ def test_period_live_flow_and_frame_size(monkeypatch):
         frame = cli._browser_frame([], None, None, nav, height, width, usage=report, now=now)
         assert len(render(frame, width, height).splitlines()) == height
 
+    # At the 60-column minimum, the widest provider row keeps every token value intact.
+    big = TokenBreakdown(input_tokens=8_980_000, cache_read_tokens=217_530_000, cache_creation_tokens=2_670_000, output_tokens=1_910_000)
+    report.periods["month"].by_provider = {"Antigravity": big}
+    frame = cli._browser_frame([], None, None, NavigationState(period="month"), 24, 60, usage=report, now=now)
+    row = next(line for line in render(frame, 60, 24).splitlines() if "Antigravity" in line and "217.53M" in line)
+    assert "…" not in row and "231.09M" in row
+
 @pytest.mark.parametrize("width,height", [(60, 24), (120, 40)])
 def test_home_sections_and_running_clock(width, height):
     from datetime import datetime, timezone, timedelta

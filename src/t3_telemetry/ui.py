@@ -376,7 +376,8 @@ def usage_graph_lines(period: PeriodUsage, width: int, plot_rows: int, now: date
             label = start.strftime("%a")
         else:
             label = str(start.day)
-        if label and offset >= labels_line.cell_len and offset + len(label) <= width:
+        # Leave at least one space after the previous label so numbers never run together.
+        if label and offset >= labels_line.cell_len + (labels_line.cell_len > 6) and offset + len(label) <= width:
             labels_line.append(" " * (offset - labels_line.cell_len) + label)
     lines.append(labels_line)
     return lines
