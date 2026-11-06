@@ -60,3 +60,57 @@ def test_codex_recorded_limit_and_missing_session(tmp_path):
     assert node.context_samples[0].limit == 12345
     snapshot.provider_threads_by_thread["thread"].append(ProviderThreadRecord("other", "thread", "codex", "", "missing", "idle"))
     assert build_thread_node("thread", snapshot, store).store_state == "syncing"
+
+
+def test_bound_claude_child_rollup_and_no_duplicate_native(tmp_path):
+    from t3_telemetry.models import SubagentLinkRecord
+
+    store, key, snapshot = setup_thread(tmp_path)
+    child_key = "claude:native/agent-x"
+    store.upsert_sessions([SessionRecord(child_key, "claude", "native/agent-x", parent_session_key=key)])
+    store.replace_t3_graph([], [
+        {"session_key": key, "thread_id": "thread", "provider_thread_id": "pt"},
+        {"session_key": child_key, "thread_id": "child", "provider_thread_id": "cpt"},
+    ])
+    store.upsert_steps([StepRecord(key, "p", "2025-01-01T00:00:02Z", input_tokens=5),
+                        StepRecord(child_key, "c", "2025-01-01T00:00:01Z", output_tokens=7)])
+    snapshot.subagents_by_parent["thread"] = [SubagentLinkRecord(
+        "link", "thread", "child", "claude", None, "child-model", "Child title", "running",
+        duration_seconds=3)]
+    node = build_thread_node("thread", snapshot, store)
+    assert len(node.subagents) == 1
+    child = node.subagents[0]
+    assert (child.thread_id, child.title, child.model, child.status) == ("child", "Child title", "child-model", "running")
+    assert child.self_metrics.total_tokens == 7
+    assert child.rollup_metrics.duration_seconds == 3
+    assert node.rollup_metrics.total_tokens == 12
+    assert (node.rollup_metrics.total_subagents, node.rollup_metrics.active_subagents) == (1, 1)
+    assert [step.total_tokens for step in node.combined_steps] == [7, 5]
+    assert node.launches[0].child_present
+
+
+def test_unbound_native_child_and_launch(tmp_path):
+    store, key, snapshot = setup_thread(tmp_path, "antigravity")
+    child_key = "antigravity:B"
+    store.upsert_sessions([SessionRecord(child_key, "antigravity", "B", parent_session_key=key,
+                                         title="Native work", model="gemini", first_ts="2025-01-01T00:00:01Z")])
+    store.upsert_steps([StepRecord(child_key, "c", "2025-01-01T00:00:01Z", input_tokens=13)])
+    node = build_thread_node("thread", snapshot, store)
+    child = node.subagents[0]
+    assert (child.thread_id, child.title, child.provider, child.model) == ("B", "Native work", "antigravity", "gemini")
+    assert child.self_metrics.total_tokens == node.rollup_metrics.total_tokens == 13
+    launch = node.launches[0]
+    assert (launch.launch_id, launch.child_thread_id, launch.child_native_id, launch.child_present) == ("native:B", "B", "B", True)
+    assert (launch.launched_at, launch.launch_time_source, launch.sources) == ("2025-01-01T00:00:01Z", "child session start", ["C"])
+
+
+def test_thread_cycle_is_guarded(tmp_path):
+    from t3_telemetry.models import SubagentLinkRecord
+
+    store, _, snapshot = setup_thread(tmp_path)
+    snapshot.subagents_by_parent["thread"] = [SubagentLinkRecord("a", "thread", "child", "claude", None, None, "", "completed")]
+    snapshot.subagents_by_parent["child"] = [SubagentLinkRecord("b", "child", "thread", "claude", None, None, "", "completed")]
+    node = build_thread_node("thread", snapshot, store)
+    assert [child.thread_id for child in node.subagents] == ["child"]
+    assert node.subagents[0].subagents == []
+    assert node.rollup_metrics.total_subagents == 1
