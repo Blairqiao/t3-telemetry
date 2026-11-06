@@ -1931,3 +1931,30 @@ def test_syncing_scope_and_activity_placeholders():
     node.rollup_metrics.total_subagents = 0
     assert all("syncing…" in line.plain for line in build_scopes_summary(node))
     assert activity_tokens_cell(MagicMock(), syncing=True) == "syncing…"
+
+
+def test_provider_model_table_rows_and_widths():
+    from rich.console import Console
+    from t3_telemetry.ui import build_provider_model_table, provider_model_row_count
+    from t3_telemetry.usage import UsageStats
+
+    stats = UsageStats()
+    stats.add('claude-opus-5-5', None, 100, 200, 20, 50, False, family='Claude')
+    stats.add('claude-sonnet-5', None, 10, 20, 0, 5, False, family='Claude')
+    stats.add('unknown-model', None, 10, 0, 0, 0, False, family='Codex')
+    for width in (60, 80, 120):
+        table = build_provider_model_table(stats, 'tokens', width, max_rows=4)
+        console = Console(width=width, record=True)
+        console.print(table)
+        output = console.export_text()
+        assert output.index('Claude') < output.index('└ claude-opus') < output.index('└ claude-sonnet') < output.index('Codex')
+        assert table.row_count == provider_model_row_count(stats, 4) == 4
+        assert len(output.splitlines()) == 5
+    table = build_provider_model_table(stats, 'usd', 120, max_rows=2)
+    console = Console(width=120, record=True)
+    console.print(table)
+    output = console.export_text()
+    assert 'Claude · 2 models' in output
+    assert '$' in output and 'unpriced' in output
+    assert table.row_count == provider_model_row_count(stats, 2) == 2
+    assert provider_model_row_count(UsageStats(), 2) == 1

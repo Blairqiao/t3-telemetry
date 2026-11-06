@@ -18,9 +18,9 @@ from rich.text import Text
 from t3_telemetry.activity import DETAIL_FIELD_LABELS, TOOL_VERBS, ActivityEntry, build_activity_entries, describe_tool, neutralize
 from t3_telemetry.insights import Kpi, _usd as format_usd, headline, kind_values, kpis, share_label
 from t3_telemetry.models import ModelStep, ThreadTelemetryNode, ToolCallDetail, TurnItem
-from t3_telemetry.prices import KINDS
+from t3_telemetry.prices import KINDS, CostBreakdown
 from t3_telemetry.tui import window_start
-from t3_telemetry.usage import PROVIDER_ORDER, SCOPE_ORDER, PeriodUsage, UsageStats, node_cost, step_usd, turn_cost
+from t3_telemetry.usage import PROVIDER_ORDER, SCOPE_ORDER, ModelUsage, PeriodUsage, TokenBreakdown, UsageStats, cache_hit_pct, node_cost, step_usd, turn_cost
 
 
 # Focused selection: bright text on a solid background; the ▶ marker carries it without color.
@@ -359,6 +359,67 @@ def allocate_cells(values: dict[str, float], width: int, order: Sequence[str]) -
                 cells[donor] -= 1
                 cells[key] += 1
     return cells
+
+
+
+def _kind_values_of(tokens: TokenBreakdown, cost: CostBreakdown, measure: str) -> dict[str, float]:
+    if measure == "usd":
+        return {kind: getattr(cost, kind) for kind in KINDS}
+    return {"cache_read": tokens.cache_read_tokens, "cache_write": tokens.cache_creation_tokens,
+            "input": tokens.input_tokens, "output": tokens.output_tokens}
+
+
+def _provider_model_rows(stats: UsageStats, max_rows: int) -> list[tuple[str, str, ModelUsage | None]]:
+    providers = [p for p in PROVIDER_ORDER if p in stats.provider_tokens and stats.provider_tokens[p].total > 0]
+    if not providers:
+        return [("No usage recorded", "dim", None)]
+    if max_rows <= 0:
+        return []
+    if len(providers) > max_rows:
+        visible = providers[:max_rows - 1]
+        return [(p, f"bold {PROVIDER_STYLES[p]}", ModelUsage(stats.provider_tokens[p], stats.provider_cost.get(p, CostBreakdown()))) for p in visible] + [(f"+{len(providers) - len(visible)} more providers", "dim", None)]
+    remaining = max_rows - len(providers)
+    rows = []
+    for p in providers:
+        models = stats.provider_models.get(p, {})
+        usage = ModelUsage(stats.provider_tokens[p], stats.provider_cost.get(p, CostBreakdown()))
+        style = f"bold {PROVIDER_STYLES[p]}"
+        if len(models) == 1:
+            rows.append((f"{p} · {next(iter(models))}", style, usage))
+        elif len(models) >= 2 and len(models) <= remaining:
+            rows.append((p, style, usage))
+            rows.extend((f"  └ {name}", "dim", model) for name, model in sorted(models.items(), key=lambda item: item[1].tokens.total, reverse=True))
+            remaining -= len(models)
+        else:
+            rows.append((f"{p} · {len(models)} models" if models else p, style, usage))
+    return rows
+
+
+def provider_model_row_count(stats: UsageStats, max_rows: int) -> int:
+    return len(_provider_model_rows(stats, max_rows))
+
+
+def build_provider_model_table(stats: UsageStats, measure: str, width: int, *, max_rows: int, show_header: bool = True) -> Table:
+    table = Table(box=None, expand=True, padding=(0, 1), pad_edge=False, show_edge=False, header_style="dim", show_header=show_header)
+    columns = (["Name", "Mix", "Cache hit", "Cache write", "Uncached", "Output", "Total", "Hit %"] if width >= 100 else
+               ["Name", "Mix", "Cache hit", "Uncached", "Output", "Total"] if width >= 70 else
+               ["Name", "Mix", "Total", "Hit %"])
+    for column in columns:
+        table.add_column(column, no_wrap=True, overflow="ellipsis", justify="left" if column in ("Name", "Mix") else "right", ratio=1 if column == "Name" else None)
+    for label, style, usage in _provider_model_rows(stats, max_rows):
+        if usage is None:
+            table.add_row(Text(label, style=style))
+            continue
+        values = _kind_values_of(usage.tokens, usage.cost, measure)
+        fmt = format_usd if measure == "usd" else format_tokens
+        total = "unpriced" if measure == "usd" and usage.cost.total <= 0 and usage.cost.unpriced_tokens else fmt(usage.cost.total if measure == "usd" else usage.tokens.total)
+        hit = cache_hit_pct(usage.tokens)
+        cells = {"Name": Text(label, style=style), "Mix": kind_bar_line(values, 10 if width >= 100 else 6),
+                 "Cache hit": fmt(values["cache_read"]), "Cache write": fmt(values["cache_write"]),
+                 "Uncached": fmt(values["input"]), "Output": fmt(values["output"]), "Total": total,
+                 "Hit %": f"{hit:.0f}%" if hit is not None else "—"}
+        table.add_row(*(cells[column] for column in columns))
+    return table
 
 
 def kind_bar_line(values: dict[str, float], width: int) -> Text:
