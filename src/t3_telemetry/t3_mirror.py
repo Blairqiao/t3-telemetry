@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
@@ -47,6 +48,7 @@ def mirror_t3_graph(store: TelemetryStore, snapshot: T3StateSnapshot) -> None:
             "provider_thread_id": pt.provider_thread_id,
         })
 
+    session_keys = set(store.sessions_by_key())
     for parent_thread_id, links in snapshot.subagents_by_parent.items():
         for link in links:
             if (
@@ -59,9 +61,25 @@ def mirror_t3_graph(store: TelemetryStore, snapshot: T3StateSnapshot) -> None:
             if "task:" not in unquoted_id:
                 continue
             agent_id = unquoted_id.rsplit("task:", 1)[1]
-            parent_pt = snapshot.get_provider_thread(parent_thread_id)
-            if parent_pt is None or not parent_pt.native_id or parent_pt.native_id.startswith("pending:"):
+            candidates = [
+                pt for pt in snapshot.provider_threads.values()
+                if pt.thread_id == parent_thread_id
+                and provider_key(pt.driver, pt.provider_instance_id) == "claude"
+                and pt.native_id and not pt.native_id.startswith("pending:")
+            ]
+            # Native child IDs can encode their provider thread ID. Prefer that
+            # direct reference over an inference from the available sessions.
+            child_id = unquote(link.child_thread_id)
+            referenced = [pt for pt in candidates if re.search(r"(?:^|:)" + re.escape(pt.provider_thread_id) + r"(?:$|:)", child_id)]
+            matching = referenced or [
+                pt for pt in candidates
+                if f"claude:{pt.native_id}/agent-{agent_id}" in session_keys
+            ]
+            if not matching and len(candidates) == 1:
+                matching = candidates
+            if len(matching) != 1:
                 continue
+            parent_pt = matching[0]
             bindings.append({
                 "session_key": f"claude:{parent_pt.native_id}/agent-{agent_id}",
                 "thread_id": link.child_thread_id,

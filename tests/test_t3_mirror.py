@@ -2,7 +2,7 @@ from pathlib import Path
 
 from t3_telemetry.db_t3 import T3StateSnapshot
 from t3_telemetry.models import AppThreadRecord, ProviderThreadRecord, SubagentLinkRecord
-from t3_telemetry.store import TelemetryStore
+from t3_telemetry.store import SessionRecord, TelemetryStore
 from t3_telemetry.t3_mirror import mirror_t3_graph
 
 
@@ -412,4 +412,43 @@ def test_mirror_native_claude_subagent_skipped_conditions(tmp_path: Path):
 
     bindings = store.bindings()
     assert bindings == {"claude:P_valid": "parent-valid"}
+    store.close()
+
+
+def test_native_claude_child_after_parent_switches_to_codex(tmp_path: Path):
+    snap = T3StateSnapshot()
+    snap.threads["parent"] = _make_app_thread("parent", default_provider="codex")
+    snap.threads["parent"].active_provider_thread_id = "pt-codex"
+    for pt in (
+        _make_provider_thread("pt-codex", "parent", "codex", "codex_inst", "X"),
+        _make_provider_thread("pt-old", "parent", "claudeAgent", "claude_inst", "P-old"),
+        _make_provider_thread("pt-other", "parent", "claudeAgent", "claude_inst", "P-other"),
+    ):
+        snap.provider_threads[pt.provider_thread_id] = pt
+        snap.provider_threads_by_thread.setdefault("parent", []).append(pt)
+    snap.subagents_by_parent["parent"] = [
+        SubagentLinkRecord(
+            subagent_id="node:provider:claudeAgent:native-item:task%3Aabc",
+            parent_thread_id="parent", child_thread_id="child", driver="claudeAgent",
+            provider_instance_id="claude_inst", model=None, title="Child",
+            status="completed", origin="provider_native",
+        ),
+        SubagentLinkRecord(
+            subagent_id="node:provider:claudeAgent:native-item:task%3Adef",
+            parent_thread_id="parent", child_thread_id="node:pt-old:child", driver="claudeAgent",
+            provider_instance_id="claude_inst", model=None, title="Child with reference",
+            status="completed", origin="provider_native",
+        ),
+    ]
+    store = TelemetryStore(tmp_path / "store.db")
+    store.upsert_sessions([
+        SessionRecord(session_key="claude:P-old/agent-abc", provider="claude", native_id="P-old/agent-abc"),
+        SessionRecord(session_key="claude:P-other/agent-def", provider="claude", native_id="P-other/agent-def"),
+    ])
+    mirror_t3_graph(store, snap)
+    bindings = store.bindings()
+    assert bindings["claude:P-old/agent-abc"] == "child"
+    assert bindings["claude:P-old/agent-def"] == "node:pt-old:child"
+    assert "claude:X/agent-abc" not in bindings
+    assert "claude:P-other/agent-def" not in bindings
     store.close()
