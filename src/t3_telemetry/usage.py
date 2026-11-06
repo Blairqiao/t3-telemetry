@@ -47,6 +47,20 @@ class TokenBreakdown:
 
 
 @dataclass(slots=True)
+class ModelUsage:
+    tokens: TokenBreakdown = field(default_factory=TokenBreakdown)
+    cost: CostBreakdown = field(default_factory=CostBreakdown)
+    steps: int = 0
+    thinking_tokens: int = 0  # already included in tokens.output_tokens
+
+
+def cache_hit_pct(tokens: TokenBreakdown) -> float | None:
+    """cache_read / (input + cache_read + cache_creation) * 100; None when that prompt total is 0."""
+    total = tokens.input_tokens + tokens.cache_read_tokens + tokens.cache_creation_tokens
+    return tokens.cache_read_tokens / total * 100 if total else None
+
+
+@dataclass(slots=True)
 class UsageStats:
     tokens: TokenBreakdown = field(default_factory=TokenBreakdown)
     cost: CostBreakdown = field(default_factory=CostBreakdown)
@@ -58,9 +72,13 @@ class UsageStats:
     model_cost: dict[str, float] = field(default_factory=dict)
     steps: int = 0
     large_context_steps: int = 0
+    thinking_tokens: int = 0
+    provider_thinking: dict[str, int] = field(default_factory=dict)
+    # family label ("Claude", "Codex", "Antigravity", "Other") -> model name -> usage
+    provider_models: dict[str, dict[str, ModelUsage]] = field(default_factory=dict)
 
     def add(self, model: str | None, when: datetime | None, input: int, cache_read: int,
-            cache_write: int, output: int, subagent: bool, *, family: str = "Other") -> None:
+            cache_write: int, output: int, subagent: bool, *, family: str = "Other", thinking: int = 0) -> None:
         self.tokens.add_counts(input, cache_read, cache_write, output)
         c = step_cost(model, when, input, cache_read, cache_write, output)
         self.cost.add(c)
@@ -72,6 +90,13 @@ class UsageStats:
         name = model_key(model) or (model if model and not model.startswith("<") else "unknown")
         self.model_tokens[name] = self.model_tokens.get(name, 0) + input + cache_read + cache_write + output
         self.model_cost[name] = self.model_cost.get(name, 0.0) + c.total
+        self.thinking_tokens += thinking
+        self.provider_thinking[family] = self.provider_thinking.get(family, 0) + thinking
+        mu = self.provider_models.setdefault(family, {}).setdefault(name, ModelUsage())
+        mu.tokens.add_counts(input, cache_read, cache_write, output)
+        mu.cost.add(c)
+        mu.steps += 1
+        mu.thinking_tokens += thinking
         self.steps += 1
         if input + cache_read + cache_write > LARGE_CONTEXT_TOKENS:
             self.large_context_steps += 1
@@ -95,7 +120,8 @@ def stats_for_node(node: ThreadTelemetryNode) -> UsageStats:
                 started_at = None
             stats.add(step.model or n.model, started_at, step.input_tokens, step.cache_read_tokens,
                       step.cache_creation_tokens, step.output_tokens, subagent=n is not node,
-                      family=family_label(step.provider or n.provider or provider_key(n.driver, n.provider_instance_id)))
+                      family=family_label(step.provider or n.provider or provider_key(n.driver, n.provider_instance_id)),
+                      thinking=step.thinking_tokens)
     return stats
 
 
@@ -321,7 +347,8 @@ def build_store_usage_report(store: TelemetryStore, now: datetime,
             w = usage.window
             if not w.start.astimezone(timezone.utc) <= t < w.end.astimezone(timezone.utc):
                 continue
-            usage.stats.add(model, t, *counts, subagent=is_subagent, family=family)
+            usage.stats.add(model, t, *counts, subagent=is_subagent, family=family,
+                            thinking=step["thinking_tokens"] if "thinking_tokens" in step.keys() else 0)
             _add_to_period(usage, bisect_right(utc_starts[key], t) - 1, family,
                            "Subagents" if is_subagent else "Main", counts, cost)
             row, families = rows[key].setdefault(row_id, (ThreadUsage(row_id, title, status, [], TokenBreakdown()), set()))

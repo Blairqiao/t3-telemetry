@@ -268,12 +268,14 @@ def test_store_report_costs_and_lifetime(tmp_path):
                            SessionRecord('codex:free', 'codex', 'free', model='mystery-model')])
     store.replace_t3_graph([{'thread_id': 'root', 'title': 'Root'}], [{'session_key': 'claude:main', 'thread_id': 'root'}])
     store.upsert_steps([
-        StepRecord('claude:main', 'a', utc_iso('2026-11-05T02:00:00Z'), input_tokens=1_000_000),
+        StepRecord('claude:main', 'a', utc_iso('2026-11-05T02:00:00Z'), input_tokens=1_000_000, thinking_tokens=42),
         StepRecord('claude:main', 'old', utc_iso('2025-01-05T02:00:00Z'), input_tokens=1_000_000),
         StepRecord('codex:free', 'u', utc_iso('2026-11-05T02:00:00Z'), input_tokens=7),
     ])
     report = build_store_usage_report(store, NOW)
     today = report.periods['today']
+    assert today.stats.thinking_tokens == 42
+    assert today.stats.provider_models['Claude']['claude-opus-5-5'].thinking_tokens == 42
     assert today.cost_buckets[18] == {'Claude': pytest.approx(4.0)}
     assert [(t.thread_id, round(t.cost.total, 2)) for t in today.top('usd')] == [('root', 4.0), ('session:codex:free', 0.0)]
     assert report.lifetime('root') == 2_000_000
@@ -329,3 +331,32 @@ def test_stats_large_context_and_unpriced():
     stats = stats_for_node(root)
     assert stats.large_context_steps == 1
     assert stats.cost.unpriced_tokens == 210_000
+
+
+def test_provider_models_and_cache_hit_percentage():
+    from t3_telemetry.prices import step_cost
+    from t3_telemetry.usage import TokenBreakdown, cache_hit_pct
+
+    steps = [
+        ModelStep(step_index=1, started_at=None, model='claude-opus-5-5', input_tokens=10,
+                  cache_read_tokens=20, cache_creation_tokens=5, output_tokens=8, thinking_tokens=3),
+        ModelStep(step_index=2, started_at=None, model='claude-opus-5-5', input_tokens=2,
+                  output_tokens=4, thinking_tokens=1),
+        ModelStep(step_index=3, started_at=None, model='mystery', input_tokens=7),
+    ]
+    child = node('child', 'Child', 'codex', [ModelStep(step_index=1, started_at=None,
+                 model='gpt-6.1-sol', output_tokens=9, thinking_tokens=2)])
+    stats = stats_for_node(node('root', 'Root', 'claude', steps, [child]))
+    opus = stats.provider_models['Claude']['claude-opus-5-5']
+    assert opus.tokens == TokenBreakdown(12, 20, 5, 12)
+    assert (opus.steps, opus.thinking_tokens) == (2, 4)
+    assert opus.cost.total == pytest.approx(step_cost('claude-opus-5-5', None, 10, 20, 5, 8).total +
+                                            step_cost('claude-opus-5-5', None, 2, 0, 0, 4).total)
+    assert stats.provider_models['Claude']['mystery'].tokens == TokenBreakdown(7, 0, 0, 0)
+    codex = stats.provider_models['Codex']['gpt-6.1-sol']
+    assert (codex.tokens, codex.steps, codex.thinking_tokens) == (TokenBreakdown(0, 0, 0, 9), 1, 2)
+    assert codex.cost.total == pytest.approx(step_cost('gpt-6.1-sol', None, 0, 0, 0, 9).total)
+    assert stats.thinking_tokens == 6
+    assert stats.provider_thinking == {'Claude': 4, 'Codex': 2}
+    assert cache_hit_pct(TokenBreakdown(output_tokens=5)) is None
+    assert cache_hit_pct(TokenBreakdown(10, 20, 10, 99)) == 50.0
