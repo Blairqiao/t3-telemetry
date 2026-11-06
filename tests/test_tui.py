@@ -285,7 +285,7 @@ def test_breadcrumb_parent_child_grandchild_navigation_and_restoration():
 
     # 2. Tab to switch focus to subagents
     nav.tab()
-    assert screen1.focus == "subagents"
+    assert screen1.focus == "overview"
     nav.move(1)
     assert screen1.selected_child_id == "child-2"
 
@@ -302,7 +302,7 @@ def test_breadcrumb_parent_child_grandchild_navigation_and_restoration():
 
     # 4. Tab and enter gc-1 -> depth 3
     nav.tab()
-    assert screen2.focus == "subagents"
+    assert screen2.focus == "overview"
     nav.enter()
     assert nav.detail_id == "gc-1"
     assert len(nav.stack) == 3
@@ -314,7 +314,7 @@ def test_breadcrumb_parent_child_grandchild_navigation_and_restoration():
     assert nav.detail_id == "child-2"
     assert len(nav.stack) == 2
     restored2 = nav.current_screen
-    assert restored2.focus == "subagents"
+    assert restored2.focus == "overview"
     assert restored2.selected_child_id == "gc-1"
     assert restored2.activity_offset == 5
 
@@ -323,7 +323,7 @@ def test_breadcrumb_parent_child_grandchild_navigation_and_restoration():
     assert nav.detail_id == "root-1"
     assert len(nav.stack) == 1
     restored1 = nav.current_screen
-    assert restored1.focus == "subagents"
+    assert restored1.focus == "overview"
     assert restored1.selected_child_id == "child-2"
     assert restored1.activity_offset == 3
 
@@ -341,13 +341,13 @@ def test_disappearance_reconciliation_to_nearest_available_ancestor():
     nav.current_screen.title = "Root Thread"
     nav.current_screen.child_ids = ["child-1"]
     nav.current_screen.selected_child_id = "child-1"
-    nav.current_screen.focus = "subagents"
+    nav.current_screen.focus = "overview"
 
     nav.enter()
     nav.current_screen.title = "Child 1"
     nav.current_screen.child_ids = ["gc-1"]
     nav.current_screen.selected_child_id = "gc-1"
-    nav.current_screen.focus = "subagents"
+    nav.current_screen.focus = "overview"
 
     nav.enter()
     nav.current_screen.title = "Grandchild 1"
@@ -436,7 +436,7 @@ def test_detail_viewport_row_budget_60x24_with_subagents():
     nav.current_screen.title = root.title
     nav.current_screen.child_ids = [child.thread_id]
     nav.current_screen.selected_child_id = child.thread_id
-    nav.current_screen.focus = "subagents"
+    nav.current_screen.focus = "overview"
 
     layout = _browser_frame([], node=root, summary=root, nav=nav, height=24, width=60)
     buf = io.StringIO()
@@ -929,6 +929,7 @@ def _open_overview(node):
     nav = NavigationState()
     nav.reconcile([node.thread_id])
     nav.enter()
+    nav.current_screen.focus = "activity"
     nav.current_screen.child_ids = [c.thread_id for c in node.subagents]
     nav.current_screen.selected_child_id = node.subagents[0].thread_id if node.subagents else None
     return nav
@@ -950,7 +951,7 @@ def test_child_selection_is_visible_after_every_key_across_all_children(height, 
     browser = TelemetryBrowser(TerminalAdapter(), navigation=nav)
     _render_lines(node, nav, height, width)
     browser.handle_key("TAB")
-    assert nav.current_screen.focus == "subagents"
+    assert nav.current_screen.focus == "overview"
 
     visible_rows_seen = set()
     for expected in range(1, 6):
@@ -1156,22 +1157,23 @@ def test_live_loop_activity_keys_do_not_read_data(monkeypatch):
     assert len(capture.updates) > len(keys) // 2
 
 
-def test_focus_falls_back_to_activity_when_subagents_disappear():
+def test_focus_stays_on_overview_when_subagents_disappear():
     from t3_telemetry.activity import build_activity_entries
 
     node = _activity_node()
     nav = _open_overview(node)
     nav.sync_activities([e.entry_id for e in build_activity_entries(node, 50)])
     nav.tab()
-    assert nav.current_screen.focus == "subagents"
+    assert nav.current_screen.focus == "overview"
 
     node.subagents.clear()
     nav.sync_children([c.thread_id for c in node.subagents])
     screen = nav.current_screen
-    assert screen.focus == "activity"
+    assert screen.focus == "overview"
     last = screen.selected_activity_id
     nav.move(-1)
-    assert screen.selected_activity_id != last
+    assert screen.selected_activity_id == last
+    nav.tab()
     nav.enter()
     assert screen.detail_activity_id == screen.selected_activity_id
 
@@ -1509,7 +1511,7 @@ def test_shift_tab_decodes_and_reverses_focus_without_leaving_overview():
         key = adapter.read_key(0.2)
         assert key == "SHIFT_TAB"
         browser.handle_key(key)
-        assert nav.current_screen.focus == "subagents"
+        assert nav.current_screen.focus == "overview"
         browser.handle_key(key)
         assert nav.current_screen.focus == "activity"
         assert nav.detail_id == node.thread_id
@@ -1522,7 +1524,7 @@ def test_shift_tab_decodes_and_reverses_focus_without_leaving_overview():
 def test_list_ranges_and_focus_are_in_section_rules():
     node = _activity_node(n_children=12)
     nav = _open_overview(node)
-    for focus in ("activity", "subagents"):
+    for focus in ("activity", "overview"):
         nav.current_screen.focus = focus
         lines = _render_lines(node, nav, 24, 60)
         for label in ("Subagents", "Activity"):
@@ -1530,7 +1532,7 @@ def test_list_ranges_and_focus_are_in_section_rules():
             assert len(rules) == 1
             rule = lines[rules[0]]
             assert "───" in rule
-            assert ("▌" in rule) == (focus == label.lower())
+            assert ("▌" in rule) == (focus == ("overview" if label == "Subagents" else "activity"))
             # Column names sit on the line directly under the rule.
             assert "Tokens" in lines[rules[0] + 1] and "Time" in lines[rules[0] + 1]
 
@@ -1546,7 +1548,7 @@ def test_every_overview_section_uses_the_standard_rule():
 def test_subagent_table_shows_total_tokens_not_in_out():
     node = _activity_node(n_children=3)
     nav = _open_overview(node)
-    nav.current_screen.focus = "subagents"
+    nav.current_screen.focus = "overview"
     lines = _render_lines(node, nav, 30, 120)
     header = next(line for line in lines if "Model" in line and "Steps" in line)
     assert "Tokens" in header
@@ -1558,7 +1560,7 @@ def test_focus_switch_preserves_table_capacity_and_section_rules():
     nav = _open_overview(node)
     for height, width in ((24, 60), (30, 80), (40, 120), (55, 140)):
         ranges = []
-        for focus in ("activity", "subagents", "activity"):
+        for focus in ("activity", "overview", "activity"):
             nav.current_screen.focus = focus
             lines = _render_lines(node, nav, height, width)
             headers = [i for i, line in enumerate(lines) if "of 40" in line]
@@ -2408,22 +2410,22 @@ def test_footer_line_cost_and_split():
     # Home offers the toggle too.
     assert _footer_line(NavigationState(), None, 100).plain == "Tab section  W/S move  E/Enter open  $ cost  q quit"
 
-    # Overview screens: with subagents, focus == "subagents"
+    # Overview screens: with subagents, focus == "overview"
     child = ThreadTelemetryNode(thread_id="c1", title="Child", driver="codex", provider_instance_id="codex", model="m")
     parent = ThreadTelemetryNode(thread_id="p1", title="Parent", driver="codex", provider_instance_id="codex", model="m", subagents=[child])
     nav_detail = NavigationState()
-    nav_detail.stack = [ScreenState(node_id="p1", focus="subagents")]
-    assert _footer_line(nav_detail, parent, 100).plain == "Tab activity  W/S move  E/Enter open  $ cost  Esc back  q quit"
+    nav_detail.stack = [ScreenState(node_id="p1", focus="overview")]
+    assert _footer_line(nav_detail, parent, 100).plain == "Tab activity  W/S move  E/Enter open subagent  $ cost  Esc back  q quit"
 
     # Overview screens: with subagents, focus == "activity"
     nav_detail.stack = [ScreenState(node_id="p1", focus="activity")]
-    assert _footer_line(nav_detail, parent, 100).plain == "Tab subagents  W/S move  E/Enter details  $ cost  Esc back  q quit"
+    assert _footer_line(nav_detail, parent, 100).plain == "Tab overview  W/S move  E/Enter details  $ cost  Esc back  q quit"
 
     # Overview screens: without subagents
     lone = ThreadTelemetryNode(thread_id="l1", title="Lone", driver="codex", provider_instance_id="codex", model="m")
     nav_lone = NavigationState()
     nav_lone.stack = [ScreenState(node_id="l1")]
-    assert _footer_line(nav_lone, lone, 100).plain == "W/S move  E/Enter details  $ cost  Esc back  q quit"
+    assert _footer_line(nav_lone, lone, 100).plain == "Tab activity  $ cost  Esc back  q quit"
 
 
 def _priced_tree():
@@ -2520,3 +2522,23 @@ def test_root_list_shows_syncing_for_missing_usage():
         created_at=None, updated_at=None,
     )
     assert "syncing…" in _root_list_body([root], NavigationState(), 5, 60, None, True).plain
+
+
+def test_session_tabs_without_children_and_activity_escape():
+    nav = NavigationState()
+    nav.reconcile(["root"])
+    nav.enter()
+    screen = nav.current_screen
+    assert screen.focus == "overview"
+    nav.tab()
+    assert screen.focus == "activity"
+    nav.sync_activities(["entry"])
+    nav.enter()
+    assert screen.detail_activity_id == "entry"
+    nav.escape()
+    assert screen.focus == "activity"
+    nav.tab()
+    assert screen.focus == "overview"
+    nav.sync_children(["child"])
+    nav.enter()
+    assert nav.detail_id == "child"

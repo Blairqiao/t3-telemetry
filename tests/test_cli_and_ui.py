@@ -1391,7 +1391,7 @@ def test_browser_frame_60x24_repro_parent_claude_child_worker_scopes_context_act
 
     # 3. 60x24 subagents focus: selected child is visible with marker ▶ and Enter usable
     nav.tab()
-    assert nav.current_screen.focus == "subagents"
+    assert nav.current_screen.focus == "overview"
     layout_sub = _browser_frame([parent], node=parent, summary=parent, nav=nav, height=24, width=60)
     buf_sub = io.StringIO()
     Console(file=buf_sub, width=60, height=24, force_terminal=True, color_system=None).print(layout_sub)

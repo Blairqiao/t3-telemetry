@@ -622,12 +622,13 @@ def _footer_line(nav: NavigationState, node: ThreadTelemetryNode | None, width: 
             keys = f"W/S scroll  Tab actions  P prompt  {money}  Esc back  q quit"
         elif screen.detail_activity_id:
             keys = f"W/S scroll  P prompt  {money}  Esc back  q quit"
-        elif node.subagents and screen.focus == "subagents":
-            keys = f"Tab activity  W/S move  E/Enter open  {money}  Esc back  q quit"
-        elif node.subagents:
-            keys = f"Tab subagents  W/S move  E/Enter details  {money}  Esc back  q quit"
+        elif screen.focus == "overview":
+            if node.subagents:
+                keys = f"Tab activity  W/S move  E/Enter open subagent  {money}  Esc back  q quit"
+            else:
+                keys = f"Tab activity  {money}  Esc back  q quit"
         else:
-            keys = f"W/S move  E/Enter details  {money}  Esc back  q quit"
+            keys = f"Tab overview  W/S move  E/Enter details  {money}  Esc back  q quit"
     elif nav.period and not nav.stack:
         keys = f"W/S move  E/Enter open thread  {money}  G split  Esc home  q quit"
     else:
@@ -734,7 +735,7 @@ def _overview_body(
     children = list(node.subagents)
     child_ids = [c.thread_id for c in children]
     child_sel = child_ids.index(screen.selected_child_id) if screen.selected_child_id in child_ids else 0
-    sub_focus = bool(children) and screen.focus == "subagents"
+    sub_focus = bool(children) and screen.focus == "overview"
 
     # Rows per list (an empty list still shows one message line) and how many it could use.
     counts = ({"subagents": len(children)} if children else {}) | {"activity": act_total}

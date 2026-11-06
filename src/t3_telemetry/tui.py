@@ -13,7 +13,7 @@ from t3_telemetry.usage import PERIODS
 class ScreenState:
     node_id: str
     title: str = ""
-    focus: str = "activity"  # "activity" or "subagents"
+    focus: str = "overview"  # session tab
     child_ids: list[str] = field(default_factory=list)
     selected_child_id: str | None = None
     child_scroll: int = 0
@@ -149,14 +149,12 @@ class NavigationState:
             self.notice = "Activity is no longer available"
 
     def sync_children(self, ids: list[str]) -> None:
-        """Reconcile the current screen's subagent list; focus falls back to activity when it empties."""
+        """Reconcile the current screen's subagent list."""
         screen = self.current_screen
         if screen is None:
             return
         screen.child_ids = list(ids)
-        if not screen.child_ids:
-            screen.focus = "activity"
-        elif screen.selected_child_id not in screen.child_ids:
+        if screen.child_ids and screen.selected_child_id not in screen.child_ids:
             screen.selected_child_id = screen.child_ids[0]
 
     def sync_top(self, ids: list[str]) -> None:
@@ -185,7 +183,7 @@ class NavigationState:
                     ids = screen.activity_ids
                     curr_idx = ids.index(screen.selected_activity_id) if screen.selected_activity_id in ids else len(ids) - 1
                     screen.selected_activity_id = ids[max(0, min(len(ids) - 1, curr_idx + delta))]
-            elif screen.focus == "subagents":
+            elif screen.focus == "overview":
                 if screen.child_ids:
                     curr_idx = (
                         screen.child_ids.index(screen.selected_child_id)
@@ -212,13 +210,12 @@ class NavigationState:
                 if screen.detail_item_count > 0 and not screen.action_open:
                     screen.detail_focus = "page" if screen.detail_focus == "actions" else "actions"
                 return
-            if screen.child_ids:
-                if screen.focus == "activity":
-                    screen.focus = "subagents"
-                    if not screen.selected_child_id or screen.selected_child_id not in screen.child_ids:
-                        screen.selected_child_id = screen.child_ids[0]
-                else:
-                    screen.focus = "activity"
+            if screen.focus == "activity":
+                screen.focus = "overview"
+                if screen.child_ids and screen.selected_child_id not in screen.child_ids:
+                    screen.selected_child_id = screen.child_ids[0]
+            else:
+                screen.focus = "activity"
 
         elif not self.period:
             self.home_focus = "threads" if self.home_focus == "usage" else "usage"
@@ -247,7 +244,7 @@ class NavigationState:
                     screen.action_open = True
                     screen.action_scroll = 0
                 return
-            if screen.focus == "subagents":
+            if screen.focus == "overview":
                 target = screen.selected_child_id
                 if target and target in screen.child_ids:
                     self.stack.append(ScreenState(node_id=target))
