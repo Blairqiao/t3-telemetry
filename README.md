@@ -42,6 +42,19 @@ t3-top --interval 1.0
 t3-top --max-steps 15
 ```
 
+#### Keys
+
+The bottom footer dynamically reflects the available keys for the current screen and focus:
+
+- **Tab**: Switch between Usage and Chats on Home (`Tab section`), toggle between the **Overview** and **Activity** tabs in a session (`Tab activity` / `Tab overview`), or switch between page and actions in activity details (`Tab actions` / `Tab page`).
+- **W / S** (or **Up / Down**, **k / j**): Move selection in lists (`W/S move`), scroll details (`W/S scroll`), or select an action item (`W/S select`).
+- **E / Enter**: Open selected chat thread or period (`E/Enter open`), open top thread on period screens (`E/Enter open thread`), drill into child subagent on Overview (`E/Enter open subagent`), open activity details on Activity tab (`E/Enter details`), or expand full action text (`E/Enter full text`).
+- **$** or **c**: Toggle usage numbers between token counts and estimated USD cost (`$ tokens` / `$ cost`).
+- **P**: Toggle prompt expansion in activity details (`P prompt`).
+- **G**: Switch period chart between provider and scope splits (`G split`).
+- **Esc**: Return one level back (`Esc back`) or return home from a period screen (`Esc home`).
+- **q** or **Ctrl-C**: Quit `t3-top` cleanly (`q quit`).
+
 ### Snapshot mode
 
 Print a single telemetry snapshot to standard output and exit:
@@ -85,13 +98,16 @@ t3-top --t3-dir /path/to/custom/userdata --once
 
 ### Terminal navigation and controls
 
-Live watch mode provides an interactive terminal browser with full keyboard navigation across root application threads and subagent trees:
+Live watch mode provides an interactive terminal browser with full keyboard navigation across root application threads, session tabs, and subagent trees:
 
-- Up / Down, k / j, or W / S: Move selection in the home Chats list or Usage periods, select top threads on a period screen, select activity entries on overviews or scroll an open activity detail, or change subagent selection when the subagent pane is focused.
-- Tab / Shift+Tab: Move focus between Usage and Chats sections on the home screen, between Activity and Subagents selection on detail screens, or between the actions list and page on action details.
-- E or Enter: Open the detail screen for the selected app thread, open the period screen for a selected usage period, open a top thread from a period screen, drill down into a highlighted child subagent, or open the focused activity detail. In a launch detail, E or Enter opens the linked child when available. E or Enter in an ordinary activity detail does nothing.
-- Escape: Return one level, restoring focus, selection, and scroll position. From a period screen, Escape returns home with the period selection preserved. A child opened from a launch returns to that launch detail first.
-- q or Ctrl-C: Exit t3-top cleanly and restore the terminal to canonical cooked mode.
+- Up / Down, k / j, or W / S: Move selection in the home Chats list or Usage periods (`W/S move`), select top threads on a period screen (`W/S move`), move child subagent selection on the session Overview tab when subagents are present (`W/S move`), select activity entries on the session Activity tab (`W/S move`), scroll open activity details (`W/S scroll`), or select an action item when the actions list is focused (`W/S select`).
+- Tab: Switch between Usage and Chats sections on the home screen (`Tab section`), toggle between the **Overview** and **Activity** tabs in a session (`Tab activity` from Overview, `Tab overview` from Activity), or switch focus between the page and actions list in activity details (`Tab actions` / `Tab page`).
+- E or Enter: Open the session screen for the selected app thread or period screen for a selected usage period (`E/Enter open`), open a top thread from a period screen (`E/Enter open thread`), drill down into a highlighted child subagent on the Overview tab (`E/Enter open subagent`), open details for the selected activity entry on the Activity tab (`E/Enter details`), drill into a linked child subagent in a launch activity detail (`E/Enter open subagent`), or open full text for a selected action item (`E/Enter full text`).
+- $ or c: Toggle all usage numbers between token counts and estimated USD cost (`$ tokens` / `$ cost`).
+- P: Toggle prompt expansion in activity details (`P prompt`).
+- G: Switch the period usage chart between provider and scope splits (`G split`).
+- Escape: Return one level back, restoring focus, selection, and scroll position (`Esc back`). From a period screen, return home with the period selection preserved (`Esc home`). A child opened from a launch returns to that launch detail first.
+- q or Ctrl-C: Exit t3-top cleanly and restore the terminal to canonical cooked mode (`q quit`).
 
 #### Screens and breadcrumbs
 
@@ -103,12 +119,20 @@ The browser supports hierarchical navigation across primary view levels:
    - Chats section: Displays root application threads ordered by most recent update, with model labels and status-colored titles.
 2. Period screen: Detailed breakdown for a selected calendar period (Today, This week, or This month):
    - Usage over time: Stacked bar chart broken into hourly buckets (Today) or daily buckets (This week and This month; merged when terminal width requires). Bars stack provider tokens with distinct glyphs and colors: Claude (`█`, dark orange), Codex (`▓`, green), Antigravity (`▒`, medium purple), and Other (`░`, grey). A legend displays each provider's glyph, color, and total tokens. Future time buckets display `·`.
-   - Providers table: Lists token breakdown by provider family with Input, Cache read, Cache write (cache creation), Output, and Total.
+   - Providers & models table: Lists provider totals and model sub-rows, with responsive token or cost columns and cache hit rate.
    - Top threads: Root threads ranked by in-period token usage, with descendant subagents rolled into the root app thread. Displays the root thread title, active provider families, and total tokens.
    - Navigation: Up / Down selects a thread; Enter opens the thread's detail screen with a breadcrumb starting with the period name (for example, `This week › Root Thread`). Pressing Escape returns to the period screen with the top thread selection preserved; pressing Escape again returns home with the period row still selected.
-3. Detail screen: Displays the summary header, three-scope token metrics, context occupancy graph, immediate subagents table, and recent activity stream for the active thread.
+3. Session screen (Overview and Activity tabs): Opening an app thread or subagent provides two full tabs switched with Tab:
+   - **Overview tab**: A consolidated view of thread telemetry:
+     - **Identity & breadcrumbs**: Thread title, root status, active model, driver, and lineage breadcrumb indicating depth (for example, `Root Thread > Child Subagent > Grandchild` or `This week › Root Thread › Child Subagent`).
+     - **Tab strip**: Shows `▌ Overview   Activity (<count>)` indicating the active tab and activity entry count.
+     - **Usage**: Three explicit metric scopes (`Current turn`, `Whole chat · this agent`, and `Chat + subagents`), followed by the token-mix breakdown bar and compact legend.
+     - **Context**: Context window occupancy history graph with automatic token ceiling scale, limit, provenance (`Measured`, `Estimated`, or `Unknown`), and peak retention across drops.
+     - **Providers & models**: Hierarchical table breaking down token usage by provider family (Claude, Codex, Antigravity, Other) and individual model sub-rows, reporting Cache hit, Cache write, Uncached, Output, Total, and Hit % (toggle between tokens and estimated cost via `$`).
+     - **Subagents**: Present when the thread has child subagents, listing child status, model, and rollup token counts; navigate with `W / S` and press `E / Enter` to drill down into a child subagent.
+   - **Activity tab**: Full-height stream of provider turns and model inference steps showing the token mix bar, model (when multiple models run), cache hits, new input tokens, output tokens, total tokens or cost, and duration. Navigate entries with `W / S` and press `E / Enter` to open detailed step telemetry.
 
-When drilling down into child or native subagents, a breadcrumb header (for example, `Root Thread > Child Subagent > Grandchild` or `This week › Root Thread › Child Subagent`) indicates the active lineage depth. Pressing Escape ascends the stack one level at a time, preserving previous cursor selections and scroll positions.
+When drilling down into child or native subagents, pressing Escape ascends the stack one level at a time, returning from Activity detail to the Activity tab, and from subagents back to the parent session with previous cursor selections and scroll positions preserved.
 
 #### Summary follow and selection pinning
 
@@ -134,7 +158,7 @@ Claude records uncached input directly; for Codex, uncached input is `inputToken
 
 #### Activity details and retention
 
-Activity rows show a recorded description, total tokens, and duration. Visible ranges indicate the list window, and selection scrolls at the visible boundary. Open details to inspect the detail sections (Tokens with re-read vs. new split and end-of-turn context, What it did timeline, Prompt with `P` to expand, Details footer). Provider-turn totals cover the entire turn, including any listed tools. Missing usage differs from recorded zero; approximate or partial totals are marked.
+Activity rows show a recorded description, total tokens, and duration. Visible ranges indicate the list window, and selection scrolls at the visible boundary. Open details to inspect the detail sections (Tokens breakdown separating cache hit, cache write, uncached, response, thinking, and cost, What it did timeline, Prompt with `P` to expand, Details footer). Provider-turn totals cover the entire turn, including any listed tools. Missing usage differs from recorded zero; approximate or partial totals are marked.
 
 Descriptions use recorded command, path, task, or explicitly associated message fields. Name-only tools and unassociated turns report unavailable details. T3 message associations require explicit references; arbitrary provider logs are not searched. Retained text is bounded and truncation is labeled. Recorded commands are displayed as text and never executed.
 
@@ -162,7 +186,14 @@ In headless environments, CI pipelines, or when stdout is redirected to a pipe, 
 
 ### Breakdown and estimated cost
 
-The breakdown bar displays four token kinds: cache read, cache write, output (which includes thinking), and input. Press `$` or `c` on any screen to toggle every usage figure between token counts and estimated USD cost: home period totals, the lifetime total shown beside each chat, the period breakdown, chart, providers table and top threads (ranked by the active measure), each agent's usage lines and header total (agent plus all its subagents), the Subagents and Activity columns. The activity detail always shows both a step's tokens and its estimated cost. The context graph stays in tokens, since it measures window occupancy rather than spend. Press `g` to switch the period chart between provider and scope splits.
+The breakdown bar and token tables categorize usage into four token kinds:
+
+- **Cache hit** (`cache_read`): Prompt context re-read from cache, billed at discounted cache-read rates (`re-read from cache, cheap`).
+- **Cache write** (`cache_write`): New prompt context stored into cache for reuse in subsequent turns, billed at cache-creation rates (`stored for reuse, premium`).
+- **Uncached** (`input`): Uncached input tokens and cache misses, billed at full standard input price (`cache miss, full input price`).
+- **Output** (`output`): What the model wrote, including reply text, tool calls, and thinking / reasoning tokens (`what the model wrote, incl. thinking`). In activity details, output is further detailed into **Response** (reply text and tool calls) and **Thinking** (reasoning tokens, billed as output).
+
+Press `$` or `c` on any screen to toggle usage figures between token counts and estimated USD cost: home period totals, the lifetime total shown beside each chat, the period breakdown, chart, providers & models table and top threads (ranked by the active measure), each agent's usage lines and header total (agent plus all its subagents), and the Subagents and Activity columns. The Home Live card always shows tokens and estimated cost. The activity detail always shows both a step's tokens and its estimated cost. The context graph stays in tokens, since it measures window occupancy rather than spend. Press `g` to switch the period chart between provider and scope splits.
 
 Dollars are estimates at API list prices from a static table in `src/t3_telemetry/prices.py` (checked 2026-11-05). On subscription plans this is what the same work would cost on the API. Unknown models are shown as unpriced tokens.
 
