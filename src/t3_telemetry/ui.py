@@ -1583,7 +1583,7 @@ def build_activity_detail_lines(
         token_row("input", "Uncached", step.input_tokens)
         output = f"{' Output · what the model wrote':<38} {step.output_tokens:>10,}"
         if cost.total > 0:
-            output += f" {format_usd(cost.output):>27}"
+            output += f" {format_usd(cost.output):>23}"
         lines.append(Text(output))
         if step.thinking_tokens:
             response = step.response_tokens or max(0, step.output_tokens - step.thinking_tokens)

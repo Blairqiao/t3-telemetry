@@ -1108,6 +1108,7 @@ def _period_body(usage, nav, inner_height, inner_width, now) -> list:
     show_header = 1 + 1 + len(graph) + 1 + 1 + thinking_lines + min_pm_rows + 4 <= inner_height_rest
     fixed_lines = 1 + 1 + 1 + int(show_header) + thinking_lines + 1
     pm_rows = max(min_pm_rows, min(provider_model_row_count(p.stats, 10**6), inner_height_rest - len(graph) - fixed_lines - 3))
+    pm_rows = provider_model_row_count(p.stats, pm_rows)  # rows actually drawn; a collapsed group can leave the cap unused
     table = build_provider_model_table(p.stats, nav.measure, inner_width, max_rows=pm_rows, show_header=show_header)
     thinking_line = None
     if p.stats.thinking_tokens > 0:
