@@ -77,3 +77,58 @@ def test_origin_precedence_and_invalid_lines(tmp_path):
     result = parse_claude_file(path)
     assert result.sessions[0].origin_hint == "t3"
     assert result.offset == path.stat().st_size
+
+
+def test_turns_items_and_resuming(tmp_path):
+    from t3_telemetry.store import TelemetryStore
+
+    path = tmp_path / "session.jsonl"
+    entries = [
+        {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "promptId": "p1",
+         "message": {"content": "First prompt"}},
+        {"type": "user", "timestamp": "2026-01-01T00:00:01Z", "promptId": "meta",
+         "isMeta": True, "message": {"content": "Internal"}},
+        assistant("m1", "2026-01-01T00:00:02Z", {}, [
+            {"type": "thinking", "thinking": "private"},
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "tool_use", "id": "t2", "name": "Edit", "input": {"file_path": "a.py"}},
+        ]),
+        {"type": "user", "timestamp": "2026-01-01T00:00:03Z", "promptId": "p1",
+         "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"},
+                                 {"type": "tool_result", "tool_use_id": "t2", "is_error": True}]}},
+        assistant("m2", "2026-01-01T00:00:04Z", {}, [{"type": "text", "text": "Done"}]),
+        {"type": "user", "timestamp": "2026-01-01T00:00:05Z", "uuid": "u2",
+         "message": {"content": [{"type": "text", "text": "Second"}, {"type": "text", "text": "prompt"}]}},
+        assistant("m3", "2026-01-01T00:00:06Z", {}, [{"type": "text", "text": "Reply"}]),
+    ]
+    chunks = [line(entry) for entry in entries]
+    path.write_bytes(b"".join(chunks))
+    whole = parse_claude_file(path)
+    split = sum(map(len, chunks[:3]))
+    path.write_bytes(b"".join(chunks[:3]))
+    first = parse_claude_file(path)
+    path.write_bytes(b"".join(chunks))
+    second = parse_claude_file(path, first.offset, turn_id="p1")
+    assert first.offset == split
+    assert [step.turn_id for step in whole.steps] == ["p1", "p1", "uuid:u2"]
+
+    stores = [TelemetryStore(tmp_path / f"{name}.db") for name in ("whole", "split")]
+    for store, results in zip(stores, ([whole], [first, second])):
+        for result in results:
+            store.upsert_sessions(result.sessions)
+            store.upsert_steps(result.steps)
+            store.upsert_turns(result.turns)
+            store.upsert_items(result.items)
+    turns = [dict(row) for row in stores[0].turns_for(["claude:session"])]
+    assert [(t["turn_id"], t["prompt"], t["reply"]) for t in turns] == [
+        ("p1", "First prompt", "Done"), ("uuid:u2", "Second\nprompt", "Reply")]
+    items = [dict(row) for row in stores[0].items_for(["claude:session"])]
+    assert [(i["kind"], i["text"], i["status"]) for i in items] == [
+        ("think", "", "completed"), ("run", "ls", "completed"), ("edit", "a.py", "failed")]
+    assert turns == [dict(row) for row in stores[1].turns_for(["claude:session"])]
+    # Sequence values encode the starting offset, but preserve the same order.
+    resumed_items = [dict(row) for row in stores[1].items_for(["claude:session"])]
+    assert [{k: v for k, v in i.items() if k != "seq"} for i in items] == [
+        {k: v for k, v in i.items() if k != "seq"} for i in resumed_items]
+    for store in stores:
+        store.close()
