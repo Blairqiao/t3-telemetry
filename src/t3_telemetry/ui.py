@@ -1038,7 +1038,9 @@ def activity_range_label(start: int, shown: int, total: int) -> str:
     return f"{start + 1}–{start + shown} of {total}"
 
 
-def activity_tokens_cell(entry: ActivityEntry, measure: str = "tokens", model: str | None = None) -> str:
+def activity_tokens_cell(entry: ActivityEntry, measure: str = "tokens", model: str | None = None, syncing: bool = False) -> str:
+    if syncing:
+        return "syncing…"
     if entry.total_tokens is None:
         return "—"
     approx = entry.usage_provenance == "cumulative_fallback" or entry.usage_status == "partial"
@@ -1064,6 +1066,7 @@ def build_activity_table(
     range_label: str | None = None,
     measure: str = "tokens",
     model: str | None = None,
+    syncing: bool = False,
 ) -> Table:
     """Compact activity feed: descriptive title, total tokens, duration.
 
@@ -1081,7 +1084,7 @@ def build_activity_table(
     table.add_column("Time", justify="right", no_wrap=True)
     for entry in entries:
         duration = "—" if entry.is_launch else format_duration(entry.duration_seconds)
-        cells: list[Any] = [Text(entry.title), activity_tokens_cell(entry, measure, model), duration]
+        cells: list[Any] = [Text(entry.title), activity_tokens_cell(entry, measure, model, syncing), duration]
         if interactive:
             is_sel = entry.entry_id == selected_id
             highlighted = is_sel and focused
@@ -1556,6 +1559,8 @@ def build_scopes_summary(node: ThreadTelemetryNode, width: int = 80, measure: st
         ("Whole chat · this agent", self_val),
         (rollup_label, rollup_val),
     ]
+    if node.store_state == "syncing":
+        scopes = [(label, "syncing…") for label, _ in scopes]
     label_width = max(len(label) for label, _ in scopes)
     lines: list[Text] = []
     for label, value in scopes:
@@ -1632,6 +1637,7 @@ def build_dashboard_renderable(node: ThreadTelemetryNode, max_steps: int = 20) -
         build_activity_entries(node, max_steps),
         title="Recent Steps / Turns",
         box_style=box.ROUNDED,
+        syncing=node.store_state == "syncing",
     )
 
     renderables.append(stream_table)
@@ -1691,7 +1697,7 @@ def build_sessions_table(rows: list[dict]) -> Table:
     """Build Rich table summarizing recent telemetry sessions for --sessions mode."""
     table = Table(title="Recent Sessions", expand=True, box=box.ROUNDED, padding=(0, 1))
     table.add_column("Origin", style="bold cyan", min_width=6, no_wrap=True)
-    table.add_column("Provider", no_wrap=True)
+    table.add_column("Providers", no_wrap=True)
     table.add_column("Title", ratio=2, no_wrap=True, overflow="ellipsis")
     table.add_column("Model", ratio=1, no_wrap=True, overflow="ellipsis")
     table.add_column("Last active", no_wrap=True)

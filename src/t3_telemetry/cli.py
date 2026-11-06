@@ -423,7 +423,7 @@ def run_live_loop(
                                 width,
                                 args.max_steps,
                                 snapshot,
-                                usage=usage, now=datetime.now().astimezone(), running_ids=running_ids,
+                                usage=usage, now=datetime.now().astimezone(), running_ids=running_ids, syncing=store.get_meta("last_sync_at") is None,
                             )
                             cached_frame = frame
                             live.update(frame, refresh=True)
@@ -510,7 +510,7 @@ def run_live_loop(
                         width,
                         args.max_steps,
                         cached_snapshot,
-                        usage=usage, now=datetime.now().astimezone(), running_ids=running_ids,
+                        usage=usage, now=datetime.now().astimezone(), running_ids=running_ids, syncing=store.get_meta("last_sync_at") is None,
                     )
                     cached_frame = frame
                     live.update(frame, refresh=True)
@@ -532,7 +532,7 @@ def run_live_loop(
                         width,
                         args.max_steps,
                         cached_snapshot,
-                        usage=usage, now=datetime.now().astimezone(), running_ids=running_ids,
+                        usage=usage, now=datetime.now().astimezone(), running_ids=running_ids, syncing=store.get_meta("last_sync_at") is None,
                     )
                     cached_frame = frame
                     live.update(frame, refresh=True)
@@ -756,6 +756,8 @@ def _overview_body(
     section_rules = 2 + len(counts)
     stats = stats_for_node(node)
     variants = [(True, dict(headline_on=True, legend="compact")), (False, dict(headline_on=True, legend="compact")), (False, dict(headline_on=False, legend="compact")), (False, dict(headline_on=False, legend="none")), (False, None)]
+    if node.store_state == "syncing":
+        variants = [(False, None)]
     graph_h = graph_min
     for show_provider, variant in variants:
         block = (provider_lines(stats, nav.measure, inner_width) if show_provider else [])
@@ -829,7 +831,7 @@ def _overview_body(
         table = build_activity_table(
             window, selected_id=entry_ids[act_sel], focused=not sub_focus, interactive=True, show_header=header_lines > 0,
             range_label=activity_range_label(start, len(window), act_total),
-            measure=nav.measure, model=node.model,
+            measure=nav.measure, model=node.model, syncing=node.store_state == "syncing",
         )
         body.append(Viewport(table, height=lines, width=inner_width))
     return body
@@ -902,7 +904,7 @@ def _activity_detail_body(node: ThreadTelemetryNode, screen: ScreenState, entry,
     ]
 
 
-def _root_list_body(roots: list[AppThreadRecord], nav: NavigationState, inner_height: int, inner_width: int, snapshot, focused: bool, usage=None) -> Text:
+def _root_list_body(roots: list[AppThreadRecord], nav: NavigationState, inner_height: int, inner_width: int, snapshot, focused: bool, usage=None, syncing: bool = False) -> Text:
     body = Text()
     visible_rows = max(1, inner_height - 1)
     ids = [t.thread_id for t in roots]
@@ -924,7 +926,7 @@ def _root_list_body(roots: list[AppThreadRecord], nav: NavigationState, inner_he
         line.append("▶ " if is_selected else "  ", style="bold cyan")
         suffix = Text(f"  [{root.model or 'unknown'}]", style="dim")  # optional metadata
         row = usage.all_time.get(root.thread_id) if usage is not None else None
-        total = Text("  " + (_usage_label(row, nav.measure) if row is not None else ("…" if usage is None else "—")))
+        total = Text("  " + (_usage_label(row, nav.measure) if row is not None else ("syncing…" if syncing or usage is None else "—")))
         title = Text(root.title or root.thread_id, style="" if is_selected else (get_status_style(status) or "bold"))
         room = inner_width - 2 - total.cell_len
         if room - suffix.cell_len < 12:
@@ -952,7 +954,7 @@ def _parse_utc(value: str | None) -> datetime | None:
     return parsed
 
 
-def _home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, inner_width, now):
+def _home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, inner_width, now, syncing=False):
     card = []
     if summary:
         status = summary.status or "idle"
@@ -1003,7 +1005,7 @@ def _home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, 
         if selected and nav.home_focus == "usage":
             line.stylize(SELECTED_ROW_STYLE)
         result.append(_fit(line, inner_width))
-    result.append(_root_list_body(roots, nav, max(1, inner_height - len(result)), inner_width, snapshot, nav.home_focus == "threads", usage))
+    result.append(_root_list_body(roots, nav, max(1, inner_height - len(result)), inner_width, snapshot, nav.home_focus == "threads", usage, syncing))
     return result
 
 
@@ -1096,7 +1098,7 @@ def _browser_frame(
     width: int,
     max_steps: int = 20,
     snapshot=None,
-    *, usage: UsageReport | None = None, now: datetime | None = None, running_ids: list[str] | None = None,
+    *, usage: UsageReport | None = None, now: datetime | None = None, running_ids: list[str] | None = None, syncing: bool = False,
 ) -> Layout:
     """Construct Rich Layout bounded strictly to (height, width).
 
@@ -1129,7 +1131,7 @@ def _browser_frame(
         body_panel = Panel(Group(*_period_body(usage, nav, inner_height, inner_width, now or datetime.now().astimezone())), title=Text(PERIOD_LABELS[nav.period], style="bold cyan"), box=box.ROUNDED, expand=True)
     else:
         body_panel = Panel(
-            Group(*_home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, inner_width, now or datetime.now().astimezone())),
+            Group(*_home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, inner_width, now or datetime.now().astimezone(), syncing)),
             title="[bold]App Threads[/]",
             box=box.ROUNDED,
             expand=True,

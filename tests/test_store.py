@@ -82,7 +82,7 @@ def test_session_rows_seeded_origin_descendants_and_cycles(tmp_path):
 
     # Check codex:standalone
     codex_row = rows[0]
-    assert codex_row["origin"] == "cli"
+    assert codex_row["origin"] == "CLI"
     assert codex_row["thread_id"] is None
     assert codex_row["title"] == "my-app · codex"
     assert codex_row["subagents"] == 0
@@ -219,4 +219,29 @@ def test_bounded_and_empty_steps(tmp_path):
     assert store.steps_for([]) == []
     assert bounded("x" * 2001, 2000) == ("x" * 2000, True)
     assert bounded("  ", 2000) == (None, False)
+    store.close()
+
+
+def test_session_rows_group_app_threads_and_native_children(tmp_path):
+    from t3_telemetry.store import session_rows
+
+    store = TelemetryStore(tmp_path / "group.db")
+    store.upsert_sessions([
+        SessionRecord("claude:root", "claude", "root", model="root-model", last_ts="2026-01-01"),
+        SessionRecord("codex:child", "codex", "child", last_ts="2026-01-03"),
+        SessionRecord("codex:native", "codex", "native", parent_session_key="codex:child", last_ts="2026-01-04"),
+        SessionRecord("unbound", "claude", "unbound", origin_hint="t3", last_ts="2026-01-02"),
+    ])
+    store.replace_t3_graph([
+        {"thread_id": "root", "title": "Chat"},
+        {"thread_id": "child", "parent_thread_id": "root"},
+    ], [{"session_key": "claude:root", "thread_id": "root"},
+        {"session_key": "codex:child", "thread_id": "child"}])
+    store.upsert_steps([StepRecord("claude:root", "a", "2026-01-01", input_tokens=10),
+                        StepRecord("codex:child", "b", "2026-01-03", output_tokens=20)])
+    rows = session_rows(store)
+    assert len(rows) == 2
+    assert (rows[0]["session_key"], rows[0]["provider"], rows[0]["subagents"], rows[0]["tokens"], rows[0]["last_active"], rows[0]["model"]) == ("claude:root", "Claude, Codex", 2, 30, "2026-01-04", "root-model")
+    assert rows[1]["origin"] == "T3"
+    assert session_rows(store, limit=1) == rows[:1]
     store.close()

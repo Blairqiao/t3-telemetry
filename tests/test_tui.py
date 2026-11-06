@@ -2409,3 +2409,14 @@ def test_chats_selection_only_highlights_when_focused():
     assert "▶ Only chat" in focused.plain
     assert "▶" not in unfocused.plain
     assert not any("bright_yellow" in str(span.style) for span in unfocused.spans)
+
+
+def test_root_list_shows_syncing_for_missing_usage():
+    from t3_telemetry.cli import _root_list_body
+    root = AppThreadRecord(
+        thread_id="root", project_id=None, title="Chat", default_provider="claudeAgent",
+        provider_instance_id=None, model=None, thinking_level=None, active_provider_thread_id=None,
+        parent_thread_id=None, root_thread_id=None, relationship_to_parent=None,
+        created_at=None, updated_at=None,
+    )
+    assert "syncing…" in _root_list_body([root], NavigationState(), 5, 60, None, True).plain

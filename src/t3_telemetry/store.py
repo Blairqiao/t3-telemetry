@@ -1,6 +1,6 @@
 """Persistent store for native session telemetry."""
 
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
@@ -352,137 +352,87 @@ class TelemetryStore:
             return {row["thread_id"]: row for row in self.conn.execute("SELECT * FROM t3_threads")}
 
 
+def attribute_session(session_key: str, sessions: dict[str, SessionRecord], bindings: dict[str, str], threads: dict) -> tuple[str, bool]:
+    """Attribute a native session to its app root, or its native session root."""
+    path: list[str] = []
+    current = session_key
+    while current in sessions and current not in path:
+        path.append(current)
+        if current in bindings:
+            thread_id = bindings[current]
+            thread_path: list[str] = []
+            while thread_id in threads and thread_id not in thread_path:
+                thread_path.append(thread_id)
+                thread = threads[thread_id]
+                parent = thread["root_thread_id"] or thread["parent_thread_id"]
+                if not parent or parent == thread_id:
+                    break
+                thread_id = parent
+            else:
+                if thread_id in thread_path:
+                    thread_id = min(thread_path[thread_path.index(thread_id):])
+            return thread_id, current != session_key or thread_id != bindings[current]
+        parent = sessions[current].parent_session_key
+        if not parent or parent not in sessions:
+            break
+        current = parent
+    else:
+        if current in path:
+            current = min(path[path.index(current):])
+    return f"session:{current}", current != session_key
+
+
 def session_rows(store: TelemetryStore, limit: int = 50) -> list[dict]:
-    """Return top-level sessions sorted by last_ts descending with descendant metrics rolled up."""
-    with store.lock:
-        sessions_rows = store.conn.execute("""
-            SELECT session_key, provider, native_id, parent_session_key, title, cwd, model, origin_hint, first_ts, last_ts
-            FROM sessions
-        """).fetchall()
+    """Group native sessions by their root app thread or native session."""
+    from .providers import family_label, provider_key
+    from .usage import PROVIDER_ORDER
 
-        bindings_rows = store.conn.execute("SELECT session_key, thread_id FROM t3_bindings").fetchall()
-        bindings = {r[0]: r[1] for r in bindings_rows}
+    sessions = store.sessions_by_key()
+    bindings, threads = store.bindings(), store.t3_threads()
+    groups: dict[str, list[str]] = defaultdict(list)
+    for key in sessions:
+        row_id, _ = attribute_session(key, sessions, bindings, threads)
+        groups[row_id].append(key)
 
-        threads_rows = store.conn.execute("SELECT thread_id, title FROM t3_threads").fetchall()
-        threads = {r[0]: r[1] for r in threads_rows}
-
-        steps_rows = store.conn.execute("""
-            SELECT session_key,
-                   model,
-                   input_tokens,
-                   cache_read_tokens,
-                   cache_creation_tokens,
-                   output_tokens,
-                   thinking_tokens
-            FROM steps
-        """).fetchall()
-
-    all_sessions = {r["session_key"]: dict(r) for r in sessions_rows}
-
-    # Map each parent session key to list of its child session keys
-    children_map: dict[str, list[str]] = defaultdict(list)
-    for s_key, s in all_sessions.items():
-        p = s.get("parent_session_key")
-        if p:
-            children_map[p].append(s_key)
-
-    # Step token aggregates and models
-    step_tokens: dict[str, dict[str, int]] = defaultdict(lambda: {
-        "input_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_creation_tokens": 0,
-        "output_tokens": 0,
-        "thinking_tokens": 0,
-    })
+    token_names = ("input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens", "thinking_tokens")
+    totals: dict[str, dict[str, int]] = defaultdict(lambda: {name: 0 for name in token_names})
     step_models: dict[str, str] = {}
-    for r in steps_rows:
-        s_key = r["session_key"]
-        st = step_tokens[s_key]
-        st["input_tokens"] += r["input_tokens"]
-        st["cache_read_tokens"] += r["cache_read_tokens"]
-        st["cache_creation_tokens"] += r["cache_creation_tokens"]
-        st["output_tokens"] += r["output_tokens"]
-        st["thinking_tokens"] += r["thinking_tokens"]
-        if not step_models.get(s_key) and r["model"]:
-            step_models[s_key] = r["model"]
-
-    # Filter top-level sessions: no parent_session_key
-    top_level = [s for s in all_sessions.values() if not s.get("parent_session_key")]
-
-    # Sort by last_ts descending, then session_key
-    top_level.sort(
-        key=lambda s: (s.get("last_ts") is not None, s.get("last_ts") or "", s.get("session_key") or ""),
-        reverse=True,
-    )
-    if limit is not None and limit > 0:
-        top_level = top_level[:limit]
+    for step in store.all_steps():
+        key = step["session_key"]
+        for name in token_names:
+            totals[key][name] += step[name]
+        if step["model"]:
+            step_models.setdefault(key, step["model"])
 
     rows = []
-    for s in top_level:
-        root_key = s["session_key"]
-
-        # Collect all reachable descendants, guarding against cycles
-        descendants: list[str] = []
-        visited = {root_key}
-        queue = deque(children_map.get(root_key, []))
-        while queue:
-            child_key = queue.popleft()
-            if child_key not in visited:
-                visited.add(child_key)
-                descendants.append(child_key)
-                for next_child in children_map.get(child_key, []):
-                    if next_child not in visited:
-                        queue.append(next_child)
-
-        session_keys = [root_key] + descendants
-
-        # Tokens rollup
-        input_tokens = sum(step_tokens[k]["input_tokens"] for k in session_keys)
-        cache_read_tokens = sum(step_tokens[k]["cache_read_tokens"] for k in session_keys)
-        cache_creation_tokens = sum(step_tokens[k]["cache_creation_tokens"] for k in session_keys)
-        output_tokens = sum(step_tokens[k]["output_tokens"] for k in session_keys)
-        thinking_tokens = sum(step_tokens[k]["thinking_tokens"] for k in session_keys)
-        total_tokens = input_tokens + cache_read_tokens + cache_creation_tokens + output_tokens
-
-        # Origin & Thread binding
-        thread_id = bindings.get(root_key)
-        if thread_id is not None:
-            origin = "T3"
-            thread_title = threads.get(thread_id)
-            title = thread_title if (thread_title is not None and thread_title != "") else thread_id
+    for row_id, keys in groups.items():
+        is_thread = not row_id.startswith("session:")
+        if is_thread:
+            root_keys = [k for k in keys if bindings.get(k) == row_id]
+            root_key = (root_keys or [k for k in keys if k in bindings] or keys)[0]
+            thread = threads.get(row_id)
+            title = (thread["title"] if thread else None) or row_id
+            origin, thread_id = "T3", row_id
+            child_threads = {bindings[k] for k in keys if k in bindings and bindings[k] != row_id}
+            native_children = {k for k in keys if k not in bindings and sessions[k].parent_session_key}
+            subagents = len(child_threads) + len(native_children)
         else:
-            origin = s.get("origin_hint") or "unknown"
-            cwd = s.get("cwd")
-            cwd_name = Path(cwd).name if cwd else ""
-            provider = s.get("provider") or ""
-            fallback = f"{cwd_name} · {provider}" if cwd_name else root_key
-            title = s.get("title") or fallback
-
-        model = s.get("model")
-        if not model:
-            for k in session_keys:
-                if step_models.get(k):
-                    model = step_models[k]
-                    break
-
-        last_active = s.get("last_ts")
-
+            root_key = row_id[len("session:"):]
+            root = sessions[root_key]
+            title = root.title or (f"{Path(root.cwd).name} · {root.provider}" if root.cwd else root_key)
+            origin = {"t3": "T3", "cli": "CLI", "sdk": "SDK"}.get(root.origin_hint, "unknown")
+            thread_id = None
+            subagents = len(keys) - 1
+        root = sessions[root_key]
+        labels = {family_label(provider_key(sessions[k].provider)) for k in keys}
+        counts = {name: sum(totals[k][name] for k in keys) for name in token_names}
+        last_active = max((sessions[k].last_ts for k in keys if sessions[k].last_ts), default=None)
         rows.append({
-            "session_key": root_key,
-            "thread_id": thread_id,
-            "origin": origin,
-            "provider": s.get("provider") or "",
-            "title": title,
-            "model": model,
-            "last_active": last_active,
-            "last_ts": last_active,
-            "subagents": len(descendants),
-            "tokens": total_tokens,
-            "input_tokens": input_tokens,
-            "cache_read_tokens": cache_read_tokens,
-            "cache_creation_tokens": cache_creation_tokens,
-            "output_tokens": output_tokens,
-            "thinking_tokens": thinking_tokens,
+            "session_key": root_key, "thread_id": thread_id, "origin": origin,
+            "provider": ", ".join(label for label in PROVIDER_ORDER if label in labels),
+            "title": title, "model": root.model or step_models.get(root_key),
+            "last_active": last_active, "last_ts": last_active, "subagents": subagents,
+            "tokens": sum(counts[name] for name in token_names[:4]), **counts,
         })
-
-    return rows
+    rows.sort(key=lambda row: (row["last_active"] is not None, row["last_active"] or "", row["session_key"]), reverse=True)
+    return rows[:limit] if limit is not None and limit > 0 else rows

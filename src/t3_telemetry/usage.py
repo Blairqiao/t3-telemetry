@@ -15,7 +15,7 @@ from datetime import datetime, time, timedelta, timezone
 from .models import ModelStep, ThreadTelemetryNode
 from .prices import CostBreakdown, model_key, step_cost
 from .providers import family_label, provider_key
-from .store import TelemetryStore, utc_iso
+from .store import TelemetryStore, attribute_session, utc_iso
 
 PERIODS = ("today", "week", "month")
 PERIOD_LABELS = {"today": "Today", "week": "This week", "month": "This month"}
@@ -349,40 +349,6 @@ def build_store_usage_report(store: TelemetryStore, now: datetime,
     bindings, threads = store.bindings(), store.t3_threads()
     statuses = statuses or {}
 
-    def attribution(session_key: str) -> tuple[str, str, str, bool]:
-        # A cycle has no top; choose a stable member so all its steps group together.
-        path = []
-        current = session_key
-        while current in sessions and current not in path:
-            path.append(current)
-            parent = sessions[current].parent_session_key
-            if not parent or parent not in sessions:
-                break
-            current = parent
-        else:
-            if current in path:
-                current = min(path[path.index(current):])
-        session = sessions[current]
-        if current in bindings:
-            thread_id = bindings[current]
-            visited = set()
-            while thread_id in threads and thread_id not in visited:
-                visited.add(thread_id)
-                thread = threads[thread_id]
-                parent = thread["root_thread_id"] or thread["parent_thread_id"]
-                if not parent or parent == thread_id:
-                    break
-                thread_id = parent
-            if thread_id in visited and len(visited) > 1 and threads.get(thread_id) is not None:
-                # A cycle in the mirrored graph must not hang the report.
-                parent = threads[thread_id]["root_thread_id"] or threads[thread_id]["parent_thread_id"]
-                if parent in visited and parent != thread_id:
-                    thread_id = min(visited)
-            thread = threads.get(thread_id)
-            return thread_id, (thread["title"] if thread and thread["title"] else thread_id), statuses.get(thread_id, "idle"), current != session_key or thread_id != bindings[current]
-        title = session.title or (f"{Path(session.cwd).name} · {session.provider}" if session.cwd else current)
-        return f"session:{current}", title, "idle", current != session_key
-
     rows = {key: {} for key in PERIODS}
     all_time: dict[str, tuple[ThreadUsage, set[str]]] = {}
     start = min(w.start.astimezone(timezone.utc) for w in windows.values())
@@ -391,7 +357,16 @@ def build_store_usage_report(store: TelemetryStore, now: datetime,
     for step in period_steps:
         t = datetime.fromisoformat(step["ts"].replace("Z", "+00:00")).astimezone(timezone.utc)
         family = provider_family(step["provider"])
-        row_id, title, status, is_subagent = attribution(step["session_key"])
+        row_id, is_subagent = attribute_session(step["session_key"], sessions, bindings, threads)
+        if row_id.startswith("session:"):
+            root_key = row_id[len("session:"):]
+            session = sessions[root_key]
+            title = session.title or (f"{Path(session.cwd).name} · {session.provider}" if session.cwd else root_key)
+            status = "idle"
+        else:
+            thread = threads.get(row_id)
+            title = (thread["title"] if thread else None) or row_id
+            status = statuses.get(row_id, "idle")
         counts = tuple(step[name] for name in ("input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens"))
         model = step["model"] or sessions[step["session_key"]].model if step["session_key"] in sessions else step["model"]
         cost = step_cost(model, t, *counts)

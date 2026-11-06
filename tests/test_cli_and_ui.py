@@ -1790,7 +1790,7 @@ def test_build_sessions_table():
     assert table.title == "Recent Sessions"
     assert len(table.columns) == 7
     col_names = [str(col.header) for col in table.columns]
-    assert col_names == ["Origin", "Provider", "Title", "Model", "Last active", "Subagents", "Tokens"]
+    assert col_names == ["Origin", "Providers", "Title", "Model", "Last active", "Subagents", "Tokens"]
 
     console = Console(file=io.StringIO(), color_system="truecolor", width=120)
     console.print(table)
@@ -1834,7 +1834,7 @@ def test_cli_sessions_table_and_json(tmp_path, monkeypatch, capsys):
     assert "Bound" in out
     assert "repo" in out
     assert "T3" in out
-    assert "cli" in out
+    assert "CLI" in out
 
     # 2. Test JSON mode (--sessions --json)
     rc_json = main(["--sessions", "--json", "--store", str(db_path), "--t3-dir", str(tmp_path)])
@@ -1846,7 +1846,7 @@ def test_cli_sessions_table_and_json(tmp_path, monkeypatch, capsys):
     assert len(parsed) == 2
     # Most recent first: codex:free (2026-11-05), then claude:main (2026-11-04)
     assert parsed[0]["session_key"] == "codex:free"
-    assert parsed[0]["origin"] == "cli"
+    assert parsed[0]["origin"] == "CLI"
     assert parsed[0]["tokens"] == 1000
 
     assert parsed[1]["session_key"] == "claude:main"
@@ -1911,3 +1911,23 @@ def test_provider_lines_mixed_and_single():
     assert lines[0].cell_len == 40
     assert "Claude" in lines[1].plain and "Codex" in lines[1].plain
     assert "$" in provider_lines(stats, "usd", 80)[1].plain
+
+
+def test_syncing_scope_and_activity_placeholders():
+    from unittest.mock import MagicMock
+    from t3_telemetry.ui import activity_tokens_cell, build_scopes_summary
+
+    node = MagicMock()
+    node.status = "idle"
+    node.store_state = "syncing"
+    node.turn_metrics_availability = "unavailable"
+    node.latest_step_label = None
+    node.self_metrics.steps_display = "0 steps"
+    node.self_metrics.total_tokens = 0
+    node.self_metrics.duration_seconds = 0
+    node.rollup_metrics.steps_display = "0 steps"
+    node.rollup_metrics.total_tokens = 0
+    node.rollup_metrics.duration_seconds = 0
+    node.rollup_metrics.total_subagents = 0
+    assert all("syncing…" in line.plain for line in build_scopes_summary(node))
+    assert activity_tokens_cell(MagicMock(), syncing=True) == "syncing…"
