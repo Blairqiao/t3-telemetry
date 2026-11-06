@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from math import floor
 import textwrap
 from typing import Any
 
@@ -15,9 +16,11 @@ from rich.table import Table
 from rich.text import Text
 
 from t3_telemetry.activity import DETAIL_FIELD_LABELS, TOOL_VERBS, ActivityEntry, build_activity_entries, describe_tool, neutralize
+from t3_telemetry.insights import Kpi, _usd as format_usd, headline, kind_values, kpis, share_label
 from t3_telemetry.models import ModelStep, ThreadTelemetryNode, ToolCallDetail, TurnItem
+from t3_telemetry.prices import KINDS
 from t3_telemetry.tui import window_start
-from t3_telemetry.usage import PROVIDER_ORDER, PeriodUsage
+from t3_telemetry.usage import PROVIDER_ORDER, SCOPE_ORDER, PeriodUsage, UsageStats, node_cost, step_usd, turn_cost
 
 
 # Focused selection: bright text on a solid background; the ▶ marker carries it without color.
@@ -48,6 +51,13 @@ def format_tokens(value: int | float | None) -> str:
     if value < 1_000_000:
         return f"{value / 1000:.1f}k"
     return f"{value / 1_000_000:.2f}M"
+
+
+def format_measure(value: int | float | None, measure: str) -> str:
+    """Token count or estimated dollars, following the active $ toggle."""
+    if measure == "usd":
+        return format_usd(value or 0.0)
+    return format_tokens(value)
 
 
 def format_duration(seconds: float | None) -> str:
@@ -279,11 +289,24 @@ def nice_ceiling(value: float) -> int:
     if value <= 0:
         return 1000
     magnitude = 1
+    while magnitude / 10 >= value and magnitude > 0.01:
+        magnitude /= 10
     while True:
         for step in (1, 2, 5):
             if step * magnitude >= value:
                 return step * magnitude
         magnitude *= 10
+
+
+def format_axis_usd(value: float) -> str:
+    """Short dollar axis label such as $0, $0.5, $20, $1.5k."""
+    if value >= 1000:
+        return f"${value / 1000:g}k"
+    return f"${value:g}"
+
+
+def format_axis(value: float, measure: str) -> str:
+    return format_axis_usd(value) if measure == "usd" else format_axis_tokens(value)
 
 
 def format_axis_tokens(value: float) -> str:
@@ -295,8 +318,205 @@ def format_axis_tokens(value: float) -> str:
     return f"{value:g}"
 
 
-PROVIDER_STYLES = {"Claude": "dark_orange", "Codex": "green3", "Antigravity": "medium_purple1", "Other": "grey62"}
+# Chart colors: categorical hues validated on a dark terminal surface (lightness band,
+# chroma floor, colorblind separation). Glyph textures stay as a second cue.
+CHART_BLUE = "#3987e5"
+CHART_ORANGE = "#d95926"
+CHART_AQUA = "#199e70"
+CHART_YELLOW = "#c98500"
+CHART_MAGENTA = "#d55181"
+CHART_VIOLET = "#9085e9"
+CHART_NEUTRAL = "#8a8a85"
+
+PROVIDER_STYLES = {"Claude": CHART_ORANGE, "Codex": CHART_AQUA, "Antigravity": CHART_VIOLET, "Other": CHART_NEUTRAL}
+
+KIND_LABELS = {"cache_read": "Cache read", "cache_write": "Cache write", "output": "Output", "input": "Input"}
+KIND_STYLES = {"cache_read": CHART_BLUE, "cache_write": CHART_ORANGE, "output": CHART_AQUA, "input": CHART_YELLOW}
+KIND_GLYPHS = {"cache_read": "█", "cache_write": "▓", "output": "▒", "input": "░"}
+KIND_MEANINGS = {
+    "cache_read": "context re-read from cache",
+    "cache_write": "new context written to cache",
+    "output": "what the model wrote, incl. thinking",
+    "input": "uncached input",
+}
+
+
+def allocate_cells(values: dict[str, float], width: int, order: Sequence[str]) -> dict[str, int]:
+    """Allocate bar cells by largest remainder, preserving small positive segments when possible."""
+    cells = dict.fromkeys(order, 0)
+    total = sum(values.get(key, 0) for key in order)
+    if width <= 0 or total <= 0:
+        return cells
+    exact = {key: values.get(key, 0) / total * width for key in order}
+    cells = {key: floor(exact[key]) for key in order}
+    ranked = sorted(order, key=lambda key: exact[key] - cells[key], reverse=True)
+    for key in ranked[:width - sum(cells.values())]:
+        cells[key] += 1
+    for key in order:
+        if values.get(key, 0) > 0 and cells[key] == 0:
+            donor = max(order, key=lambda other: cells[other])
+            if cells[donor] >= 2:
+                cells[donor] -= 1
+                cells[key] += 1
+    return cells
+
+
+def kind_bar_line(values: dict[str, float], width: int) -> Text:
+    if sum(values.get(key, 0) for key in KINDS) <= 0:
+        return Text("░" * width, style="dim")
+    cells = allocate_cells(values, width, KINDS)
+    line = Text()
+    for key in KINDS:
+        line.append(KIND_GLYPHS[key] * cells[key], style=KIND_STYLES[key])
+    return line
+
+
+def kind_legend_lines(stats: UsageStats, measure: str, width: int, detailed: bool) -> list[Text]:
+    """Legend for token breakdown by kind in compact or detailed format."""
+    if detailed and width < 88:
+        detailed = False
+    values = kind_values(stats, measure)
+    total = sum(values.values())
+
+    if detailed:
+        cw = width // 4
+        if cw <= 0:
+            return []
+        line1 = Text()
+        line2 = Text()
+        for kind in KINDS:
+            v = values.get(kind, 0.0)
+            amount = format_usd(v) if measure == "usd" else format_tokens(v)
+            pct = share_label(v, total)
+            label = KIND_LABELS[kind]
+            meaning = KIND_MEANINGS[kind]
+
+            cell1 = Text()
+            cell1.append("■", style=f"bold {KIND_STYLES[kind]}")
+            cell1.append(f" {label} {pct}", style="bold")
+            if cell1.cell_len > cw - 1:
+                cell1.truncate(cw - 1, overflow="ellipsis")
+            if cell1.cell_len < cw:
+                cell1.append(" " * (cw - cell1.cell_len))
+
+            cell2 = Text(f"  {amount} · {meaning}", style="dim")
+            if cell2.cell_len > cw - 1:
+                cell2.truncate(cw - 1, overflow="ellipsis")
+            if cell2.cell_len < cw:
+                cell2.append(" " * (cw - cell2.cell_len))
+
+            line1.append_text(cell1)
+            line2.append_text(cell2)
+
+        line1.no_wrap = True
+        line2.no_wrap = True
+        line1.truncate(width, overflow="ellipsis")
+        line2.truncate(width, overflow="ellipsis")
+        return [line1, line2]
+
+    # Compact
+    items: list[Text] = []
+    for kind in KINDS:
+        v = values.get(kind, 0.0)
+        if v == 0:
+            continue
+        amount = format_usd(v) if measure == "usd" else format_tokens(v)
+        pct = share_label(v, total)
+        label = KIND_LABELS[kind]
+        item = Text()
+        item.append("■", style=KIND_STYLES[kind])
+        item.append(f" {label} {pct} {amount}")
+        items.append(item)
+
+    if not items:
+        return []
+
+    lines: list[Text] = []
+    line = Text()
+    for item in items:
+        if line.plain and line.cell_len + 3 + item.cell_len > width:
+            lines.append(line)
+            line = Text()
+        if line.plain:
+            line.append("   ")
+        line.append_text(item)
+    if line.plain:
+        lines.append(line)
+
+    for l in lines:
+        l.no_wrap = True
+        l.truncate(width, overflow="ellipsis")
+    return lines
+
+
+def kpi_lines(items: list[Kpi], width: int) -> list[Text]:
+    """KPI values and labels padded to column width, dropping items when narrow."""
+    if not items or width <= 0:
+        return []
+    kept = list(items)
+    while len(kept) > 1 and (width // len(kept)) < 14:
+        kept.pop()
+    n = len(kept)
+    cw = width // n
+
+    line1 = Text()
+    line2 = Text()
+    for item in kept:
+        val_text = Text(item.value, style="bold")
+        if val_text.cell_len > cw:
+            val_text.truncate(cw, overflow="ellipsis")
+        if val_text.cell_len < cw:
+            val_text.append(" " * (cw - val_text.cell_len))
+        line1.append_text(val_text)
+
+        lbl_text = Text(item.label, style="dim")
+        target_w = max(1, cw - 1) if cw > 1 else cw
+        if lbl_text.cell_len > target_w:
+            lbl_text.truncate(target_w, overflow="ellipsis")
+        if lbl_text.cell_len < cw:
+            lbl_text.append(" " * (cw - lbl_text.cell_len))
+        line2.append_text(lbl_text)
+
+    line1.no_wrap = True
+    line2.no_wrap = True
+    line1.truncate(width, overflow="ellipsis")
+    line2.truncate(width, overflow="ellipsis")
+    return [line1, line2]
+
+
+def breakdown_lines(
+    stats: UsageStats,
+    measure: str,
+    width: int,
+    scope: str,
+    *,
+    headline_on: bool = True,
+    legend: str = "compact",
+    kpis_on: bool = False,
+) -> list[Text]:
+    """Render headline, stacked kind bar, legend, and KPI tiles."""
+    lines: list[Text] = []
+    if headline_on:
+        hl = Text(headline(stats, measure, scope), style="bold")
+        hl.no_wrap = True
+        hl.truncate(width, overflow="ellipsis")
+        lines.append(hl)
+
+    lines.append(kind_bar_line(kind_values(stats, measure), width))
+
+    if legend in ("detailed", "compact"):
+        detailed = (legend == "detailed") and (width >= 88)
+        lines.extend(kind_legend_lines(stats, measure, width, detailed=detailed))
+
+    if kpis_on:
+        lines.extend(kpi_lines(kpis(stats, measure), width))
+
+    return lines
+
+
 PROVIDER_GLYPHS = {"Claude": "█", "Codex": "▓", "Antigravity": "▒", "Other": "░"}
+SCOPE_STYLES = {"Main": CHART_BLUE, "Subagents": CHART_MAGENTA}
+SCOPE_GLYPHS = {"Main": "█", "Subagents": "▓"}
 
 
 def merge_buckets(buckets: list[dict[str, int]], starts: list[datetime], max_columns: int) -> list[tuple[datetime, dict[str, int]]]:
@@ -314,45 +534,75 @@ def merge_buckets(buckets: list[dict[str, int]], starts: list[datetime], max_col
     return result
 
 
-def stack_column(values: dict[str, int], ceiling: int, rows: int) -> list[str | None]:
+def stack_column(
+    values: dict[str, int], ceiling: int, rows: int, order: Sequence[str] = PROVIDER_ORDER
+) -> list[str | None]:
     """Assign each row, bottom first, to the provider covering its midpoint."""
     result: list[str | None] = [None] * rows
     if ceiling <= 0 or rows <= 0:
         return result
     low = 0.0
-    for provider in PROVIDER_ORDER:
+    for provider in order:
         high = low + values.get(provider, 0) / ceiling * rows
         for row in range(rows):
             if low <= row + 0.5 < high:
                 result[row] = provider
         low = high
     if values and sum(values.values()) > 0 and not any(result):
-        result[0] = max(PROVIDER_ORDER, key=lambda provider: values.get(provider, 0))
+        result[0] = max(order, key=lambda provider: values.get(provider, 0))
     return result
 
 
-def usage_graph_lines(period: PeriodUsage, width: int, plot_rows: int, now: datetime) -> list[Text]:
+def usage_graph_lines(
+    period: PeriodUsage, width: int, plot_rows: int, now: datetime, split: str = "provider",
+    measure: str = "tokens",
+) -> list[Text]:
     """Render a legend, stacked usage plot, and time labels."""
     legend = Text()
-    for provider in PROVIDER_ORDER:
-        if provider in period.by_provider:
-            if legend:
-                legend.append("   ")
-            legend.append("■", style=PROVIDER_STYLES[provider])
-            legend.append(f" {provider} ({PROVIDER_GLYPHS[provider]}) {format_tokens(period.by_provider[provider].total)}")
+    if split == "scope":
+        order = SCOPE_ORDER
+        buckets = period.series("scope", measure)
+        styles = SCOPE_STYLES
+        glyphs = SCOPE_GLYPHS
+        if measure == "usd":
+            totals = {"Main": period.stats.cost.total - period.stats.subagent_cost.total, "Subagents": period.stats.subagent_cost.total}
+        else:
+            totals = {
+                "Main": period.stats.tokens.total - period.stats.subagent_tokens.total,
+                "Subagents": period.stats.subagent_tokens.total,
+            }
+        for item in order:
+            total = totals.get(item, 0)
+            if total > 0:
+                if legend:
+                    legend.append("   ")
+                legend.append("■", style=styles[item])
+                legend.append(f" {item} ({glyphs[item]}) {format_measure(total, measure)}")
+    else:
+        order = PROVIDER_ORDER
+        buckets = period.series("provider", measure)
+        styles = PROVIDER_STYLES
+        glyphs = PROVIDER_GLYPHS
+        for provider in PROVIDER_ORDER:
+            if provider in period.by_provider:
+                if legend:
+                    legend.append("   ")
+                legend.append("■", style=styles[provider])
+                value = period.cost_by_provider[provider].total if measure == "usd" and provider in period.cost_by_provider else period.by_provider[provider].total
+                legend.append(f" {provider} ({glyphs[provider]}) {format_measure(value, measure)}")
     if not legend:
         legend.append("No usage recorded")
     legend.truncate(width, overflow="ellipsis")
-    merged = merge_buckets(period.buckets, period.window.bucket_starts, max(1, (width - 6) // 2))
+    merged = merge_buckets(buckets, period.window.bucket_starts, max(1, (width - 6) // 2))
     ceiling = nice_ceiling(max((sum(values.values()) for _, values in merged), default=0))
     n = len(merged)
     bar_w = min(3, max(1, (width - 6) // n - 1)) if n else 1
-    columns = [stack_column(values, ceiling, plot_rows) for _, values in merged]
+    columns = [stack_column(values, ceiling, plot_rows, order=order) for _, values in merged]
     lines = [legend]
     for row in range(plot_rows - 1, -1, -1):
-        labels = {0: "0", plot_rows - 1: format_axis_tokens(ceiling)}
+        labels = {0: format_axis(0, measure), plot_rows - 1: format_axis(ceiling, measure)}
         if plot_rows >= 5:
-            labels[plot_rows // 2] = format_axis_tokens(ceiling / 2)
+            labels[plot_rows // 2] = format_axis(ceiling / 2, measure)
         label = labels.get(row)
         line = Text((label or "")[-5:].rjust(5), style="bold")
         line.append("┤" if label is not None else "│", style="bold")
@@ -361,7 +611,7 @@ def usage_graph_lines(period: PeriodUsage, width: int, plot_rows: int, now: date
             if start >= now:
                 line.append("·" * bar_w if row == 0 else " " * bar_w, style="dim")
             elif provider:
-                line.append(PROVIDER_GLYPHS[provider] * bar_w, style=PROVIDER_STYLES[provider])
+                line.append(glyphs[provider] * bar_w, style=styles[provider])
             else:
                 line.append(" " * bar_w)
             line.append(" ")
@@ -443,7 +693,7 @@ def _bar_cell(bucket: ContextBucket, row: int, rows: int, ceiling: int) -> tuple
     """
     cell = ceiling / rows
     y_low = row * cell
-    style = "cyan" if bucket.latest_provenance == "measured" else "yellow"
+    style = CHART_BLUE if bucket.latest_provenance == "measured" else CHART_YELLOW
     latest = bucket.latest
     if latest > y_low:
         if latest >= y_low + cell:
@@ -769,10 +1019,17 @@ def activity_range_label(start: int, shown: int, total: int) -> str:
     return f"{start + 1}–{start + shown} of {total}"
 
 
-def activity_tokens_cell(entry: ActivityEntry) -> str:
+def activity_tokens_cell(entry: ActivityEntry, measure: str = "tokens", model: str | None = None) -> str:
     if entry.total_tokens is None:
         return "—"
     approx = entry.usage_provenance == "cumulative_fallback" or entry.usage_status == "partial"
+    if measure == "usd":
+        if entry.detail is None:
+            return "—"
+        cost = step_usd(model, entry.detail)
+        if cost.total <= 0 and cost.unpriced_tokens:
+            return "unpriced"
+        return format_usd(cost.total) + ("~" if approx else "")
     return format_tokens(entry.total_tokens) + ("~" if approx else "")
 
 
@@ -786,6 +1043,8 @@ def build_activity_table(
     title: str | None = None,
     box_style: box.Box = box.SIMPLE_HEAD,
     range_label: str | None = None,
+    measure: str = "tokens",
+    model: str | None = None,
 ) -> Table:
     """Compact activity feed: descriptive title, total tokens, duration.
 
@@ -799,11 +1058,11 @@ def build_activity_table(
         table = Table(title=title, box=box_style, expand=True, show_header=show_header)
     header = "" if interactive else "Activity"
     table.add_column(header, ratio=1, no_wrap=True, overflow="ellipsis")
-    table.add_column("Tokens", justify="right", no_wrap=True)
+    table.add_column("Cost" if measure == "usd" else "Tokens", justify="right", no_wrap=True)
     table.add_column("Time", justify="right", no_wrap=True)
     for entry in entries:
         duration = "—" if entry.is_launch else format_duration(entry.duration_seconds)
-        cells: list[Any] = [Text(entry.title), activity_tokens_cell(entry), duration]
+        cells: list[Any] = [Text(entry.title), activity_tokens_cell(entry, measure, model), duration]
         if interactive:
             is_sel = entry.entry_id == selected_id
             highlighted = is_sel and focused
@@ -1134,8 +1393,8 @@ def build_activity_detail_lines(
         bar_width = max(10, min(40, width - 36))
         read_width = round(bar_width * step.cache_read_tokens / total_input) if total_input else 0
         bar = Text(f"{' Input':<20} {total_input:>10,}  ")
-        bar.append("█" * read_width, style="cyan")
-        bar.append("█" * (bar_width - read_width), style="yellow")
+        bar.append("█" * read_width, style=KIND_STYLES["cache_read"])
+        bar.append("█" * (bar_width - read_width), style=KIND_STYLES["input"])
         lines.append(bar)
         read_pct = f"{step.cache_read_tokens / total_input * 100:.1f}%" if total_input else "—"
         new_pct = f"{new_input / total_input * 100:.1f}%" if total_input else "—"
@@ -1143,7 +1402,15 @@ def build_activity_detail_lines(
         breakdown = f"uncached {step.input_tokens:,}" if step.activity_kind == "model_step" else f"cache write {step.cache_creation_tokens:,} + uncached {step.input_tokens:,}"
         lines.append(Text(f"{'   └ new this turn':<20} {new_input:>10,}  {new_pct:>6}   {breakdown}"))
         lines.append(Text(f"{' Output':<20} {step.output_tokens:>10,}  thinking {step.thinking_tokens:,} · response {step.response_tokens:,}"))
-        lines.append(Text(f"{' Total':<20} {step.total_tokens:>10,}"))
+        total_line = Text(f"{' Total':<20} {step.total_tokens:>10,}")
+        cost = step_usd(node.model if node is not None else None, step)
+        if cost.total > 0:
+            total_line.append("  est. ")
+            total_line.append(format_usd(cost.total), style="bold")
+            total_line.append(" at API list prices", style="dim")
+        elif cost.unpriced_tokens:
+            total_line.append("  cost unpriced (no list price for this model)", style="dim")
+        lines.append(total_line)
         if step.context_used_tokens is not None:
             context = Text(" Context at end  ")
             context.append_text(Text.from_markup(render_context_bar(step.context_used_tokens, step.context_max_tokens, width=20)))
@@ -1229,7 +1496,7 @@ def _launch_detail_lines(entry: ActivityEntry, node: ThreadTelemetryNode | None,
     return lines
 
 
-def build_scopes_summary(node: ThreadTelemetryNode, width: int = 80) -> list[Text]:
+def build_scopes_summary(node: ThreadTelemetryNode, width: int = 80, measure: str = "tokens") -> list[Text]:
     """Build compact scope summary lines for interactive live browser frame."""
     if node.status == "running":
         turn_label = "Current turn (running)"
@@ -1241,17 +1508,29 @@ def build_scopes_summary(node: ThreadTelemetryNode, width: int = 80) -> list[Tex
     turn = node.current_turn_metrics
     avail = node.turn_metrics_availability if node.turn_metrics_availability else (turn.availability if turn else "unavailable")
 
+    usd = measure == "usd"
+
+    def amount(tokens: int, cost) -> str:
+        if not usd:
+            return f"{format_tokens(tokens)} tokens"
+        if cost is None:
+            return "cost n/a"
+        if cost.total <= 0 and cost.unpriced_tokens:
+            return "unpriced"
+        return f"{format_usd(cost.total)} est."
+
+    t_cost = turn_cost(node) if usd else None
     if avail == "available" and turn is not None:
-        turn_val = f"{turn.steps_display}, {format_tokens(turn.total_tokens)} tokens, {format_duration(turn.duration_seconds)}"
+        turn_val = f"{turn.steps_display}, {amount(turn.total_tokens, t_cost)}, {format_duration(turn.duration_seconds)}"
     elif avail == "partial" and turn is not None:
-        turn_val = f"partial ({format_tokens(turn.total_tokens)} tokens, {format_duration(turn.duration_seconds)})"
+        turn_val = f"partial ({amount(turn.total_tokens, t_cost)}, {format_duration(turn.duration_seconds)})"
     else:
         turn_val = f"unavailable ({node.latest_step_label})" if node.latest_step_label else "unavailable"
 
-    self_val = f"{node.self_metrics.steps_display}, {format_tokens(node.self_metrics.total_tokens)} tokens, {format_duration(node.self_metrics.duration_seconds)}"
+    self_val = f"{node.self_metrics.steps_display}, {amount(node.self_metrics.total_tokens, node_cost(node, rollup=False) if usd else None)}, {format_duration(node.self_metrics.duration_seconds)}"
     n_sub = node.rollup_metrics.total_subagents
     rollup_label = f"Chat + subagents (+{n_sub} subs)" if n_sub > 0 else "Chat + subagents"
-    rollup_val = f"{node.rollup_metrics.steps_display}, {format_tokens(node.rollup_metrics.total_tokens)} tokens, {format_duration(node.rollup_metrics.duration_seconds)}"
+    rollup_val = f"{node.rollup_metrics.steps_display}, {amount(node.rollup_metrics.total_tokens, node_cost(node) if usd else None)}, {format_duration(node.rollup_metrics.duration_seconds)}"
 
     scopes = [
         (turn_label, turn_val),
@@ -1376,5 +1655,41 @@ def build_threads_list_table(nodes: list[ThreadTelemetryNode]) -> Table:
             f"{node.rollup_metrics.cache_hit_pct:.1f}%",
             format_tokens(node.rollup_metrics.thinking_tokens),
             format_tokens(node.rollup_metrics.output_tokens),
+        )
+    return table
+
+
+def _format_local_ts(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return value
+
+
+def build_sessions_table(rows: list[dict]) -> Table:
+    """Build Rich table summarizing recent telemetry sessions for --sessions mode."""
+    table = Table(title="Recent Sessions", expand=True, box=box.ROUNDED, padding=(0, 1))
+    table.add_column("Origin", style="bold cyan", min_width=6, no_wrap=True)
+    table.add_column("Provider", no_wrap=True)
+    table.add_column("Title", ratio=2, no_wrap=True, overflow="ellipsis")
+    table.add_column("Model", ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column("Last active", no_wrap=True)
+    table.add_column("Subagents", justify="right")
+    table.add_column("Tokens", justify="right")
+
+    for row in rows:
+        status_style = get_status_style(row.get("status"))
+        title = row.get("title") or ""
+        title_text = Text(title, style=status_style) if status_style else Text(title)
+        table.add_row(
+            str(row.get("origin") or ""),
+            str(row.get("provider") or ""),
+            title_text,
+            str(row.get("model") or ""),
+            _format_local_ts(row.get("last_active")),
+            str(row.get("subagents", 0)),
+            format_tokens(row.get("tokens", 0)),
         )
     return table

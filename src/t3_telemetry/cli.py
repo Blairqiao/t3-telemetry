@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 import time
 from typing import Callable
 
@@ -28,9 +29,12 @@ from t3_telemetry.aggregator import (
     read_t3_state,
     resolve_thread,
     resolve_thread_id_in_snapshot,
+    snapshot_thread_status,
 )
 from datetime import datetime, timezone, timedelta
-from t3_telemetry.usage import UsageCache, UsageReport, PERIOD_LABELS
+from t3_telemetry.usage import UsageCache, UsageReport, PERIOD_LABELS, node_cost, read_store_usage_report, stats_for_node
+from t3_telemetry.collector import Collector, default_roots
+from t3_telemetry.store import TelemetryStore, session_rows
 
 from t3_telemetry.context_history import ContextHistoryStore, make_agent_key
 from t3_telemetry.models import AppThreadRecord, ContextSample, ThreadTelemetryNode
@@ -47,7 +51,9 @@ from t3_telemetry.tui import (
 )
 from t3_telemetry.ui import (
     SELECTED_ROW_STYLE,
+    format_measure,
     usage_graph_lines,
+    breakdown_lines,
     ActionsView,
     build_action_detail_lines,
     section_rule,
@@ -61,6 +67,7 @@ from t3_telemetry.ui import (
     build_scopes_summary,
     build_scopes_table,
     build_threads_list_table,
+    build_sessions_table,
     format_duration,
     render_context_bar,
     format_tokens,
@@ -130,6 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="Max recent steps/turns to display in the stream table.",
     )
+    parser.add_argument("--store", type=Path, default=Path("~/.t3-telemetry/telemetry.sqlite").expanduser(), help="Path to the local telemetry store.")
+    parser.add_argument("--no-store", action="store_true", help="Use T3-only usage reporting.")
+    parser.add_argument("--sync", action="store_true", help="Sync the telemetry store once and exit.")
+    parser.add_argument("--sessions", action="store_true", help="List recent native sessions from the telemetry store and exit.")
     return parser
 
 
@@ -142,6 +153,7 @@ def run_live_loop(
     _live_cls: type[Live] | None = None,
     _history_store: ContextHistoryStore | None = None,
     _usage_cache: UsageCache | None = None,
+    _collector: Collector | None = None,
 ) -> int:
     """Run live watch TUI loop with graceful refresh and error handling."""
     console = console or Console()
@@ -163,7 +175,31 @@ def run_live_loop(
     browser = TelemetryBrowser(adapter, history_store=history_store)
     live_factory = _live_cls or Live
 
-    usage_cache = _usage_cache if _usage_cache is not None else UsageCache(background=True)
+    store = None
+    collector = _collector
+    if not args.no_store and _usage_cache is None:
+        store = TelemetryStore(Path(args.store).expanduser())
+        collector = collector or Collector(store, default_roots(t3_dir))
+        usage_cache = UsageCache(background=True, reader=lambda d, s: read_store_usage_report(store, s))
+    else:
+        usage_cache = _usage_cache if _usage_cache is not None else UsageCache(background=True)
+    sync_worker = None
+    last_sync = None
+
+    def start_sync(snapshot, now):
+        nonlocal sync_worker, last_sync
+        if collector is None or (sync_worker is not None and sync_worker.is_alive()):
+            return
+        if last_sync is not None and now - last_sync < 5:
+            return
+        last_sync = now
+        def run():
+            try:
+                collector.sync(snapshot)
+            except Exception:
+                pass  # Keep worker failures from corrupting the terminal display.
+        sync_worker = threading.Thread(target=run, name="telemetry-sync", daemon=True)
+        sync_worker.start()
     usage = None
     last_period = None
     cached_snapshot = None
@@ -222,6 +258,7 @@ def run_live_loop(
             nav.list_scroll,
             nav.notice,
             nav.home_focus, nav.selected_period, nav.period, nav.selected_top_id, nav.top_scroll,
+            nav.measure, nav.graph_split,
         )
         return (
             roots_sig,
@@ -234,8 +271,8 @@ def run_live_loop(
             int(_clock()) if summary and cached_snapshot and any(t.status == "running" and t.started_at for t in cached_snapshot.provider_turns_by_thread.get(summary.thread_id, [])) else None,
         )
 
-    adapter.begin()
     try:
+        adapter.begin()
         with live_factory(auto_refresh=False, console=console, screen=True, transient=True) as live:
             while True:
                 if _max_iterations is not None and polls >= _max_iterations:
@@ -246,10 +283,17 @@ def run_live_loop(
                     polls += 1
                     try:
                         snapshot = read_t3_state(t3_dir)
-                        usage = usage_cache.get(t3_dir, snapshot, force=polls == 1 or browser.navigation.period != last_period)
+                        start_sync(snapshot, now)
+                        if store is not None and usage_cache.report is None:
+                            # UsageCache normally reads its first report synchronously.
+                            if (usage_cache.built_at is None or
+                                    usage_cache.clock() - usage_cache.built_at >= usage_cache.max_age):
+                                usage_cache._start_worker(t3_dir, snapshot)
+                        else:
+                            usage = usage_cache.get(t3_dir, snapshot, force=polls == 1 or browser.navigation.period != last_period)
                         last_period = browser.navigation.period
                         if usage and browser.navigation.period:
-                            browser.navigation.sync_top([t.thread_id for t in usage.periods[browser.navigation.period].threads[:10]])
+                            browser.navigation.sync_top([t.thread_id for t in usage.periods[browser.navigation.period].top(browser.navigation.measure)])
                         cached_snapshot = snapshot
                         running_ids = running_root_ids(snapshot)
                         tree_node_cache.clear()
@@ -393,7 +437,7 @@ def run_live_loop(
                         break
 
                     if usage and browser.navigation.period:
-                        browser.navigation.sync_top([t.thread_id for t in usage.periods[browser.navigation.period].threads[:10]])
+                        browser.navigation.sync_top([t.thread_id for t in usage.periods[browser.navigation.period].top(browser.navigation.measure)])
                     active_id = browser.navigation.detail_id or browser.navigation.selected_id
                     if active_id and active_id not in tree_node_cache and cached_snapshot and active_id in cached_snapshot.threads:
                         n = build_thread_telemetry(active_id, t3_dir, snapshot=cached_snapshot)
@@ -479,7 +523,17 @@ def run_live_loop(
                         last_size,
                     )
     finally:
-        adapter.end()
+        try:
+            adapter.end()
+        finally:
+            # Bounded joins keep quit fast during a long first sync. Writes are single locked
+            # transactions, so close() lands between them and a late write fails as sqlite3.Error.
+            if sync_worker is not None:
+                sync_worker.join(timeout=1.0)
+            if store is not None:
+                if usage_cache._worker is not None:
+                    usage_cache._worker.join(timeout=1.0)
+                store.close()
     return 0
 
 
@@ -489,6 +543,13 @@ def _context_text(node: ThreadTelemetryNode) -> str:
     if getattr(node, "context_limit_provenance", "") == "measured":
         return f"Context: {format_tokens(node.context_used_tokens)}/{format_tokens(node.context_max_tokens)} ({node.context_pct:.0f}%)"
     return f"Context: {format_tokens(node.context_used_tokens)} / ? (limit unknown)"
+
+
+def _usage_label(row, measure: str) -> str:
+    """A thread's total in the active measure; spend with no list price reads 'unpriced', not $0."""
+    if measure == "usd" and row.cost.total <= 0 and row.cost.unpriced_tokens:
+        return "unpriced"
+    return format_measure(row.value(measure), measure)
 
 
 def _fit(text: Text, width: int) -> Text:
@@ -528,27 +589,28 @@ def _root_strip(summary: ThreadTelemetryNode | None, width: int) -> Text:
 def _footer_line(nav: NavigationState, node: ThreadTelemetryNode | None, width: int) -> Text:
     """The only place key help appears; the keys match the current focus."""
     screen = nav.current_screen
+    money = "$ tokens" if nav.measure == "usd" else "$ cost"
     if nav.detail_id and node and screen is not None:
         if screen.detail_activity_id in screen.activity_targets:
             keys = "E/Enter open subagent  W/S scroll  Esc back  q quit"
         elif screen.detail_activity_id and screen.action_open:
             keys = "W/S scroll  Esc back  q quit"
         elif screen.detail_activity_id and screen.detail_item_count and screen.detail_focus == "actions":
-            keys = "W/S select  E/Enter full text  Tab page  P prompt  Esc back  q quit"
+            keys = f"W/S select  E/Enter full text  Tab page  P prompt  {money}  Esc back  q quit"
         elif screen.detail_activity_id and screen.detail_item_count:
-            keys = "W/S scroll  Tab actions  P prompt  Esc back  q quit"
+            keys = f"W/S scroll  Tab actions  P prompt  {money}  Esc back  q quit"
         elif screen.detail_activity_id:
-            keys = "W/S scroll  P prompt  Esc back  q quit"
+            keys = f"W/S scroll  P prompt  {money}  Esc back  q quit"
         elif node.subagents and screen.focus == "subagents":
-            keys = "Tab activity  W/S move  E/Enter open  Esc back  q quit"
+            keys = f"Tab activity  W/S move  E/Enter open  {money}  Esc back  q quit"
         elif node.subagents:
-            keys = "Tab subagents  W/S move  E/Enter details  Esc back  q quit"
+            keys = f"Tab subagents  W/S move  E/Enter details  {money}  Esc back  q quit"
         else:
-            keys = "W/S move  E/Enter details  Esc back  q quit"
+            keys = f"W/S move  E/Enter details  {money}  Esc back  q quit"
     elif nav.period and not nav.stack:
-        keys = "W/S move  E/Enter open thread  Esc home  q quit"
+        keys = f"W/S move  E/Enter open thread  {money}  G split  Esc home  q quit"
     else:
-        keys = "Tab section  W/S move  E/Enter open  q quit"
+        keys = f"Tab section  W/S move  E/Enter open  {money}  q quit"
     foot = Text()
     if nav.notice:
         foot.append(nav.notice, style="bold yellow")
@@ -568,27 +630,42 @@ def _breadcrumb(nav: NavigationState, width: int) -> str:
     return crumb
 
 
-def _identity_line(node: ThreadTelemetryNode, width: int) -> Text:
-    """Selected agent: title in status color, then textual status, driver and model."""
+def _agent_total(node: ThreadTelemetryNode, measure: str) -> str:
+    """Spend of this agent plus every subagent below it, in the active measure."""
+    if measure == "usd":
+        cost = node_cost(node)
+        return "unpriced" if cost.total <= 0 and cost.unpriced_tokens else format_measure(cost.total, measure)
+    return format_measure(node.rollup_metrics.total_tokens, measure)
+
+
+def _identity_line(node: ThreadTelemetryNode, width: int, measure: str = "tokens") -> Text:
+    """Selected agent: title in status color, then textual status, total spend, driver and model."""
     style = get_status_style(node.status)
     tail = Text()
     tail.append("  ")
     tail.append(node.status.upper(), style=style or "bold")
-    meta = [node.driver, node.model or "unknown"] if width >= 76 else [node.model or "unknown"]
-    tail.append("".join(f"  ·  {m}" for m in meta), style="bold")
     title = Text(f"{node.title} ({node.thread_id[:8]})", style=style or "bold")
+    total = _agent_total(node, measure)
+    unit = (" est." if total.startswith("$") else "") if measure == "usd" else " tokens"
+    total_text = f"  ·  Total {total}{unit}"
+    meta = [node.driver, node.model or "unknown"] if width >= 76 + len(total_text) else [node.model or "unknown"]
+    meta_text = "".join(f"  ·  {m}" for m in meta)
+    # The total is shown only when the title still fits whole (or keeps 24 cells).
+    if width - tail.cell_len - len(meta_text) - len(total_text) >= min(title.cell_len, 24):
+        tail.append(total_text, style="bold")
+    tail.append(meta_text, style="bold")
     _fit(title, max(12, width - tail.cell_len))
     title.append_text(tail)
     return _fit(title, width)
 
 
-def _child_table(node: ThreadTelemetryNode, screen: ScreenState, window: list, show_header: bool, focused: bool, width: int, range_label: str) -> Table:
+def _child_table(node: ThreadTelemetryNode, screen: ScreenState, window: list, show_header: bool, focused: bool, width: int, range_label: str, measure: str = "tokens") -> Table:
     # The section rule above carries the name, range and focus; the header names columns only.
     table = Table(box=None, expand=True, padding=(0, 1), show_header=show_header, pad_edge=False, show_edge=False, header_style="dim")
     table.add_column("", ratio=2, no_wrap=True, overflow="ellipsis")
     table.add_column("Model", ratio=1, no_wrap=True, overflow="ellipsis")
     table.add_column("Steps", justify="right", no_wrap=True)
-    table.add_column("Tokens", justify="right", no_wrap=True)
+    table.add_column("Cost" if measure == "usd" else "Tokens", justify="right", no_wrap=True)
     table.add_column("Time", justify="right", no_wrap=True)
     for child in window:
         is_sel = child.thread_id == screen.selected_child_id
@@ -602,7 +679,7 @@ def _child_table(node: ThreadTelemetryNode, screen: ScreenState, window: list, s
             title,
             child.model or "unknown",
             str(m.step_count),
-            format_tokens(m.total_tokens),
+            _agent_total(child, measure),
             format_duration(m.duration_seconds),
             style=SELECTED_ROW_STYLE if highlighted else "",
         )
@@ -627,8 +704,8 @@ def _overview_body(
     then the lists again until every row is shown.
     Every list row is one line, so the window, selection, and clip agree.
     """
-    identity = _identity_line(node, inner_width)
-    scope_lines = [_fit(line, inner_width) for line in build_scopes_summary(node, width=inner_width)]
+    identity = _identity_line(node, inner_width, nav.measure)
+    scope_lines = [_fit(line, inner_width) for line in build_scopes_summary(node, width=inner_width, measure=nav.measure)]
 
     entry_ids = [e.entry_id for e in entries]
     act_total = len(entries)
@@ -656,9 +733,15 @@ def _overview_body(
 
     # One section rule each for Usage, Context, and every list.
     section_rules = 2 + len(counts)
-    fixed = 1 + len(scope_lines) + section_rules
+    stats = stats_for_node(node)
+    variants = [dict(headline_on=True, legend="compact"), dict(headline_on=False, legend="compact"), dict(headline_on=False, legend="none"), None]
     graph_h = graph_min
-    spare = inner_height - fixed - graph_h - sum(_lines(k) for k in counts)
+    for variant in variants:
+        block = breakdown_lines(stats, nav.measure, inner_width, scope="this chat's", **variant) if variant is not None else []
+        fixed = 1 + len(scope_lines) + section_rules + len(block)
+        spare = inner_height - fixed - graph_h - sum(_lines(k) for k in counts)
+        if spare >= 0:
+            break
     if spare < 0:
         # Below the supported minimum: the graph shrinks before list rows go.
         graph_h = max(1, graph_h + spare)
@@ -695,6 +778,7 @@ def _overview_body(
         identity,
         section_rule("Usage", inner_width),
         *scope_lines,
+        *block,
         section_rule("Context", inner_width),
         graph,
     ]
@@ -705,14 +789,14 @@ def _overview_body(
         start = window_start(len(children), child_sel, screen.child_scroll, rows)
         screen.child_scroll = start
         window = children[start : start + rows]
-        table = _child_table(node, screen, window, header_lines > 0, sub_focus, width, activity_range_label(start, len(window), len(children)))
+        table = _child_table(node, screen, window, header_lines > 0, sub_focus, width, activity_range_label(start, len(window), len(children)), nav.measure)
         body.append(section_rule("Subagents", inner_width, note=activity_range_label(start, len(window), len(children)), focused=sub_focus))
         body.append(Viewport(table, height=lines, width=inner_width))
 
     lines = alloc["activity"]
     if not entries:
         body.append(section_rule("Activity", inner_width, note="0 of 0", focused=not sub_focus))
-        body.append(Viewport(build_activity_table([], interactive=True, focused=not sub_focus, range_label="0 of 0"), height=lines, width=inner_width))
+        body.append(Viewport(build_activity_table([], interactive=True, focused=not sub_focus, range_label="0 of 0", measure=nav.measure), height=lines, width=inner_width))
     else:
         header_lines, rows = table_geometry(lines)
         start = window_start(act_total, act_sel, screen.activity_offset, rows)
@@ -721,13 +805,14 @@ def _overview_body(
         body.append(section_rule("Activity", inner_width, note=activity_range_label(start, len(window), act_total), focused=not sub_focus))
         table = build_activity_table(
             window, selected_id=entry_ids[act_sel], focused=not sub_focus, interactive=True, show_header=header_lines > 0,
-            range_label=activity_range_label(start, len(window), act_total)
+            range_label=activity_range_label(start, len(window), act_total),
+            measure=nav.measure, model=node.model,
         )
         body.append(Viewport(table, height=lines, width=inner_width))
     return body
 
 
-def _action_detail_body(node: ThreadTelemetryNode, screen: ScreenState, lines: list, inner_height: int, inner_width: int) -> list:
+def _action_detail_body(node: ThreadTelemetryNode, screen: ScreenState, lines: list, inner_height: int, inner_width: int, unit: str = "tokens") -> list:
     """Scrollable full text of one 'What it did' item."""
     measuring = Console(width=inner_width, force_terminal=True, color_system=None)
     opts = measuring.options.update(width=inner_width, height=None)
@@ -740,13 +825,13 @@ def _action_detail_body(node: ThreadTelemetryNode, screen: ScreenState, lines: l
     bottom = min(total_lines, screen.action_scroll + view_height)
     note = f"{screen.detail_item + 1} of {screen.detail_item_count} · lines {top}–{bottom} of {total_lines}"
     return [
-        _identity_line(node, inner_width),
+        _identity_line(node, inner_width, unit),
         section_rule("Action detail", inner_width, note=note, focused=True),
         Viewport(group, height=view_height, scroll=screen.action_scroll, width=inner_width),
     ]
 
 
-def _activity_detail_body(node: ThreadTelemetryNode, screen: ScreenState, entry, inner_height: int, inner_width: int) -> list:
+def _activity_detail_body(node: ThreadTelemetryNode, screen: ScreenState, entry, inner_height: int, inner_width: int, unit: str = "tokens") -> list:
     """Scrollable full detail for one activity; shows everything the one-line row elides."""
     measuring = Console(width=inner_width, force_terminal=True, color_system=None)
     opts = measuring.options.update(width=inner_width, height=None)
@@ -788,13 +873,13 @@ def _activity_detail_body(node: ThreadTelemetryNode, screen: ScreenState, entry,
         focused=not actions.focused or not actions.count,
     )
     return [
-        _identity_line(node, inner_width),
+        _identity_line(node, inner_width, unit),
         head,
         Viewport(detail_group, height=view_height, scroll=screen.detail_scroll, width=inner_width),
     ]
 
 
-def _root_list_body(roots: list[AppThreadRecord], nav: NavigationState, inner_height: int, inner_width: int, snapshot, focused: bool) -> Text:
+def _root_list_body(roots: list[AppThreadRecord], nav: NavigationState, inner_height: int, inner_width: int, snapshot, focused: bool, usage=None) -> Text:
     body = Text()
     visible_rows = max(1, inner_height - 1)
     ids = [t.thread_id for t in roots]
@@ -802,21 +887,30 @@ def _root_list_body(roots: list[AppThreadRecord], nav: NavigationState, inner_he
     start = window_start(len(roots), sel_idx, nav.list_scroll, visible_rows)
     nav.list_scroll = start
     shown = len(roots[start : start + visible_rows])
-    body.append_text(section_rule("Chats", inner_width, note=activity_range_label(start, shown, len(roots)), focused=focused))
+    note = activity_range_label(start, shown, len(roots)) + (" · lifetime est. $" if nav.measure == "usd" else " · lifetime tokens")
+    body.append_text(section_rule("Chats", inner_width, note=note, focused=focused))
     body.append("\n")
     if not roots:
         body.append("No app threads found. Waiting for activity.\n", style="italic")
     for root in roots[start : start + visible_rows]:
-        is_selected = root.thread_id == nav.selected_id
+        # Only the focused section shows its selection; the cursor is kept for when focus returns.
+        is_selected = focused and root.thread_id == nav.selected_id
         pt = snapshot.get_provider_thread(root.thread_id) if snapshot else None
         status = pt.status if pt else getattr(root, "status", "idle")
         line = Text()
         line.append("▶ " if is_selected else "  ", style="bold cyan")
         suffix = Text(f"  [{root.model or 'unknown'}]", style="dim")  # optional metadata
+        row = usage.all_time.get(root.thread_id) if usage is not None else None
+        total = Text("  " + (_usage_label(row, nav.measure) if row is not None else ("…" if usage is None else "—")))
         title = Text(root.title or root.thread_id, style="" if is_selected else (get_status_style(status) or "bold"))
-        _fit(title, max(5, inner_width - 2 - suffix.cell_len))
+        room = inner_width - 2 - total.cell_len
+        if room - suffix.cell_len < 12:
+            suffix = Text()
+        _fit(title, max(5, room - suffix.cell_len))
         line.append_text(title)
         line.append_text(suffix)
+        line.append(" " * max(0, inner_width - line.cell_len - total.cell_len))
+        line.append_text(total)
         if is_selected:
             line.stylize(SELECTED_ROW_STYLE)
         body.append_text(_fit(line, inner_width))
@@ -856,7 +950,7 @@ def _home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, 
         elif completed:
             clock = "Last turn " + completed.astimezone(now.tzinfo).strftime("%H:%M")
         if usage:
-            clock += ("  ·  " if clock else "") + "Today " + format_tokens(usage.root_total("today", summary.thread_id))
+            clock += ("  ·  " if clock else "") + "Today " + format_measure(usage.root_total("today", summary.thread_id, nav.measure), nav.measure)
         if clock:
             card.append(Text(clock))
         if summary.steps:
@@ -871,10 +965,10 @@ def _home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, 
         card.append(Text("No active app threads"))
     card = card[:max(1, inner_height - 8)]
     result = [section_rule("Live", inner_width), *(_fit(line, inner_width) for line in card)]
-    result.append(section_rule("Usage", inner_width, focused=nav.home_focus == "usage"))
+    result.append(section_rule("Usage", inner_width, note="est. $" if nav.measure == "usd" else "tokens", focused=nav.home_focus == "usage"))
     for key in ("today", "week", "month"):
         selected = key == nav.selected_period
-        total = format_tokens(usage.periods[key].total.total) if usage else "…"
+        total = format_measure(usage.periods[key].total_value(nav.measure), nav.measure) if usage else "…"
         line = Text(("▶ " if selected else "  ") + PERIOD_LABELS[key].ljust(11))
         if usage:
             window = usage.periods[key].window
@@ -886,8 +980,11 @@ def _home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, 
         if selected and nav.home_focus == "usage":
             line.stylize(SELECTED_ROW_STYLE)
         result.append(_fit(line, inner_width))
-    result.append(_root_list_body(roots, nav, max(1, inner_height - len(result)), inner_width, snapshot, nav.home_focus == "threads"))
+    result.append(_root_list_body(roots, nav, max(1, inner_height - len(result)), inner_width, snapshot, nav.home_focus == "threads", usage))
     return result
+
+
+SCOPE_PHRASE = {"today": "today's", "week": "this week's", "month": "this month's"}
 
 
 def _period_body(usage, nav, inner_height, inner_width, now) -> list:
@@ -899,35 +996,57 @@ def _period_body(usage, nav, inner_height, inner_width, now) -> list:
     date = lambda d: f"{d:%a} {d.day} {d:%b}"
     label = (date(start) if nav.period == "today" else f"{start:%B %Y}" if nav.period == "month" else f"{date(start)} – {date(end)}")
     header = Text(f"{label}  ·  Total ")
-    header.append(format_tokens(p.total.total), style="bold")
-    plot_rows = 4 if inner_height <= 24 else (6 if inner_height <= 34 else 8)
+    header.append(format_measure(p.total_value(nav.measure), nav.measure), style="bold")
+    if nav.measure == "usd":
+        header.append(" est.", style="dim")
+    block = []
+    variants = (
+        dict(headline_on=True, legend="detailed", kpis_on=True),
+        dict(headline_on=True, legend="compact", kpis_on=True),
+        dict(headline_on=True, legend="compact", kpis_on=False),
+        dict(headline_on=False, legend="compact", kpis_on=False),
+        dict(headline_on=False, legend="none", kpis_on=False),
+    )
+    rest_min = 12
+    for variant in variants:
+        lines = breakdown_lines(p.stats, nav.measure, inner_width, scope=SCOPE_PHRASE[nav.period], **variant)
+        if 1 + len(lines) + rest_min <= inner_height:
+            block = [section_rule("Breakdown", inner_width, note="tokens" if nav.measure == "tokens" else "est. $"), *lines]
+            break
+    inner_height_rest = inner_height - len(block)
+    plot_rows = 4 if inner_height_rest <= 24 else (6 if inner_height_rest <= 34 else 8)
     providers = list(p.by_provider.items())
-    graph = usage_graph_lines(p, inner_width, plot_rows, now)
-    if 1 + 1 + len(graph) + 1 + 1 + max(1, len(providers)) + 2 > inner_height:
+    graph = usage_graph_lines(p, inner_width, plot_rows, now, split=nav.graph_split, measure=nav.measure)
+    if 1 + 1 + len(graph) + 1 + 1 + max(1, len(providers)) + 2 > inner_height_rest:
         plot_rows = 3
-        graph = usage_graph_lines(p, inner_width, plot_rows, now)
-    show_header = 1 + 1 + len(graph) + 1 + 1 + max(1, len(providers)) + 2 <= inner_height
-    provider_rows = max(1, min(max(1, len(providers)), inner_height - (1 + 1 + len(graph) + 1 + int(show_header) + 2)))
+        graph = usage_graph_lines(p, inner_width, plot_rows, now, split=nav.graph_split, measure=nav.measure)
+    show_header = 1 + 1 + len(graph) + 1 + 1 + max(1, len(providers)) + 2 <= inner_height_rest
+    provider_rows = max(1, min(max(1, len(providers)), inner_height_rest - (1 + 1 + len(graph) + 1 + int(show_header) + 2)))
     table = Table(box=None, expand=True, padding=(0, 1), show_header=show_header, pad_edge=False, show_edge=False, header_style="dim")
     # Short headers below 70 columns so token values are never cut off.
     columns = ("Provider", "Input", "Cache read", "Cache write", "Output", "Total") if inner_width >= 70 else ("Provider", "In", "Cache R", "Cache W", "Out", "Total")
     for col in columns:
         table.add_column(col, justify="left" if col == "Provider" else "right", no_wrap=True, overflow="ellipsis")
     for name, tokens in providers[:provider_rows]:
-        table.add_row(name, *(format_tokens(v) for v in (tokens.input_tokens, tokens.cache_read_tokens, tokens.cache_creation_tokens, tokens.output_tokens, tokens.total)))
+        if nav.measure == "usd":
+            c = p.cost_by_provider.get(name)
+            values = (c.input, c.cache_read, c.cache_write, c.output, c.total) if c else (0.0,) * 5
+        else:
+            values = (tokens.input_tokens, tokens.cache_read_tokens, tokens.cache_creation_tokens, tokens.output_tokens, tokens.total)
+        table.add_row(name, *(format_measure(v, nav.measure) for v in values))
     if not providers:
         table.add_row("No usage recorded", "", "", "", "", "")
-    threads = p.threads[:10]
-    rows = max(1, inner_height - (1 + 1 + len(graph) + 1 + int(show_header) + provider_rows + 1))
+    threads = p.top(nav.measure)
+    rows = max(1, inner_height_rest - (1 + 1 + len(graph) + 1 + int(show_header) + provider_rows + 1))
     ids = [t.thread_id for t in threads]
     selected = ids.index(nav.selected_top_id) if nav.selected_top_id in ids else 0
     start_idx = window_start(len(threads), selected, nav.top_scroll, rows)
     nav.top_scroll = start_idx
     window = threads[start_idx:start_idx + rows]
-    result = [header, section_rule("Usage over time", inner_width), *graph, section_rule("Providers", inner_width), table, section_rule("Top threads", inner_width, note=activity_range_label(start_idx, len(window), len(threads)), focused=True)]
+    result = [header, *block, section_rule("Usage over time", inner_width), *graph, section_rule("Providers", inner_width), table, section_rule("Top threads", inner_width, note=activity_range_label(start_idx, len(window), len(threads)), focused=True)]
     # Fixed provider and token columns so titles all end at the same place.
     provider_labels = ["+".join(t.providers) for t in window]
-    token_labels = [format_tokens(t.tokens.total) for t in window]
+    token_labels = [_usage_label(t, nav.measure) for t in window]
     token_w = max((len(x) for x in token_labels), default=0)
     provider_w = min(max((len(x) for x in provider_labels), default=0), max(0, (inner_width - 2) // 3))
     title_w = max(1, inner_width - 2 - (2 + provider_w) - (2 + token_w))
@@ -976,9 +1095,9 @@ def _browser_frame(
                 screen.close_action()
                 nav.notice = "Action is no longer available"
         if action_lines is not None:
-            body = _action_detail_body(node, screen, action_lines, inner_height, inner_width)
+            body = _action_detail_body(node, screen, action_lines, inner_height, inner_width, nav.measure)
         elif detail_entry is not None:
-            body = _activity_detail_body(node, screen, detail_entry, inner_height, inner_width)
+            body = _activity_detail_body(node, screen, detail_entry, inner_height, inner_width, nav.measure)
         else:
             body = _overview_body(node, nav, screen, entries, inner_height, inner_width, width)
         title = Text(_breadcrumb(nav, max(10, width - 8)), style="bold cyan")
@@ -1014,6 +1133,40 @@ def main(argv: list[str] | None = None) -> int:
 
     t3_dir = Path(args.t3_dir).expanduser()
     console = Console()
+
+    if args.sessions:
+        store = TelemetryStore(args.store.expanduser())
+        try:
+            try:
+                snapshot = read_t3_state(t3_dir)
+            except (sqlite3.Error, OSError):
+                snapshot = None
+            Collector(store, default_roots(t3_dir)).sync(snapshot)
+            rows = session_rows(store)
+            for row in rows:
+                row["status"] = (snapshot_thread_status(snapshot, row["thread_id"])
+                                 if snapshot is not None and row["thread_id"] in snapshot.threads else None)
+            if args.json:
+                print(json.dumps(rows, indent=2))
+            else:
+                table = build_sessions_table(rows)
+                console.print(table)
+        finally:
+            store.close()
+        return 0
+
+    if args.sync:
+        store = TelemetryStore(args.store.expanduser())
+        try:
+            try:
+                snapshot = read_t3_state(t3_dir)
+            except (sqlite3.Error, OSError):
+                snapshot = None
+            stats = Collector(store, default_roots(t3_dir)).sync(snapshot)
+            print(f"files_seen={stats.files_seen} files_read={stats.files_read} steps_written={stats.steps_written} errors={stats.errors}")
+        finally:
+            store.close()
+        return 0
 
     # Mode 1: List threads
     if args.list:

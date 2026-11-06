@@ -67,6 +67,8 @@ class NavigationState:
     top_ids: list[str] = field(default_factory=list)
     selected_top_id: str | None = None
     top_scroll: int = 0
+    measure: str = "tokens"
+    graph_split: str = "provider"
 
     @property
     def detail_id(self) -> str | None:
@@ -224,7 +226,9 @@ class NavigationState:
     def enter(self) -> None:
         if not self.stack:
             if self.period:
-                if self.selected_top_id:
+                if self.selected_top_id and self.selected_top_id.startswith("session:"):
+                    self.notice = "Not a T3 thread: no detail view"
+                elif self.selected_top_id:
                     self.stack = [ScreenState(node_id=self.selected_top_id)]
             elif self.home_focus == "usage":
                 self.period = self.selected_period
@@ -270,6 +274,13 @@ class NavigationState:
         screen = self.current_screen
         if screen is not None and screen.detail_activity_id and not screen.action_open and screen.detail_activity_id not in screen.activity_targets:
             screen.detail_prompt_expanded = not screen.detail_prompt_expanded
+
+    def toggle_measure(self) -> None:
+        self.measure = "usd" if self.measure == "tokens" else "tokens"
+
+    def toggle_graph_split(self) -> None:
+        if self.period and not self.stack:
+            self.graph_split = "scope" if self.graph_split == "provider" else "provider"
 
 
 def table_header_lines(rows: int) -> int:
@@ -334,6 +345,10 @@ class TelemetryBrowser:
             self.navigation.enter()
         elif key in ("p", "P"):
             self.navigation.toggle_prompt()
+        elif key in ("$", "c", "C"):
+            self.navigation.toggle_measure()
+        elif key in ("g", "G"):
+            self.navigation.toggle_graph_split()
         elif key in ("ESC", chr(27)):
             self.navigation.escape()
         elif key in ("q", chr(3)):

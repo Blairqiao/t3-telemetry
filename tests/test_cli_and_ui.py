@@ -17,6 +17,7 @@ from t3_telemetry.ui import (
     render_context_bar,
     build_dashboard_renderable,
     build_threads_list_table,
+    build_sessions_table,
 )
 from t3_telemetry.cli import _browser_frame, build_parser, main, run_live_loop
 from t3_telemetry.tui import NavigationState, ScreenState, TerminalAdapter
@@ -430,7 +431,7 @@ def test_cli_json_not_found(synthetic_t3_dir: Path, capsys: pytest.CaptureFixtur
 
 def test_cli_live_loop_max_iterations(synthetic_t3_dir: Path):
     parser = build_parser()
-    args = parser.parse_args(["--t3-dir", str(synthetic_t3_dir), "--no-follow", "--interval", "0.01"])
+    args = parser.parse_args(["--no-store", "--t3-dir", str(synthetic_t3_dir), "--no-follow", "--interval", "0.01"])
     buf = io.StringIO()
     test_console = Console(file=buf, width=120, color_system=None)
     # Live loop with _max_iterations=2 must exit cleanly with code 0
@@ -509,7 +510,7 @@ def test_event_loop_input_repaint_promptly_without_extra_db_poll(
 
     monkeypatch.setattr(cli_mod, "read_t3_state", counted_read_t3_state)
 
-    args = build_parser().parse_args(["--t3-dir", str(synthetic_t3_dir), "--interval", "10.0"])
+    args = build_parser().parse_args(["--no-store", "--t3-dir", str(synthetic_t3_dir), "--interval", "10.0"])
     adapter = ScriptedAdapter(["DOWN", "q"])
     capture = CaptureLive()
 
@@ -544,7 +545,7 @@ def test_event_loop_resize_repaint_promptly_without_extra_db_poll(
 
     monkeypatch.setattr(cli_mod, "read_t3_state", counted_read_t3_state)
 
-    args = build_parser().parse_args(["--t3-dir", str(synthetic_t3_dir), "--interval", "10.0"])
+    args = build_parser().parse_args(["--no-store", "--t3-dir", str(synthetic_t3_dir), "--interval", "10.0"])
     adapter = ScriptedAdapter([((30, 100), None), "q"], initial_size=(24, 80))
     capture = CaptureLive()
 
@@ -577,7 +578,7 @@ def test_event_loop_one_snapshot_per_scheduled_poll_including_query(
 
     monkeypatch.setattr(cli_mod, "read_t3_state", counted_read_t3_state)
 
-    args = build_parser().parse_args(["Beta", "--t3-dir", str(synthetic_t3_dir), "--interval", "0.5"])
+    args = build_parser().parse_args(["--no-store", "Beta", "--t3-dir", str(synthetic_t3_dir), "--interval", "0.5"])
     capture = CaptureLive()
 
     t = 0.0
@@ -609,7 +610,7 @@ def test_event_loop_same_root_build_reuse(
 
     monkeypatch.setattr(cli_mod, "build_thread_telemetry", counted_build)
 
-    args = build_parser().parse_args(["--t3-dir", str(synthetic_t3_dir), "--interval", "10.0"])
+    args = build_parser().parse_args(["--no-store", "--t3-dir", str(synthetic_t3_dir), "--interval", "10.0"])
     adapter = ScriptedAdapter(["q"])
     run_live_loop(args, _adapter=adapter, _max_iterations=1, _live_cls=lambda **kw: CaptureLive())
 
@@ -618,7 +619,7 @@ def test_event_loop_same_root_build_reuse(
 
 
 def test_event_loop_unchanged_poll_no_redraw(synthetic_t3_dir: Path):
-    args = build_parser().parse_args(["--t3-dir", str(synthetic_t3_dir), "--interval", "1.0"])
+    args = build_parser().parse_args(["--no-store", "--t3-dir", str(synthetic_t3_dir), "--interval", "1.0"])
     capture = CaptureLive()
 
     t = 0.0
@@ -639,7 +640,7 @@ def test_event_loop_unchanged_poll_no_redraw(synthetic_t3_dir: Path):
 
 def test_event_loop_selected_follow_pin_independence(synthetic_t3_dir: Path):
     db_file = synthetic_t3_dir / "statev2.sqlite"
-    args = build_parser().parse_args(["--t3-dir", str(synthetic_t3_dir), "--interval", "1.0"])
+    args = build_parser().parse_args(["--no-store", "--t3-dir", str(synthetic_t3_dir), "--interval", "1.0"])
     capture = CaptureLive()
 
     t = 0.0
@@ -676,7 +677,7 @@ def test_event_loop_selected_follow_pin_independence(synthetic_t3_dir: Path):
 def test_event_loop_pinning_with_no_follow(synthetic_t3_dir: Path):
     db_file = synthetic_t3_dir / "statev2.sqlite"
     args = build_parser().parse_args(
-        ["--t3-dir", str(synthetic_t3_dir), "--no-follow", "--interval", "1.0"]
+        ["--no-store", "--t3-dir", str(synthetic_t3_dir), "--no-follow", "--interval", "1.0"]
     )
     capture = CaptureLive()
 
@@ -712,7 +713,7 @@ def test_event_loop_pinning_with_no_follow(synthetic_t3_dir: Path):
 
 
 def test_event_loop_cleanup_on_interrupt_and_error(synthetic_t3_dir: Path):
-    args = build_parser().parse_args(["--t3-dir", str(synthetic_t3_dir), "--interval", "1.0"])
+    args = build_parser().parse_args(["--no-store", "--t3-dir", str(synthetic_t3_dir), "--interval", "1.0"])
 
     adapter_interrupt = ScriptedAdapter([KeyboardInterrupt()])
     code = run_live_loop(args, _adapter=adapter_interrupt, _live_cls=lambda **kw: CaptureLive())
@@ -726,7 +727,7 @@ def test_event_loop_cleanup_on_interrupt_and_error(synthetic_t3_dir: Path):
 
 
 def test_noninteractive_fallback(synthetic_t3_dir: Path, monkeypatch: pytest.MonkeyPatch):
-    args = build_parser().parse_args(["--t3-dir", str(synthetic_t3_dir)])
+    args = build_parser().parse_args(["--no-store", "--t3-dir", str(synthetic_t3_dir)])
     buf = io.StringIO()
     fake_console = Console(file=buf, force_terminal=False, color_system=None)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
@@ -830,7 +831,7 @@ def test_missing_child_telemetry_renders_usable_screen():
 
 
 def test_query_sets_selected_id_so_escape_lands_on_queried_chat(synthetic_t3_dir: Path):
-    args = build_parser().parse_args([
+    args = build_parser().parse_args(["--no-store",
         "--t3-dir", str(synthetic_t3_dir),
         "Beta",
     ])
@@ -1657,3 +1658,211 @@ def test_usage_graph_helpers_and_rendering():
     period = PeriodUsage(window, TokenBreakdown(), {}, [{} for _ in window.bucket_starts], [])
     x_labels = usage_graph_lines(period, 80, 4, now)[-1].plain.split()
     assert all(label.isdigit() and int(label) <= 31 for label in x_labels)
+
+    from t3_telemetry.usage import UsageStats
+    w_week = period_window("week", now)
+    stats = UsageStats()
+    stats.add("claude-sonnet", now, 35, 0, 0, 0, subagent=False)
+    stats.add("claude-sonnet", now, 35, 0, 0, 0, subagent=True)
+    p = PeriodUsage(
+        w_week,
+        TokenBreakdown(input_tokens=70),
+        {},
+        [{} for _ in w_week.bucket_starts],
+        [],
+        stats=stats,
+        scope_buckets=[{"Main": 5, "Subagents": 5} for _ in w_week.bucket_starts],
+    )
+    scope_lines = usage_graph_lines(p, 60, 5, now, split="scope")
+    assert len(scope_lines) == 7
+    assert "Main" in scope_lines[0].plain and "Subagents" in scope_lines[0].plain
+    assert any("▓" in line.plain for line in scope_lines[1:-1])
+
+
+def test_breakdown_lines_and_kpis():
+    from datetime import datetime, timezone
+    from io import StringIO
+
+    from rich.console import Console
+
+    from t3_telemetry.insights import Kpi, headline
+    from t3_telemetry.ui import KIND_MEANINGS, breakdown_lines, format_usd, kind_legend_lines, kpi_lines
+    from t3_telemetry.usage import UsageStats
+
+    assert format_usd(12.5) == "$12.50"
+    assert len(KIND_MEANINGS) == 4
+
+    now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+    stats = UsageStats()
+    stats.add("claude-sonnet-4-5", now, input=1000, cache_read=2000, cache_write=500, output=300, subagent=False)
+
+    for w in (58, 78, 118):
+        for measure in ("tokens", "usd"):
+            lines = breakdown_lines(stats, measure, w, "Main", kpis_on=True, legend="detailed")
+            output = StringIO()
+            console = Console(file=output, width=w, color_system=None)
+            for line in lines:
+                console.print(line)
+            rendered = output.getvalue().splitlines()
+            assert all(len(line) <= w for line in rendered)
+            assert any("Cache read" in line for line in rendered)
+            h = headline(stats, measure, "Main")
+            expected_h = h if len(h) <= w else h[:w - 1] + "…"
+            assert any(expected_h in line for line in rendered)
+            if w == 58:
+                assert not any("·" in line for line in rendered)
+            if w == 118:
+                assert any("·" in line for line in rendered)
+
+    # kpi_lines with 5 items at width 58 keeps 4 (58 // 4 = 14; 58 // 5 = 11 drops one)
+    items5 = [Kpi(f"v{i}", f"label{i}") for i in range(5)]
+    klines = kpi_lines(items5, 58)
+    values = klines[0].plain.split()
+    assert len(values) == 4
+
+
+def test_sync_creates_store_with_empty_roots(tmp_path, monkeypatch, capsys):
+    from t3_telemetry.collector import SourceRoots
+    monkeypatch.setattr("t3_telemetry.cli.default_roots", lambda d: SourceRoots(tmp_path / "empty", [], [], d))
+    path = tmp_path / "store.sqlite"
+    assert main(["--sync", "--store", str(path), "--t3-dir", str(tmp_path)]) == 0
+    assert path.exists()
+    assert "files_seen=0 files_read=0 steps_written=0 errors=0" in capsys.readouterr().out
+
+
+def test_build_sessions_table():
+    rows = [
+        {
+            "session_key": "claude:1",
+            "thread_id": "th-1",
+            "origin": "T3",
+            "provider": "claude",
+            "title": "T3 Main Session",
+            "model": "claude-3-5-sonnet",
+            "last_active": "2026-11-04T12:00:00Z",
+            "subagents": 2,
+            "tokens": 1540,
+            "status": "running",
+        },
+        {
+            "session_key": "codex:2",
+            "thread_id": None,
+            "origin": "cli",
+            "provider": "codex",
+            "title": "Standalone Session",
+            "model": "gpt-4o",
+            "last_active": "2026-11-03T10:00:00Z",
+            "subagents": 0,
+            "tokens": 500,
+        },
+    ]
+    table = build_sessions_table(rows)
+    assert table.title == "Recent Sessions"
+    assert len(table.columns) == 7
+    col_names = [str(col.header) for col in table.columns]
+    assert col_names == ["Origin", "Provider", "Title", "Model", "Last active", "Subagents", "Tokens"]
+
+    console = Console(file=io.StringIO(), color_system="truecolor", width=120)
+    console.print(table)
+    rendered = console.file.getvalue()
+    assert "T3 Main Session" in rendered
+    assert "Standalone Session" in rendered
+    assert "1.5k" in rendered
+    assert "500" in rendered
+
+
+def test_cli_sessions_table_and_json(tmp_path, monkeypatch, capsys):
+    from t3_telemetry.collector import SourceRoots
+    from t3_telemetry.store import SessionRecord, StepRecord, TelemetryStore
+
+    monkeypatch.setattr("t3_telemetry.cli.default_roots", lambda d: SourceRoots(tmp_path / "empty", [], [], d))
+    db_path = tmp_path / "store.sqlite"
+    store = TelemetryStore(db_path)
+    store.upsert_sessions([
+        SessionRecord("claude:main", "claude", "main", origin_hint="sdk", model="sonnet", first_ts="2026-11-01", last_ts="2026-11-04T12:00:00Z"),
+        SessionRecord("claude:child", "claude", "child", parent_session_key="claude:main"),
+        SessionRecord("codex:free", "codex", "free", origin_hint="cli", cwd="/work/repo", first_ts="2026-11-02", last_ts="2026-11-05T12:00:00Z"),
+    ])
+    store.replace_t3_graph([
+        {"thread_id": "th-root", "title": "Bound Root Thread"},
+    ], [
+        {"session_key": "claude:main", "thread_id": "th-root"},
+    ])
+    store.upsert_steps([
+        StepRecord("claude:main", "s1", "2026-11-04T10:00:00Z", input_tokens=100, output_tokens=50),
+        StepRecord("claude:child", "s2", "2026-11-04T11:00:00Z", input_tokens=20, output_tokens=30),
+        StepRecord("codex:free", "s3", "2026-11-05T10:00:00Z", input_tokens=500, output_tokens=500),
+    ])
+    store.close()
+
+    # 1. Test table mode (--sessions)
+    rc = main(["--sessions", "--store", str(db_path), "--t3-dir", str(tmp_path)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "files_seen=" not in out
+    assert "Recent Sessions" in out
+    assert "Bound" in out
+    assert "repo" in out
+    assert "T3" in out
+    assert "cli" in out
+
+    # 2. Test JSON mode (--sessions --json)
+    rc_json = main(["--sessions", "--json", "--store", str(db_path), "--t3-dir", str(tmp_path)])
+    assert rc_json == 0
+    json_out = capsys.readouterr().out
+    assert "files_seen=" not in json_out
+    parsed = json.loads(json_out)
+    assert isinstance(parsed, list)
+    assert len(parsed) == 2
+    # Most recent first: codex:free (2026-11-05), then claude:main (2026-11-04)
+    assert parsed[0]["session_key"] == "codex:free"
+    assert parsed[0]["origin"] == "cli"
+    assert parsed[0]["tokens"] == 1000
+
+    assert parsed[1]["session_key"] == "claude:main"
+    assert parsed[1]["origin"] == "T3"
+    assert parsed[1]["thread_id"] == "th-root"
+    assert parsed[1]["subagents"] == 1
+    assert parsed[1]["tokens"] == 200
+
+
+def test_kind_bar_allocation():
+    from t3_telemetry.prices import KINDS
+    from t3_telemetry.ui import allocate_cells, kind_bar_line
+
+    values = {"cache_read": 57, "cache_write": 21, "output": 16, "input": 0.3}
+    cells = allocate_cells(values, 100, KINDS)
+    assert sum(cells.values()) == 100
+    assert cells["input"] == 1
+    assert allocate_cells({}, 100, KINDS) == dict.fromkeys(KINDS, 0)
+    assert allocate_cells(values, 0, KINDS) == dict.fromkeys(KINDS, 0)
+    assert sum(allocate_cells(values, 3, KINDS).values()) == 3
+    assert allocate_cells(dict.fromkeys(KINDS, 1), 3, KINDS) == dict(zip(KINDS, (1, 1, 1, 0)))
+    for sample in (values, dict.fromkeys(KINDS, 1), dict(zip(KINDS, (1, 13, 37, 101)))):
+        for width in range(1, 201):
+            assert sum(allocate_cells(sample, width, KINDS).values()) == width
+            assert kind_bar_line(sample, width).cell_len == width
+    empty = kind_bar_line({}, 10)
+    assert empty.plain == "░" * 10
+    assert empty.style == "dim"
+
+
+def test_overview_120x40_shows_usage_breakdown():
+    from t3_telemetry.cli import _browser_frame
+    from t3_telemetry.models import ModelStep, ThreadTelemetryNode
+    from t3_telemetry.tui import NavigationState
+
+    node = ThreadTelemetryNode(
+        thread_id="priced-thread", title="Priced chat", driver="claude", provider_instance_id="claude-inst",
+        model="claude-sonnet-5-5", status="running",
+        steps=[ModelStep(step_index=1, input_tokens=100, cache_read_tokens=900, output_tokens=100)],
+    )
+    nav = NavigationState()
+    nav.reconcile([node.thread_id])
+    nav.enter()
+    layout = _browser_frame([node], node=node, summary=node, nav=nav, height=40, width=120)
+    buf = io.StringIO()
+    Console(file=buf, width=120, height=40, force_terminal=True, color_system=None).print(layout)
+    output = buf.getvalue()
+    assert "of this chat's tokens" in output
+    assert "Cache read" in output

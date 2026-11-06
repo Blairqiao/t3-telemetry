@@ -158,6 +158,12 @@ The context graph uses an automatic token axis, separate from recorded context c
 
 In headless environments, CI pipelines, or when stdout is redirected to a pipe, t3-top detects the non-TTY stream and disables raw keyboard handling, printing a single snapshot or structured JSON and exiting immediately.
 
+### Breakdown and estimated cost
+
+The breakdown bar displays four token kinds: cache read, cache write, output (which includes thinking), and input. Press `$` or `c` on any screen to toggle every usage figure between token counts and estimated USD cost: home period totals, the lifetime total shown beside each chat, the period breakdown, chart, providers table and top threads (ranked by the active measure), each agent's usage lines and header total (agent plus all its subagents), the Subagents and Activity columns. The activity detail always shows both a step's tokens and its estimated cost. The context graph stays in tokens, since it measures window occupancy rather than spend. Press `g` to switch the period chart between provider and scope splits.
+
+Dollars are estimates at API list prices from a static table in `src/t3_telemetry/prices.py` (checked 2026-11-05). On subscription plans this is what the same work would cost on the API. Unknown models are shown as unpriced tokens.
+
 ## Ghostty terminal integration
 
 To run `t3-top` alongside T3 Code in a dedicated side pane, add a keybinding to `~/.config/ghostty/config`:
@@ -175,15 +181,81 @@ t3-top --interval 0.5
 
 The interface automatically scales across narrow split panes (60+ columns) and wide multi-monitor terminals.
 
+## Data sources and the local store
+
+`t3-top` aggregates telemetry from local agent session files and stores incremental token metrics in a local SQLite database.
+
+### Native session files
+
+The collector scans three native agent directories:
+
+- **Claude.** Reads JSONL transcripts from `~/.claude/projects/*/*.jsonl` for root sessions and `~/.claude/projects/*/*/subagents/agent-*.jsonl` for subagents. Subagent descriptions are loaded from matching `.meta.json` files. The `CLAUDE_CONFIG_DIR` environment variable overrides `~/.claude`.
+- **Codex.** Reads session rollout files from `~/.codex/sessions/**/rollout-*.jsonl` and `~/.codex/archived_sessions/**/rollout-*.jsonl`. The `CODEX_HOME` environment variable overrides `~/.codex`.
+- **Antigravity.** Reads conversation databases from `<t3-dir>/providers/antigravity/*/antigravity-acp/conversations/*.db` and CLI conversations from `~/.gemini/antigravity-cli/conversations/*.db`. The collector inspects companion `-wal` files so sizes and modification timestamps reflect recent writes.
+
+### Telemetry store and privacy
+
+The store is a SQLite database located at `~/.t3-telemetry/telemetry.sqlite` by default. You can specify a different location with `--store`.
+
+Only token counts and session metadata are stored. Tracked metrics include input tokens, cache read tokens, cache creation tokens, output tokens, thinking tokens, timestamps, model identifiers, tool names, session keys, and T3 thread bindings. Message text, prompts, completions, system instructions, and tool outputs are never written to the store.
+
+The local store powers calendar usage views across Today, This week, and This month. Detailed thread overviews, turn metrics, real-time activity streams, and context occupancy graphs read directly from live T3 and Antigravity database files.
+
+### Origin detection
+
+Sessions in the store report their execution origin:
+
+- **T3.** The session matches a known T3 Code app thread through a mirrored session binding.
+- **cli.** The transcript indicates a command-line interface.
+- **sdk.** The transcript indicates an SDK or client library.
+- **unknown.** The session transcript contained no origin indicator.
+
+Origin hints remain provisional until T3 supplies a binding.
+
+### Store commands and options
+
+Sync the telemetry store from local sources and exit:
+
+```bash
+t3-top --sync
+```
+
+Output includes `files_seen`, `files_read`, `steps_written`, and `errors`.
+
+List native sessions recorded in the store:
+
+```bash
+# Formatted Rich table
+t3-top --sessions
+
+# Machine-readable JSON
+t3-top --sessions --json
+```
+
+Specify a custom store path:
+
+```bash
+t3-top --store /path/to/custom/telemetry.sqlite
+```
+
+Disable the local store and read usage directly from T3 state:
+
+```bash
+t3-top --no-store
+```
+
 ## Architecture
 
 1. `protobuf.py`: Pure-Python wire parser decoding varints and packed length-delimited fields from Antigravity SQLite metadata blobs without external protobuf compilation dependencies.
 2. `db_agy.py`: Reader extracting step timings, token counts, and tool names from Antigravity database files and transcript logs.
 3. `db_t3.py`: Read-only SQLite client querying T3 `statev2.sqlite` projection tables for thread lineage, context window gauges, and turn usage records.
-4. `aggregator.py`: Tree aggregator resolving thread hierarchies, linking
-   delegated subagents and native runs, and accumulating self and rollup metrics.
-5. `ui.py`: Rich terminal renderables generating context gauges, summary metric comparisons, recursive subagent trees, and step stream tables.
-6. `cli.py`: Command-line interface supporting live monitoring, snapshot printing, list queries, and JSON serialization.
+4. `store.py`: Persistent SQLite store recording incremental file offsets, native sessions, step token counts, tool names, and mirrored T3 bindings.
+5. `sources/`: Native file parsers for Claude JSONL transcripts, Codex rollout logs, and Antigravity databases.
+6. `collector.py`: Incremental discovery and ingestion engine syncing native agent files into the local telemetry store.
+7. `t3_mirror.py`: Graph synchronizer mirroring T3 app threads and provider session bindings into the store.
+8. `aggregator.py`: Tree aggregator resolving thread hierarchies, linking delegated subagents and native runs, and accumulating self and rollup metrics.
+9. `ui.py`: Rich terminal renderables generating context gauges, summary metric comparisons, recursive subagent trees, and step stream tables.
+10. `cli.py`: Command-line interface supporting live monitoring, snapshot printing, list queries, store sync, and JSON serialization.
 
 ## License
 

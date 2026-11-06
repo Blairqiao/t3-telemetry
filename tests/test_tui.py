@@ -592,7 +592,7 @@ def test_live_loop_context_history_retention_across_rebuilds(tmp_path: Path):
     conn.commit()
 
     history_store = ContextHistoryStore()
-    args = build_parser().parse_args(["--t3-dir", str(tmp_path), "--interval", "0.01"])
+    args = build_parser().parse_args(["--no-store", "--t3-dir", str(tmp_path), "--interval", "0.01"])
     adapter = ScriptedAdapter(["q"])
 
     # First run: 1 poll -> records 10,000 tokens
@@ -653,7 +653,7 @@ def test_navigation_retention_reopening_screen_preserves_context_history(tmp_pat
     conn.close()
 
     history_store = ContextHistoryStore()
-    args = build_parser().parse_args(["--t3-dir", str(tmp_path), "--interval", "10.0"])
+    args = build_parser().parse_args(["--no-store", "--t3-dir", str(tmp_path), "--interval", "10.0"])
 
     # Navigation actions:
     # 1. ENTER (open Thread A detail)
@@ -712,7 +712,7 @@ def test_summary_thread_switch_isolation_does_not_contaminate_selected_graph(tmp
 
     history_store = ContextHistoryStore()
     # Query th-selected so it is selected, while th-summary is latest (roots[0]) as summary
-    args = build_parser().parse_args(["th-selected", "--t3-dir", str(tmp_path), "--interval", "10.0"])
+    args = build_parser().parse_args(["--no-store", "th-selected", "--t3-dir", str(tmp_path), "--interval", "10.0"])
     adapter = ScriptedAdapter(["q"])
 
     run_live_loop(args, _adapter=adapter, _max_iterations=1, _live_cls=lambda **kw: CaptureLive(), _history_store=history_store)
@@ -757,7 +757,7 @@ def test_avoid_timestamp_only_observation_causing_redraw_every_unchanged_poll(tm
     conn.commit()
     conn.close()
 
-    args = build_parser().parse_args(["--t3-dir", str(tmp_path), "--interval", "0.01"])
+    args = build_parser().parse_args(["--no-store", "--t3-dir", str(tmp_path), "--interval", "0.01"])
     adapter = ScriptedAdapter(["q"])
     capture = CaptureLive()
 
@@ -811,7 +811,7 @@ def test_graph_correction_repaints_with_unchanged_count_and_peak(monkeypatch):
 
     capture = CaptureLive()
     adapter = ScriptedAdapter([None, None, None])
-    args = build_parser().parse_args(["--interval", "0.01"])
+    args = build_parser().parse_args(["--no-store", "--interval", "0.01"])
     assert run_live_loop(args, _adapter=adapter, _clock=clock, _max_iterations=3,
                          _live_cls=lambda **kw: capture) == 0
     assert builds == 3
@@ -870,7 +870,7 @@ def test_live_values_repaint_without_row_count_changes(monkeypatch, change):
         return tick
 
     capture = CaptureLive()
-    args = build_parser().parse_args(["--interval", "0.01"])
+    args = build_parser().parse_args(["--no-store", "--interval", "0.01"])
     assert run_live_loop(args, _adapter=ScriptedAdapter([None, None, None]), _clock=clock,
                          _max_iterations=3, _live_cls=lambda **kw: capture) == 0
     assert builds == 3
@@ -1126,7 +1126,7 @@ def test_live_loop_activity_keys_do_not_read_data(monkeypatch):
     keys = ["ENTER", "k", "k", "ENTER", "j", "j", "ESC", "TAB", "j", "j", "j", "TAB", "ENTER", "ESC",
             (( 20, 50), "j"), "UP"]
     capture = CaptureLive()
-    args = build_parser().parse_args(["--interval", "1000"])
+    args = build_parser().parse_args(["--no-store", "--interval", "1000"])
     assert run_live_loop(args, _adapter=ScriptedAdapter(keys, initial_size=(30, 100)), _clock=clock,
                          _max_iterations=5, _live_cls=lambda **kw: capture) == 0
     assert reads == 1 and builds == 1
@@ -2016,6 +2016,7 @@ def test_period_live_flow_and_frame_size(monkeypatch):
 
     now = datetime(2026, 11, 4, tzinfo=timezone.utc)
     report = build_usage_report([], now)
+    report.periods["month"].stats.add("claude-sonnet-4-5", now, 1000, 2000, 300, 400, True)
     for period in report.periods.values():
         period.threads.append(ThreadUsage("th", "Parent", "idle", ["Codex"], TokenBreakdown(input_tokens=100)))
     class FakeCache:
@@ -2027,7 +2028,7 @@ def test_period_live_flow_and_frame_size(monkeypatch):
     monkeypatch.setattr(cli, "build_thread_telemetry", lambda *a, **kw: _activity_node())
     capture = CaptureLive()
     tick = iter(range(1000))
-    args = build_parser().parse_args(["--interval", "1000"])
+    args = build_parser().parse_args(["--no-store", "--interval", "1000"])
     assert run_live_loop(args, _adapter=ScriptedAdapter(["TAB", "DOWN", "ENTER", "ENTER", "ESC", "ESC"]), _clock=lambda: next(tick) / 1000, _max_iterations=5, _live_cls=lambda **kw: capture, _usage_cache=FakeCache()) == 0
     def render(frame, width=80, height=24):
         output = io.StringIO()
@@ -2040,7 +2041,15 @@ def test_period_live_flow_and_frame_size(monkeypatch):
     for width, height in [(60, 24), (120, 40)]:
         nav = NavigationState(period="month")
         frame = cli._browser_frame([], None, None, nav, height, width, usage=report, now=now)
-        assert len(render(frame, width, height).splitlines()) == height
+        output = render(frame, width, height)
+        assert len(output.splitlines()) == height
+        assert "Breakdown" in output and "Top threads" in output
+        assert "█" in output
+        if width == 120:
+            assert "Cache read" in output and "went to subagents" in output
+        nav.measure = "usd"
+        output = render(cli._browser_frame([], None, None, nav, height, width, usage=report, now=now), width, height)
+        assert "est. $" in output and "Top threads" in output
 
     # At the 60-column minimum, the widest provider row keeps every token value intact.
     big = TokenBreakdown(input_tokens=8_980_000, cache_read_tokens=217_530_000, cache_creation_tokens=2_670_000, output_tokens=1_910_000)
@@ -2079,7 +2088,7 @@ def test_idle_home_does_not_repaint_on_unchanged_polls(monkeypatch):
     monkeypatch.setattr(cli, "read_t3_state", lambda _: snapshot)
     capture = CaptureLive()
     tick = iter(range(1000))
-    args = build_parser().parse_args(["--interval", "0.01"])
+    args = build_parser().parse_args(["--no-store", "--interval", "0.01"])
     run_live_loop(args, _adapter=ScriptedAdapter([None, None, None]), _clock=lambda: next(tick) * 0.05,
                   _max_iterations=3, _live_cls=lambda **kw: capture, _usage_cache=_EmptyUsageCache())
     assert len(capture.updates) == 1
@@ -2128,3 +2137,249 @@ def test_period_top_threads_align_columns():
         assert len(rows) == 2
         assert rows[0].index("Codex") == rows[1].index("Claude")
         assert rows[0].index("139.21M") + len("139.21M") == rows[1].index("45.37M") + len("45.37M")
+
+
+def test_period_pure_session_has_no_detail():
+    nav = NavigationState(period="today", selected_top_id="session:codex:abc")
+    nav.enter()
+    assert nav.stack == []
+    assert nav.notice == "Not a T3 thread: no detail view"
+
+
+def test_store_workers_are_nonblocking_and_join_before_close(tmp_path, monkeypatch):
+    import threading
+    import t3_telemetry.cli as cli
+    from types import SimpleNamespace
+
+    started = threading.Event()
+    release = threading.Event()
+    reader_started = threading.Event()
+    calls = []
+    closed = []
+    real_store = cli.TelemetryStore
+
+    class Store(real_store):
+        def close(self):
+            assert release.is_set()
+            assert reader_finished.is_set()
+            closed.append(True)
+            super().close()
+
+    reader_finished = threading.Event()
+    class Collector:
+        def sync(self, snapshot):
+            calls.append(snapshot)
+            started.set()
+            assert release.wait(2)
+
+    def reader(store, snapshot):
+        reader_started.set()
+        assert release.wait(2)
+        reader_finished.set()
+        raise OSError("test")
+
+    class Adapter(ScriptedAdapter):
+        def read_key(self, timeout):
+            assert started.wait(1) and reader_started.wait(1)
+            if len(self.actions) == 1:
+                assert len(calls) == 1
+                release.set()
+            return super().read_key(timeout)
+
+    snapshot = SimpleNamespace(threads={}, provider_turns_by_thread={}, subagents_by_parent={}, provider_threads={}, get_provider_thread=lambda _: None)
+    monkeypatch.setattr(cli, "TelemetryStore", Store)
+    monkeypatch.setattr(cli, "read_store_usage_report", reader)
+    monkeypatch.setattr(cli, "read_t3_state", lambda _: snapshot)
+    monkeypatch.setattr(cli, "running_root_ids", lambda _: [])
+    ticks = iter(range(1000))
+    args = build_parser().parse_args(["--store", str(tmp_path / "store.sqlite"), "--t3-dir", str(tmp_path), "--interval", "0.01"])
+    adapter = Adapter([None, "q"])
+    assert run_live_loop(args, _adapter=adapter, _clock=lambda: next(ticks), _live_cls=lambda **kw: CaptureLive(), _collector=Collector()) == 0
+    assert len(calls) == 1
+    assert closed == [True]
+
+
+def test_measure_toggle_key_handling():
+    browser = TelemetryBrowser(TerminalAdapter())
+    assert browser.navigation.measure == "tokens"
+
+    # $ toggles on home screen
+    browser.handle_key("$")
+    assert browser.navigation.measure == "usd"
+    browser.handle_key("$")
+    assert browser.navigation.measure == "tokens"
+
+    # c and C toggle measure
+    browser.handle_key("c")
+    assert browser.navigation.measure == "usd"
+    browser.handle_key("C")
+    assert browser.navigation.measure == "tokens"
+
+    # $ toggles on period screen
+    browser.navigation.period = "week"
+    browser.handle_key("$")
+    assert browser.navigation.measure == "usd"
+    browser.handle_key("$")
+    assert browser.navigation.measure == "tokens"
+
+    # $ toggles in detail view (with stack)
+    from t3_telemetry.tui import ScreenState
+    browser.navigation.stack = [ScreenState(node_id="th-1")]
+    browser.handle_key("$")
+    assert browser.navigation.measure == "usd"
+    browser.handle_key("c")
+    assert browser.navigation.measure == "tokens"
+
+
+def test_graph_split_key_handling():
+    browser = TelemetryBrowser(TerminalAdapter())
+    assert browser.navigation.graph_split == "provider"
+
+    # On home screen (period is None), g and G are no-ops
+    browser.handle_key("g")
+    assert browser.navigation.graph_split == "provider"
+    browser.handle_key("G")
+    assert browser.navigation.graph_split == "provider"
+
+    # On period screen with empty stack, g and G toggle graph_split
+    browser.navigation.period = "week"
+    browser.handle_key("g")
+    assert browser.navigation.graph_split == "scope"
+    browser.handle_key("g")
+    assert browser.navigation.graph_split == "provider"
+    browser.handle_key("G")
+    assert browser.navigation.graph_split == "scope"
+    browser.handle_key("G")
+    assert browser.navigation.graph_split == "provider"
+
+    # In thread detail opened from period screen (stack not empty), g is a no-op
+    from t3_telemetry.tui import ScreenState
+    browser.navigation.stack = [ScreenState(node_id="th-top")]
+    browser.handle_key("g")
+    assert browser.navigation.graph_split == "provider"
+    browser.handle_key("G")
+    assert browser.navigation.graph_split == "provider"
+
+
+def test_measure_toggle_repaints_in_live_loop(monkeypatch):
+    from types import SimpleNamespace
+    from t3_telemetry import cli
+    snapshot = SimpleNamespace(threads={}, provider_turns_by_thread={}, subagents_by_parent={}, provider_threads={}, get_provider_thread=lambda _: None)
+    monkeypatch.setattr(cli, "read_t3_state", lambda _: snapshot)
+    capture = CaptureLive()
+    tick = iter(range(1000))
+    args = build_parser().parse_args(["--no-store", "--interval", "0.01"])
+    run_live_loop(args, _adapter=ScriptedAdapter(["$"]), _clock=lambda: next(tick) * 0.05,
+                  _max_iterations=2, _live_cls=lambda **kw: capture, _usage_cache=_EmptyUsageCache())
+    # Initial render drew the frame once; pressing "$" toggles measure and triggers an extra update
+    assert len(capture.updates) == 2
+
+
+def test_footer_line_cost_and_split():
+    from t3_telemetry.cli import _footer_line
+    from t3_telemetry.models import ThreadTelemetryNode
+    from t3_telemetry.tui import ScreenState
+
+    # Period screen with empty stack
+    nav = NavigationState(period="week")
+    assert _footer_line(nav, None, 100).plain == "W/S move  E/Enter open thread  $ cost  G split  Esc home  q quit"
+    nav.measure = "usd"
+    assert _footer_line(nav, None, 100).plain == "W/S move  E/Enter open thread  $ tokens  G split  Esc home  q quit"
+    # Home offers the toggle too.
+    assert _footer_line(NavigationState(), None, 100).plain == "Tab section  W/S move  E/Enter open  $ cost  q quit"
+
+    # Overview screens: with subagents, focus == "subagents"
+    child = ThreadTelemetryNode(thread_id="c1", title="Child", driver="codex", provider_instance_id="codex", model="m")
+    parent = ThreadTelemetryNode(thread_id="p1", title="Parent", driver="codex", provider_instance_id="codex", model="m", subagents=[child])
+    nav_detail = NavigationState()
+    nav_detail.stack = [ScreenState(node_id="p1", focus="subagents")]
+    assert _footer_line(nav_detail, parent, 100).plain == "Tab activity  W/S move  E/Enter open  $ cost  Esc back  q quit"
+
+    # Overview screens: with subagents, focus == "activity"
+    nav_detail.stack = [ScreenState(node_id="p1", focus="activity")]
+    assert _footer_line(nav_detail, parent, 100).plain == "Tab subagents  W/S move  E/Enter details  $ cost  Esc back  q quit"
+
+    # Overview screens: without subagents
+    lone = ThreadTelemetryNode(thread_id="l1", title="Lone", driver="codex", provider_instance_id="codex", model="m")
+    nav_lone = NavigationState()
+    nav_lone.stack = [ScreenState(node_id="l1")]
+    assert _footer_line(nav_lone, lone, 100).plain == "W/S move  E/Enter details  $ cost  Esc back  q quit"
+
+
+def _priced_tree():
+    from t3_telemetry.models import ModelStep, ThreadTelemetryNode, TokenMetricsSummary
+
+    def agent(tid, title, tokens, children=()):
+        step = ModelStep(step_index=1, started_at="2026-11-05T02:00:00+00:00", input_tokens=tokens)
+        n = ThreadTelemetryNode(thread_id=tid, title=title, driver="claudeAgent", provider_instance_id="claude",
+                                model="claude-opus-5-5", steps=[step], subagents=list(children))
+        n.self_metrics.add_step(step)
+        n.rollup_metrics = TokenMetricsSummary()
+        n.rollup_metrics.add_summary(n.self_metrics)
+        for c in children:
+            n.rollup_metrics.add_summary(c.rollup_metrics)
+        return n
+
+    child = agent("kid1", "Kid task", 500_000)
+    return agent("root1", "Root chat", 1_000_000, [child])
+
+
+def test_dollar_toggle_reaches_overview_subagents_and_activity():
+    from t3_telemetry.tui import ScreenState
+
+    root = _priced_tree()
+    nav = NavigationState(measure="usd")
+    nav.stack = [ScreenState(node_id=root.thread_id)]
+    text = "\n".join(_render_lines(root, nav, 40, 120))
+    # Identity carries the agent's total (self + subagents): $4 + $2.
+    assert "Total $6.00 est." in text
+    assert "Cost" in text and "$2.00" in text  # subagent row and column header
+    assert "$4.00" in text  # the root's own activity row
+    nav.measure = "tokens"
+    text = "\n".join(_render_lines(root, nav, 40, 120))
+    assert "Total 1.50M tokens" in text and "Cost" not in text
+
+
+def test_chat_list_shows_lifetime_totals_in_active_measure():
+    from datetime import datetime, timezone
+    from rich.console import Console
+    import io
+    from t3_telemetry.cli import _browser_frame
+    from t3_telemetry.models import AppThreadRecord
+    from t3_telemetry.usage import build_usage_report
+
+    root = _priced_tree()
+    record = AppThreadRecord(
+        thread_id="root1", title="Root chat", model="claude-opus-5-5", project_id="p", default_provider="claude",
+        provider_instance_id="claude", thinking_level=None, active_provider_thread_id=None, parent_thread_id=None,
+        root_thread_id=None, relationship_to_parent=None, created_at=None, updated_at=None,
+    )
+    usage = build_usage_report([root], datetime(2026, 11, 5, 3, tzinfo=timezone.utc))
+
+    def render(measure):
+        nav = NavigationState(ids=["root1"], selected_id="root1", measure=measure)
+        buf = io.StringIO()
+        frame = _browser_frame([record], None, None, nav, 30, 100, usage=usage, now=usage.generated_at)
+        Console(file=buf, width=100, height=30, color_system=None).print(frame)
+        return [line for line in buf.getvalue().splitlines() if "Root chat" in line]
+
+    assert render("tokens")[0].rstrip(" │").endswith("1.50M")
+    assert render("usd")[0].rstrip(" │").endswith("$6.00")
+
+
+def test_chats_selection_only_highlights_when_focused():
+    from t3_telemetry.cli import _root_list_body
+
+    root = AppThreadRecord(
+        thread_id="th-1", project_id=None, title="Only chat", default_provider="claudeAgent",
+        provider_instance_id=None, model="m", thinking_level=None, active_provider_thread_id=None,
+        parent_thread_id=None, root_thread_id=None, relationship_to_parent=None,
+        created_at=None, updated_at=None,
+    )
+    nav = NavigationState()
+    nav.selected_id = "th-1"
+    focused = _root_list_body([root], nav, 5, 60, None, True)
+    unfocused = _root_list_body([root], nav, 5, 60, None, False)
+    assert "▶ Only chat" in focused.plain
+    assert "▶" not in unfocused.plain
+    assert not any("bright_yellow" in str(span.style) for span in unfocused.spans)
