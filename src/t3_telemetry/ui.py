@@ -19,6 +19,7 @@ from t3_telemetry.activity import DETAIL_FIELD_LABELS, TOOL_VERBS, ActivityEntry
 from t3_telemetry.insights import Kpi, _usd as format_usd, headline, kind_values, kpis, share_label
 from t3_telemetry.models import ModelStep, ThreadTelemetryNode, ToolCallDetail, TurnItem
 from t3_telemetry.prices import KINDS, CostBreakdown
+from t3_telemetry.providers import family_label, provider_key
 from t3_telemetry.tui import window_start
 from t3_telemetry.usage import PROVIDER_ORDER, SCOPE_ORDER, ModelUsage, PeriodUsage, TokenBreakdown, UsageStats, cache_hit_pct, node_cost, step_usd, turn_cost
 
@@ -339,6 +340,9 @@ KIND_MEANINGS = {
     "output": "what the model wrote, incl. thinking",
     "input": "uncached input",
 }
+
+
+TOKEN_ROW_MEANINGS = {"cache_read": "re-read from cache, cheap", "cache_write": "stored for reuse, premium", "input": "cache miss, full input price", "response": "reply text and tool calls", "thinking": "reasoning, billed as output"}
 
 
 def allocate_cells(values: dict[str, float], width: int, order: Sequence[str]) -> dict[str, int]:
@@ -1541,9 +1545,13 @@ def build_activity_detail_lines(
     header = f"{clean(step.row_label if step is not None else entry.title)} · {clean(entry.status)} · {format_duration(entry.duration_seconds)}"
     if step is not None and step.started_at and step.completed_at:
         header += f" · {clean(format_clock(step.started_at))}–{clean(format_clock(step.completed_at))}"
-    if node is not None:
-        header += f" · {clean(node.model or 'unknown')}"
     lines.append(Text(header, style="bold"))
+    model = (step.model if step is not None else None) or (node.model if node is not None else None)
+    cost = step_usd(model, step) if step is not None else CostBreakdown()
+    provider = (step.provider if step is not None else None) or (provider_key(node.driver, node.provider_instance_id) if node is not None else None)
+    identity = f"{clean(model or 'unknown')} · {clean(family_label(provider))}"
+    cost_label = f"est. {format_usd(cost.total)}" if cost.total > 0 else ""
+    lines.append(Text(identity + cost_label.rjust(max(1, width - len(identity)))))
     lines.append(_section_rule("Tokens", width))
     if step is not None and entry.usage_status == "unavailable":
         lines.append(Text("usage unavailable (not recorded; not zero)"))
@@ -1555,32 +1563,41 @@ def build_activity_detail_lines(
         elif entry.usage_status == "partial":
             field("Usage source", "partial usage recorded")
         total_input = step.input_tokens + step.cache_read_tokens + step.cache_creation_tokens
-        new_input = step.input_tokens + step.cache_creation_tokens
-        bar_width = max(10, min(40, width - 36))
-        read_width = round(bar_width * step.cache_read_tokens / total_input) if total_input else 0
-        bar = Text(f"{' Input':<20} {total_input:>10,}  ")
-        bar.append("█" * read_width, style=KIND_STYLES["cache_read"])
-        bar.append("█" * (bar_width - read_width), style=KIND_STYLES["input"])
+        values = {"cache_read": step.cache_read_tokens, "cache_write": step.cache_creation_tokens, "input": step.input_tokens, "output": step.output_tokens}
+        bar = Text("[")
+        bar.append_text(kind_bar_line(values, max(1, width - 2)))
+        bar.append("]")
         lines.append(bar)
-        read_pct = f"{step.cache_read_tokens / total_input * 100:.1f}%" if total_input else "—"
-        new_pct = f"{new_input / total_input * 100:.1f}%" if total_input else "—"
-        lines.append(Text(f"{'   ├ re-read context':<20} {step.cache_read_tokens:>10,}  {read_pct:>6}   cache read"))
-        breakdown = f"uncached {step.input_tokens:,}" if step.activity_kind == "model_step" else f"cache write {step.cache_creation_tokens:,} + uncached {step.input_tokens:,}"
-        lines.append(Text(f"{'   └ new this turn':<20} {new_input:>10,}  {new_pct:>6}   {breakdown}"))
-        lines.append(Text(f"{' Output':<20} {step.output_tokens:>10,}  thinking {step.thinking_tokens:,} · response {step.response_tokens:,}"))
-        total_line = Text(f"{' Total':<20} {step.total_tokens:>10,}")
-        cost = step_usd(node.model if node is not None else None, step)
+        lines.append(Text(f"{' Prompt · what the model read':<38} {total_input:>10,}"))
+        def token_row(kind: str, label: str, value: int) -> None:
+            pct = f"{value / total_input * 100:.1f}%" if total_input else "—"
+            row = Text("   ")
+            row.append(KIND_GLYPHS[kind], style=KIND_STYLES[kind])
+            row.append(f" {label:<12} {value:>10,} {pct:>6}   {TOKEN_ROW_MEANINGS[kind]:<27}")
+            if cost.total > 0:
+                row.append(f" {format_usd(getattr(cost, kind)):>7}")
+            lines.append(row)
+        token_row("cache_read", "Cache hit", step.cache_read_tokens)
+        if step.cache_creation_tokens:
+            token_row("cache_write", "Cache write", step.cache_creation_tokens)
+        token_row("input", "Uncached", step.input_tokens)
+        output = f"{' Output · what the model wrote':<38} {step.output_tokens:>10,}"
         if cost.total > 0:
-            total_line.append("  est. ")
-            total_line.append(format_usd(cost.total), style="bold")
-            total_line.append(" at API list prices", style="dim")
+            output += f" {format_usd(cost.output):>27}"
+        lines.append(Text(output))
+        if step.thinking_tokens:
+            response = step.response_tokens or max(0, step.output_tokens - step.thinking_tokens)
+            row = Text("   ")
+            row.append(KIND_GLYPHS["output"], style=KIND_STYLES["output"])
+            row.append(f" {'Response':<12} {response:>10,}          {TOKEN_ROW_MEANINGS['response']}")
+            lines.append(row)
+            lines.append(Text(f"     {'Thinking':<12} {step.thinking_tokens:>10,}          {TOKEN_ROW_MEANINGS['thinking']}"))
+        total_line = Text(f"{' Total':<38} {step.total_tokens:>10,}")
+        if cost.total > 0:
+            total_line.append(f"  est. {format_usd(cost.total)} at API list prices")
         elif cost.unpriced_tokens:
             total_line.append("  cost unpriced (no list price for this model)", style="dim")
         lines.append(total_line)
-        if step.context_used_tokens is not None:
-            context = Text(" Context at end  ")
-            context.append_text(Text.from_markup(render_context_bar(step.context_used_tokens, step.context_max_tokens, width=20)))
-            lines.append(context)
     if step is not None:
         rule_index = len(lines)
         lines.append(_section_rule("What it did", width))
@@ -1609,17 +1626,12 @@ def build_activity_detail_lines(
                     if user_rec.truncated:
                         lines.append(Text("  … (truncated)", style="dim"))
     lines.append(_section_rule("Details", width))
-    if node is not None:
-        lines.append(Text(f"Agent: {clean(node.title)} ({clean(node.thread_id[:8])})", style="dim"))
-        lines.append(Text(f"Driver / model: {clean(node.driver)} · {clean(node.model or 'unknown')}", style="dim"))
     if step is not None:
         if step.provider_turn_id:
             lines.append(Text(f"Provider turn id: {clean(step.provider_turn_id)} (ordinal {step.step_index})", style="dim"))
         else:
             lines.append(Text(f"Step index: {step.step_index}", style="dim"))
         lines.append(Text(f"Source: {clean(step.source)}", style="dim"))
-    lines.append(Text(f"Unit of accounting: {clean(entry.accounting_scope)}", style="dim"))
-    lines.append(Text(neutralize(entry.scope_note), style="dim"))
     return lines
 
 

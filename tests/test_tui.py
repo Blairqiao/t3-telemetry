@@ -1038,7 +1038,7 @@ def test_activity_detail_opens_selected_entry_scrolls_and_escape_restores_overvi
         browser.handle_key("j")
     assert screen.detail_scroll == screen.max_detail_scroll
     scrolled = "\n".join(_render_lines(node, nav, 24, 60))
-    assert scrolled != text and "Unit of accounting" in scrolled
+    assert scrolled != text and "Source:" in scrolled
     browser.handle_key("k")
     assert screen.detail_scroll == screen.max_detail_scroll - 1
     assert screen.selected_activity_id == saved[1]  # detail scroll never moved list selection
@@ -1203,7 +1203,7 @@ def test_recorded_command_gives_title_and_inspectable_details():
     assert entry.title == "Run command · uv run pytest (+1 more) · #3"
     assert "Run command · uv run pytest" in text
     assert "Read file · src/app.py" in text
-    assert "Unit of accounting" in text
+    assert "Source:" in text
 
 
 def test_name_only_and_undescribed_turn_fallbacks():
@@ -1215,7 +1215,7 @@ def test_name_only_and_undescribed_turn_fallbacks():
     entry, text = _detail_text(turn)
     assert entry.title == "Provider turn #4 · action details unavailable"
     assert "No actions recorded for this turn." in text
-    assert "not per-tool usage" in text
+    assert "Source:" in text
 
 
 def test_control_characters_neutralized_in_title_and_detail():
@@ -1647,10 +1647,9 @@ def test_w_s_move_selection_and_scroll_activity_details():
     assert screen.detail_item == 0
     # Tab hands W/S back to page scrolling.
     browser.handle_key("TAB")
-    browser.handle_key("w")
-    _render_lines(node, nav, 15, 60)
-    browser.handle_key("w")
-    _render_lines(node, nav, 15, 60)
+    for _ in range(page_scroll + 1):
+        browser.handle_key("w")
+        _render_lines(node, nav, 15, 60)
     assert screen.detail_scroll == 0
     browser.handle_key("s")
     assert screen.detail_scroll == 1 and screen.detail_item == 0
@@ -1763,14 +1762,14 @@ def test_detail_token_split_context_and_reply_filter():
                      output_tokens=907, thinking_tokens=249,
                      context_texts=[RecordedText(role="assistant", text="secret reply")])
     _, text = _detail_text(step)
-    for value in ("re-read context", "241,250", "99.6%", "new this turn", "949", "Total", "243,106"):
+    for value in ("Cache hit", "241,250", "99.6%", "Uncached", "943", "Total", "243,106"):
         assert value in text
     assert "Context at end" not in text
     assert "secret reply" not in text and "Recorded reply" not in text
     step.context_used_tokens = 100
     step.context_max_tokens = 1000
     _, text = _detail_text(step)
-    assert "Context at end" in text
+    assert "Context at end" not in text
 
 
 def test_detail_view_claude_turn_with_mixed_timeline():
@@ -2592,3 +2591,21 @@ def test_session_tabs_without_children_and_activity_escape():
     nav.sync_children(["child"])
     nav.enter()
     assert nav.detail_id == "child"
+
+
+def test_detail_token_rows_and_step_pricing():
+    from t3_telemetry.models import ModelStep
+    from t3_telemetry.usage import step_usd
+
+    step = ModelStep(step_index=1, activity_kind="provider_turn", model="claude-opus-5-5", provider="claude", input_tokens=49, cache_read_tokens=241250, cache_creation_tokens=900, output_tokens=907, thinking_tokens=207, response_tokens=700)
+    _, text = _detail_text(step)
+    for value in ("Claude", "Cache hit", "241,250", "99.6%", "Cache write", "900", "0.4%", "Uncached", "49", "Response", "700", "Thinking", "207"):
+        assert value in text
+    cost = step_usd(step.model, step)
+    assert abs(sum(round(getattr(cost, kind), 2) for kind in ("cache_read", "cache_write", "input", "output")) - cost.total) <= 0.02
+    for kind in ("cache_read", "cache_write", "input", "output"):
+        assert f"${getattr(cost, kind):.2f}" in text
+    step.cache_creation_tokens = 0
+    step.thinking_tokens = 0
+    _, text = _detail_text(step)
+    assert "Cache write" not in text and "Response" not in text and "Thinking" not in text
