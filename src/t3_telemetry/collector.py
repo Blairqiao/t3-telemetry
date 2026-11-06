@@ -1,6 +1,7 @@
 """Discover native telemetry and incrementally ingest it into the store."""
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ from t3_telemetry.db_t3 import T3StateSnapshot
 from t3_telemetry.sources.antigravity import parse_antigravity_conversation
 from t3_telemetry.sources.claude import parse_claude_file
 from t3_telemetry.sources.codex import parse_codex_file
-from t3_telemetry.store import TelemetryStore
+from t3_telemetry.store import TelemetryStore, utc_iso
 from t3_telemetry.t3_mirror import mirror_t3_graph
 
 
@@ -79,7 +80,8 @@ class Collector:
                     continue
                 offset = previous[2] if previous and size >= previous[2] else 0
                 if provider == "claude":
-                    result = parse_claude_file(path, offset)
+                    key = self.store.get_file_session_key(path)
+                    result = parse_claude_file(path, offset, turn_id=self.store.last_turn_id(key) if offset else None)
                 elif provider == "codex":
                     key = self.store.get_file_session_key(path) if offset else None
                     session_id = key.removeprefix("codex:") if key and key.startswith("codex:") else None
@@ -88,6 +90,8 @@ class Collector:
                     result = parse_antigravity_conversation(path.stem, self.roots.t3_dir, reader=self.reader)
                 self.store.upsert_sessions(result.sessions)
                 self.store.upsert_steps(result.steps)
+                self.store.upsert_turns(result.turns)
+                self.store.upsert_items(result.items)
                 key = result.sessions[0].session_key if result.sessions else None
                 self.store.set_file(path, provider, size, mtime, result.offset, key)
                 models.update((s.session_key, s.model) for s in result.sessions if s.model is not None)
@@ -97,4 +101,5 @@ class Collector:
                 stats.errors += 1
         if snapshot is not None:
             mirror_t3_graph(self.store, snapshot)
+        self.store.set_meta("last_sync_at", utc_iso(datetime.now(timezone.utc)))
         return stats
