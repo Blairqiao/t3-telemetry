@@ -28,7 +28,7 @@ from t3_telemetry.aggregator import (
     snapshot_thread_status,
 )
 from datetime import datetime, timezone, timedelta
-from t3_telemetry.usage import UsageCache, UsageReport, PERIOD_LABELS, node_cost, read_store_usage_report, stats_for_node
+from t3_telemetry.usage import PROVIDER_ORDER, UsageCache, UsageReport, PERIOD_LABELS, node_cost, read_store_usage_report, stats_for_node
 from t3_telemetry.collector import Collector, default_roots
 from t3_telemetry.store import TelemetryStore, session_rows
 from t3_telemetry.db_t3 import T3StateSnapshot, read_t3_state
@@ -1091,7 +1091,9 @@ def _period_body(usage, nav, inner_height, inner_width, now) -> list:
         dict(headline_on=False, legend="compact", kpis_on=False),
         dict(headline_on=False, legend="none", kpis_on=False),
     )
-    rest_min = 12
+    min_pm_rows = provider_model_row_count(p.stats, len(p.by_provider)) or 1
+    thinking_lines = int(p.stats.thinking_tokens > 0)
+    rest_min = 12 + min_pm_rows + thinking_lines
     for variant in variants:
         lines = breakdown_lines(p.stats, nav.measure, inner_width, scope=SCOPE_PHRASE[nav.period], **variant)
         if 1 + len(lines) + rest_min <= inner_height:
@@ -1099,35 +1101,36 @@ def _period_body(usage, nav, inner_height, inner_width, now) -> list:
             break
     inner_height_rest = inner_height - len(block)
     plot_rows = 4 if inner_height_rest <= 24 else (6 if inner_height_rest <= 34 else 8)
-    providers = list(p.by_provider.items())
     graph = usage_graph_lines(p, inner_width, plot_rows, now, split=nav.graph_split, measure=nav.measure)
-    if 1 + 1 + len(graph) + 1 + 1 + max(1, len(providers)) + 2 > inner_height_rest:
+    if 1 + 1 + len(graph) + 1 + 1 + thinking_lines + min_pm_rows + 4 > inner_height_rest:
         plot_rows = 3
         graph = usage_graph_lines(p, inner_width, plot_rows, now, split=nav.graph_split, measure=nav.measure)
-    show_header = 1 + 1 + len(graph) + 1 + 1 + max(1, len(providers)) + 2 <= inner_height_rest
-    provider_rows = max(1, min(max(1, len(providers)), inner_height_rest - (1 + 1 + len(graph) + 1 + int(show_header) + 2)))
-    table = Table(box=None, expand=True, padding=(0, 1), show_header=show_header, pad_edge=False, show_edge=False, header_style="dim")
-    # Short headers below 70 columns so token values are never cut off.
-    columns = ("Provider", "Input", "Cache read", "Cache write", "Output", "Total") if inner_width >= 70 else ("Provider", "In", "Cache R", "Cache W", "Out", "Total")
-    for col in columns:
-        table.add_column(col, justify="left" if col == "Provider" else "right", no_wrap=True, overflow="ellipsis")
-    for name, tokens in providers[:provider_rows]:
-        if nav.measure == "usd":
-            c = p.cost_by_provider.get(name)
-            values = (c.input, c.cache_read, c.cache_write, c.output, c.total) if c else (0.0,) * 5
-        else:
-            values = (tokens.input_tokens, tokens.cache_read_tokens, tokens.cache_creation_tokens, tokens.output_tokens, tokens.total)
-        table.add_row(name, *(format_measure(v, nav.measure) for v in values))
-    if not providers:
-        table.add_row("No usage recorded", "", "", "", "", "")
+    show_header = 1 + 1 + len(graph) + 1 + 1 + thinking_lines + min_pm_rows + 4 <= inner_height_rest
+    fixed_lines = 1 + 1 + 1 + int(show_header) + thinking_lines + 1
+    pm_rows = max(min_pm_rows, min(provider_model_row_count(p.stats, 10**6), inner_height_rest - len(graph) - fixed_lines - 3))
+    table = build_provider_model_table(p.stats, nav.measure, inner_width, max_rows=pm_rows, show_header=show_header)
+    thinking_line = None
+    if p.stats.thinking_tokens > 0:
+        entries = [f"Thinking {format_tokens(p.stats.thinking_tokens)} (included in output)"]
+        for prov in PROVIDER_ORDER:
+            n = p.stats.provider_thinking.get(prov, 0)
+            if n > 0:
+                entries.append(f"{prov} {format_tokens(n)}")
+        for prov, n in p.stats.provider_thinking.items():
+            if prov not in PROVIDER_ORDER and n > 0:
+                entries.append(f"{prov} {format_tokens(n)}")
+        thinking_line = _fit(Text(" · ".join(entries), style="dim"), inner_width)
     threads = p.top(nav.measure)
-    rows = max(1, inner_height_rest - (1 + 1 + len(graph) + 1 + int(show_header) + provider_rows + 1))
+    rows = max(1, inner_height_rest - (len(graph) + fixed_lines + pm_rows))
     ids = [t.thread_id for t in threads]
     selected = ids.index(nav.selected_top_id) if nav.selected_top_id in ids else 0
     start_idx = window_start(len(threads), selected, nav.top_scroll, rows)
     nav.top_scroll = start_idx
     window = threads[start_idx:start_idx + rows]
-    result = [header, *block, section_rule("Usage over time", inner_width), *graph, section_rule("Providers", inner_width), table, section_rule("Top threads", inner_width, note=activity_range_label(start_idx, len(window), len(threads)), focused=True)]
+    result = [header, *block, section_rule("Usage over time", inner_width), *graph, section_rule("Providers & models", inner_width), table]
+    if thinking_line is not None:
+        result.append(thinking_line)
+    result.append(section_rule("Top threads", inner_width, note=activity_range_label(start_idx, len(window), len(threads)), focused=True))
     # Fixed provider and token columns so titles all end at the same place.
     provider_labels = ["+".join(t.providers) for t in window]
     token_labels = [_usage_label(t, nav.measure) for t in window]

@@ -2110,7 +2110,7 @@ def test_period_live_flow_and_frame_size(monkeypatch):
         Console(file=output, width=width, height=height, force_terminal=True, color_system=None).print(frame)
         return output.getvalue()
     frames = [render(frame) for frame in capture.updates]
-    assert any("This week" in f and "Providers" in f and "Top threads" in f for f in frames)
+    assert any("This week" in f and "Providers & models" in f and "Top threads" in f for f in frames)
     assert any("This week ›" in f for f in frames)
     assert "Top threads" in frames[-2] and "App Threads" in frames[-1]
     for width, height in [(60, 24), (120, 40)]:
@@ -2121,17 +2121,65 @@ def test_period_live_flow_and_frame_size(monkeypatch):
         assert "Breakdown" in output and "Top threads" in output
         assert "█" in output
         if width == 120:
-            assert "Cache read" in output and "went to subagents" in output
+            assert "Cache hit" in output and "went to subagents" in output
         nav.measure = "usd"
         output = render(cli._browser_frame([], None, None, nav, height, width, usage=report, now=now), width, height)
         assert "est. $" in output and "Top threads" in output
 
     # At the 60-column minimum, the widest provider row keeps every token value intact.
     big = TokenBreakdown(input_tokens=8_980_000, cache_read_tokens=217_530_000, cache_creation_tokens=2_670_000, output_tokens=1_910_000)
+    report.periods["month"].stats.add("gemini-2-5-pro", now, 8_980_000, 217_530_000, 2_670_000, 1_910_000, False, family="Antigravity")
     report.periods["month"].by_provider = {"Antigravity": big}
     frame = cli._browser_frame([], None, None, NavigationState(period="month"), 24, 60, usage=report, now=now)
-    row = next(line for line in render(frame, 60, 24).splitlines() if "Antigravity" in line and "217.53M" in line)
+    row = next(line for line in render(frame, 60, 24).splitlines() if "Antigravity" in line and "231.09M" in line)
     assert "…" not in row and "231.09M" in row
+
+
+def test_period_provider_model_table_expansion_and_top_threads_budget():
+    from datetime import datetime, timezone
+    from t3_telemetry import cli
+    from t3_telemetry.usage import ThreadUsage, TokenBreakdown, build_store_usage_report
+    from t3_telemetry.store import TelemetryStore
+
+    now = datetime(2026, 11, 4, tzinfo=timezone.utc)
+    report = build_store_usage_report(TelemetryStore(":memory:"), now)
+    p = report.periods["month"]
+    p.stats.add("claude-sonnet-4-5", now, 1000, 2000, 300, 400, False, family="Claude", thinking=25)
+    p.stats.add("claude-haiku-3-5", now, 500, 1000, 100, 200, False, family="Claude")
+    p.stats.add("o3", now, 2000, 3000, 400, 500, False, family="Codex", thinking=15)
+    p.by_provider = {
+        "Claude": TokenBreakdown(1500, 3000, 400, 600),
+        "Codex": TokenBreakdown(2000, 3000, 400, 500),
+    }
+    for i in range(10):
+        p.threads.append(ThreadUsage(f"t{i}", f"Thread {i}", "idle", ["Claude"], TokenBreakdown(input_tokens=100 * (10 - i))))
+
+    def render(frame, width, height):
+        output = io.StringIO()
+        Console(file=output, width=width, height=height, force_terminal=True, color_system=None).print(frame)
+        return output.getvalue()
+
+    nav = NavigationState(period="month")
+    frame40 = cli._browser_frame([], None, None, nav, 40, 120, usage=report, now=now)
+    out40 = render(frame40, 120, 40)
+    assert len(out40.splitlines()) == 40
+    assert "Providers & models" in out40
+    assert "└ claude-sonnet-4-5" in out40
+    assert "└ claude-haiku-3-5" in out40
+    assert "Codex · o3" in out40
+    for col in ("Cache hit", "Cache write", "Uncached", "Output", "Total", "Hit %"):
+        assert col in out40
+    assert "Thinking 40 (included in output) · Claude 25 · Codex 15" in out40
+
+    frame24 = cli._browser_frame([], None, None, nav, 24, 80, usage=report, now=now)
+    out24 = render(frame24, 80, 24)
+    assert len(out24.splitlines()) == 24
+    assert "Providers & models" in out24
+    assert "Claude · 2 models" in out24
+    assert "Codex · o3" in out24
+    assert "Thinking 40 (included in output) · Claude 25 · Codex 15" in out24
+    thread_rows = [l for l in out24.splitlines() if "Thread " in l]
+    assert len(thread_rows) >= 3
 
 @pytest.mark.parametrize("width,height", [(60, 24), (120, 40)])
 def test_home_sections_and_running_clock(width, height):
