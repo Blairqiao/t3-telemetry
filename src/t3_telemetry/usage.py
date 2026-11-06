@@ -5,7 +5,7 @@ import time as clock_time
 from pathlib import Path
 from typing import Callable
 
-from .aggregator import build_thread_telemetry, snapshot_thread_status
+from .aggregator import snapshot_thread_status
 from .db_t3 import T3StateSnapshot
 
 from bisect import bisect_right
@@ -279,65 +279,7 @@ def period_window(key: str, now: datetime) -> PeriodWindow:
     return PeriodWindow(key, PERIOD_LABELS[key], start, end, "hour" if key == "today" else "day", starts)
 
 
-def build_usage_report(roots: list[ThreadTelemetryNode], now: datetime) -> UsageReport:
-    windows = {key: period_window(key, now) for key in PERIODS}
-    periods = {key: _new_period(w) for key, w in windows.items()}
-    utc_starts = {key: [d.astimezone(timezone.utc) for d in w.bucket_starts] for key, w in windows.items()}
-    all_time: dict[str, ThreadUsage] = {}
-    seen = set()
-    for root in roots:
-        totals = {key: TokenBreakdown() for key in PERIODS}
-        costs = {key: CostBreakdown() for key in PERIODS}
-        families = {key: {} for key in PERIODS}
-        lifetime = ThreadUsage(root.thread_id, root.title, root.status, [], TokenBreakdown())
-        lifetime_families: set[str] = set()
-        stack = [(root, False)]
-        while stack:
-            node, is_subagent = stack.pop()
-            stack.extend((child, True) for child in reversed(node.subagents))
-            for step in node.steps:
-                identity = (node.thread_id, step.source, step.provider_turn_id, step.step_index)
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                family = provider_family(node.driver, node.provider_instance_id)
-                counts = (step.input_tokens, step.cache_read_tokens, step.cache_creation_tokens, step.output_tokens)
-                try:
-                    t = datetime.fromisoformat(step.started_at).astimezone(timezone.utc)
-                except (TypeError, ValueError):
-                    t = None
-                cost = step_cost(node.model, t, *counts)
-                lifetime.tokens.add_counts(*counts)
-                lifetime.cost.add(cost)
-                if sum(counts):
-                    lifetime_families.add(family)
-                if t is None:
-                    continue
-                for key, usage in periods.items():
-                    w = usage.window
-                    if not w.start.astimezone(timezone.utc) <= t < w.end.astimezone(timezone.utc):
-                        continue
-                    usage.stats.add(node.model, t, *counts, subagent=is_subagent, family=family)
-                    _add_to_period(usage, bisect_right(utc_starts[key], t) - 1, family,
-                                   "Subagents" if is_subagent else "Main", counts, cost)
-                    totals[key].add_counts(*counts)
-                    costs[key].add(cost)
-                    families[key].setdefault(family, TokenBreakdown()).add_counts(*counts)
-        if lifetime.tokens.total > 0:
-            lifetime.providers = [f for f in PROVIDER_ORDER if f in lifetime_families]
-        all_time[root.thread_id] = lifetime
-        for key, usage in periods.items():
-            if totals[key].total > 0:
-                usage.threads.append(ThreadUsage(root.thread_id, root.title, root.status, [f for f in PROVIDER_ORDER if f in families[key] and families[key][f].total > 0], totals[key], costs[key]))
-    for usage in periods.values():
-        _finish_period(usage)
-    return UsageReport(now.astimezone(now.tzinfo), periods, all_time)
 
-
-def read_usage_report(t3_dir: Path | str, snapshot: T3StateSnapshot, now: datetime | None = None) -> UsageReport:
-    roots = [t for t in snapshot.threads.values() if t.parent_thread_id is None and t.deleted_at is None]
-    trees = [build_thread_telemetry(t.thread_id, t3_dir, snapshot=snapshot) for t in roots]
-    return build_usage_report(trees, now or datetime.now().astimezone())
 
 
 def build_store_usage_report(store: TelemetryStore, now: datetime,
@@ -407,6 +349,10 @@ def read_store_usage_report(store: TelemetryStore, snapshot: T3StateSnapshot,
     return build_store_usage_report(store, now or datetime.now().astimezone(), statuses)
 
 
+def _default_usage_reader(*_args: object, **_kwargs: object) -> UsageReport:
+    raise ValueError("UsageCache needs a reader")
+
+
 class UsageCache:
     """Rebuild the usage report at most every ``max_age`` seconds.
 
@@ -416,11 +362,11 @@ class UsageCache:
     """
 
     def __init__(self, max_age: float = 5.0, clock: Callable[[], float] = clock_time.monotonic,
-                 reader: Callable[[Path, T3StateSnapshot], UsageReport] | None = None,
+                 reader: Callable[..., UsageReport] | None = None,
                  background: bool = False) -> None:
         self.max_age = max_age
         self.clock = clock
-        self.reader = reader or read_usage_report
+        self.reader = reader or _default_usage_reader
         self.background = background
         self.report: UsageReport | None = None
         self.built_at: float | None = None  # time of the last attempt, successful or not

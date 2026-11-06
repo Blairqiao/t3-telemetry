@@ -1,6 +1,6 @@
 # t3-telemetry
 Live terminal telemetry dashboard and command-line inspector for T3 Code and Antigravity.
-`t3-top` aggregates token consumption, context window usage, cache efficiency, thinking tokens, and execution latency across T3 Code threads and delegated subagent hierarchies. It connects to local T3 SQLite databases using read-only URIs (`?mode=ro`) without locking or interrupting active agent runs.
+`t3-top` aggregates token consumption, context window usage, cache efficiency, thinking tokens, and execution latency across T3 Code threads and delegated subagent hierarchies. It uses native harness files as the primary source of token numbers and activity, backed by a local telemetry store, and connects to local T3 SQLite databases using read-only URIs (`?mode=ro`) for the thread tree, titles, and status without locking or interrupting active agent runs.
 
 ## Installation
 
@@ -122,13 +122,15 @@ The top telemetry header operates independently of the selected screen:
 
 Token telemetry is reported across three explicit scopes:
 
-1. Current turn: Metrics for the active or latest provider turn. If an active turn is still in-flight or the provider has not yet published token counts, current turn availability is reported as unavailable rather than inventing zero usage.
+1. Current turn: Metrics for the active or latest provider turn reconstructed from harness turn records. Claude turns start at each user prompt. If an active turn is still in-flight or token counts have not yet been recorded, current turn availability is reported as unavailable rather than inventing zero usage.
 2. Whole chat · this agent: Metrics consumed directly by the inspected agent, excluding child activity.
 3. Chat + subagents: Totals for the inspected agent and its descendants. Child activity stays separate from the agent's own activity.
 
+When the store is synchronizing or awaiting its initial sync, metric scopes, activity tokens, and thread totals report `syncing…` until incremental ingestion is ready. Telemetry rollups also report a provider split (`by_provider`) breaking down token totals across provider families (Claude, Codex, Antigravity).
+
 Provider turns (Claude or Codex turn boundaries) and model inference steps (Antigravity steps) are tracked distinctly via `provider_turn_count` and `model_step_count`. Duration is the sum of recorded agent step and turn durations. Concurrent subagents can overlap, so this total is not wall-clock elapsed time.
 
-For Claude/Codex, uncached input is now `inputTokens − cached − cache creation`, totals include cache creation, and `--json` steps and summaries include `new_input_tokens` and `context_read_tokens`.
+Claude records uncached input directly; for Codex, uncached input is `inputTokens − cached − cache creation`, totals include cache creation, and `--json` steps and summaries include `new_input_tokens` and `context_read_tokens`.
 
 #### Activity details and retention
 
@@ -197,9 +199,9 @@ The collector scans three native agent directories:
 
 The store is a SQLite database located at `~/.t3-telemetry/telemetry.sqlite` by default. You can specify a different location with `--store`.
 
-Only token counts and session metadata are stored. Tracked metrics include input tokens, cache read tokens, cache creation tokens, output tokens, thinking tokens, timestamps, model identifiers, tool names, session keys, and T3 thread bindings. Message text, prompts, completions, system instructions, and tool outputs are never written to the store.
+The store records token counts, session metadata, turn boundaries, prompts, replies, and activity details from harness files. Prompts and replies are limited to 2,000 characters each; activity item text is limited to 300 characters. Stored history remains available if the harness deletes its logs.
 
-The local store powers calendar usage views across Today, This week, and This month. Detailed thread overviews, turn metrics, real-time activity streams, and context occupancy graphs read directly from live T3 and Antigravity database files.
+The local store powers calendar usage views across Today, This week, and This month, as well as thread telemetry overviews, turn metrics, and activity streams. Harness files supply token numbers and activity details, while T3 provides the thread tree, titles, and thread status. While background syncing is underway or awaiting completion, affected metrics report `syncing…`.
 
 ### Origin detection
 
@@ -238,7 +240,7 @@ Specify a custom store path:
 t3-top --store /path/to/custom/telemetry.sqlite
 ```
 
-Disable the local store and read usage directly from T3 state:
+Do not sync native session files in the background; read the store as it is:
 
 ```bash
 t3-top --no-store
@@ -248,14 +250,15 @@ t3-top --no-store
 
 1. `protobuf.py`: Pure-Python wire parser decoding varints and packed length-delimited fields from Antigravity SQLite metadata blobs without external protobuf compilation dependencies.
 2. `db_agy.py`: Reader extracting step timings, token counts, and tool names from Antigravity database files and transcript logs.
-3. `db_t3.py`: Read-only SQLite client querying T3 `statev2.sqlite` projection tables for thread lineage, context window gauges, and turn usage records.
+3. `db_t3.py`: Read-only SQLite client querying T3 `statev2.sqlite` projection tables for thread lineage, titles, and thread status.
 4. `store.py`: Persistent SQLite store recording incremental file offsets, native sessions, step token counts, tool names, and mirrored T3 bindings.
 5. `sources/`: Native file parsers for Claude JSONL transcripts, Codex rollout logs, and Antigravity databases.
 6. `collector.py`: Incremental discovery and ingestion engine syncing native agent files into the local telemetry store.
 7. `t3_mirror.py`: Graph synchronizer mirroring T3 app threads and provider session bindings into the store.
-8. `aggregator.py`: Tree aggregator resolving thread hierarchies, linking delegated subagents and native runs, and accumulating self and rollup metrics.
-9. `ui.py`: Rich terminal renderables generating context gauges, summary metric comparisons, recursive subagent trees, and step stream tables.
-10. `cli.py`: Command-line interface supporting live monitoring, snapshot printing, list queries, store sync, and JSON serialization.
+8. `thread_view.py`: Builder constructing thread telemetry trees, activity entries, and rollup metrics from the owned store.
+9. `aggregator.py`: Subagent launch merger and thread status resolver.
+10. `ui.py`: Rich terminal renderables generating context gauges, summary metric comparisons, recursive subagent trees, and step stream tables.
+11. `cli.py`: Command-line interface supporting live monitoring, snapshot printing, list queries, store sync, and JSON serialization.
 
 ## License
 

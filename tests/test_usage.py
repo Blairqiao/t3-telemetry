@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from t3_telemetry.models import ModelStep, ThreadTelemetryNode
-from t3_telemetry.usage import build_usage_report, period_window, provider_family, stats_for_node
+from t3_telemetry.usage import UsageCache, period_window, provider_family, stats_for_node
 
 ZONE = ZoneInfo("America/Los_Angeles")
 NOW = datetime(2026, 11, 4, 20, tzinfo=ZONE)
@@ -36,57 +36,10 @@ def test_families():
     assert provider_family(None, "codex_x") == "Codex"
 
 
-def test_aggregation():
-    child_step = step(1, "2026-11-05T02:00:00Z", 20)
-    child = node("child", "Child", "antigravity_gemini_secondary", [child_step, child_step])
-    root = node("root", "Root", "claude", [step(1, "2026-11-04T08:00:00Z"), step(2, None), step(3, "bad"), step(4, "2026-11-05T08:00:00Z"), step(5, "2026-11-01T19:00:00Z")], [child, child])
-    report = build_usage_report([root, node("zero", "Zero", "codex")], NOW)
-    today = report.periods["today"]
-    assert today.total.total == 30
-    assert today.buckets[18] == {"Antigravity": 20}
-    assert today.buckets[0] == {"Claude": 10}
-    assert today.scope_buckets[18] == {"Subagents": 20}
-    assert today.scope_buckets[0] == {"Main": 10}
-    assert today.stats.subagent_tokens.total == 20
-    for usage in report.periods.values():
-        assert sum(sum(b.values()) for b in usage.scope_buckets) == sum(sum(b.values()) for b in usage.buckets)
-        assert usage.stats.tokens.total == usage.total.total
-    assert today.threads[0].tokens.total == 30
-    assert today.threads[0].providers == ["Claude", "Antigravity"]
-    assert {k: v.total for k, v in today.by_provider.items()} == {"Claude": 10, "Antigravity": 20}
-    assert report.periods["week"].total.total == 40  # end of today is within week
-    assert report.periods["month"].total.total == 50
-    assert report.root_total("today", "missing") == 0
-    assert len(today.threads) == 1
-
-
-def test_stats_for_node():
-    child = node("child", "Child", "codex", [ModelStep(step_index=1, started_at=None, input_tokens=1_000_000)])
-    child.model = "gpt-6.1-sol"
-    root = node("root", "Root", "claude", [ModelStep(step_index=1, started_at="bad", output_tokens=1_000_000)], [child, child])
-    root.model = "claude-opus-5-5"
-    stats = stats_for_node(root)
-    assert stats.tokens.total == 2_000_000
-    assert stats.subagent_tokens.total == 1_000_000
-    assert stats.steps == 2
-    assert stats.model_tokens == {"claude-opus-5-5": 1_000_000, "gpt-6.1-sol": 1_000_000}
-    assert stats.cost.total == pytest.approx(24.0)
-    assert stats.subagent_cost.total == pytest.approx(4.0)
-
-
-def test_stats_large_context_and_unpriced():
-    root = node("root", "Root", "claude", [ModelStep(step_index=1, started_at=None, input_tokens=60_000, cache_read_tokens=150_000)])
-    stats = stats_for_node(root)
-    assert stats.large_context_steps == 1
-    assert stats.cost.unpriced_tokens == 210_000
-
-
-def test_sort_and_token_fields():
-    s = ModelStep(step_index=1, started_at="2026-11-05T02:00:00Z", input_tokens=1, cache_read_tokens=2, cache_creation_tokens=3, output_tokens=4)
-    roots = [node("z", "Z", "codex", [s]), node("a", "A", "codex", [s]), node("big", "Big", "codex", [step(1, s.started_at, 11)])]
-    rows = build_usage_report(roots, NOW).periods["today"].threads
-    assert [r.title for r in rows] == ["Big", "A", "Z"]
-    assert rows[1].tokens.total == 10
+def test_usage_cache_needs_reader(tmp_path):
+    cache = UsageCache()
+    with pytest.raises(ValueError, match="UsageCache needs a reader"):
+        cache.get(tmp_path, None)
 
 
 def test_usage_cache_ttl_force_and_failure(tmp_path):
@@ -282,33 +235,7 @@ def priced(index, date, model_tokens=1_000_000):
     return ModelStep(step_index=index, started_at=date, input_tokens=model_tokens)
 
 
-def test_cost_series_lifetime_and_top_order():
-    # claude-opus-5-5 input is $4/M; claude-sonnet-5-5 is $2/M (neither has a long-context tier).
-    cheap = ThreadTelemetryNode(thread_id="cheap", title="Cheap", driver="codex", provider_instance_id=None,
-                                model="claude-sonnet-5-5", steps=[priced(1, "2026-11-05T02:00:00Z", 3_000_000)])
-    child = ThreadTelemetryNode(thread_id="kid", title="Kid", driver="claude", provider_instance_id=None,
-                                model="claude-opus-5-5", steps=[priced(1, "2026-11-05T02:00:00Z")])
-    pricey = ThreadTelemetryNode(thread_id="pricey", title="Pricey", driver="claude", provider_instance_id=None,
-                                 model="claude-opus-5-5", steps=[priced(1, "2026-11-05T02:00:00Z"), priced(2, "2026-10-01T02:00:00Z")],
-                                 subagents=[child])
-    report = build_usage_report([cheap, pricey], NOW)
-    today = report.periods["today"]
-    assert today.stats.cost.total == pytest.approx(14.0)
-    assert sum(sum(b.values()) for b in today.cost_buckets) == pytest.approx(14.0)
-    assert sum(sum(b.values()) for b in today.scope_cost_buckets) == pytest.approx(14.0)
-    assert today.scope_cost_buckets[18] == {"Main": pytest.approx(10.0), "Subagents": pytest.approx(4.0)}
-    assert {k: round(v.total, 2) for k, v in today.cost_by_provider.items()} == {"Claude": 8.0, "Codex": 6.0}
-    assert today.series("provider", "usd") is today.cost_buckets
-    assert today.series("scope", "tokens") is today.scope_buckets
-    # Token order puts Cheap (3M) ahead of Pricey (2M); dollar order flips it.
-    assert [t.thread_id for t in today.top("tokens")] == ["cheap", "pricey"]
-    assert [t.thread_id for t in today.top("usd")] == ["pricey", "cheap"]
-    assert today.total_value("usd") == pytest.approx(14.0)
-    assert report.root_total("today", "pricey", "usd") == pytest.approx(8.0)
-    # Lifetime totals include steps outside every period window.
-    assert report.lifetime("pricey") == 3_000_000
-    assert report.lifetime("pricey", "usd") == pytest.approx(12.0)
-    assert report.lifetime("missing") is None
+
 
 
 def test_node_and_turn_cost():
@@ -381,3 +308,24 @@ def test_provider_split_and_serialization():
     assert data["by_provider"] == split
     assert sum(v["total_tokens"] for v in split.values()) == data["rollup_metrics"]["total_tokens"]
     assert data["current_turn_metrics"]["turn_id"] == "turn"
+
+
+def test_stats_for_node():
+    child = node("child", "Child", "codex", [ModelStep(step_index=1, started_at=None, input_tokens=1_000_000)])
+    child.model = "gpt-6.1-sol"
+    root = node("root", "Root", "claude", [ModelStep(step_index=1, started_at="bad", output_tokens=1_000_000)], [child, child])
+    root.model = "claude-opus-5-5"
+    stats = stats_for_node(root)
+    assert stats.tokens.total == 2_000_000
+    assert stats.subagent_tokens.total == 1_000_000
+    assert stats.steps == 2
+    assert stats.model_tokens == {"claude-opus-5-5": 1_000_000, "gpt-6.1-sol": 1_000_000}
+    assert stats.cost.total == pytest.approx(24.0)
+    assert stats.subagent_cost.total == pytest.approx(4.0)
+
+
+def test_stats_large_context_and_unpriced():
+    root = node("root", "Root", "claude", [ModelStep(step_index=1, started_at=None, input_tokens=60_000, cache_read_tokens=150_000)])
+    stats = stats_for_node(root)
+    assert stats.large_context_steps == 1
+    assert stats.cost.unpriced_tokens == 210_000

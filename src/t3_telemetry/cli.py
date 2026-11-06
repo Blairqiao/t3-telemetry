@@ -24,7 +24,6 @@ from rich.text import Text
 from t3_telemetry.activity import build_activity_entries, launch_targets
 from t3_telemetry.aggregator import (
     running_root_ids,
-    read_t3_state,
     resolve_thread_id_in_snapshot,
     snapshot_thread_status,
 )
@@ -32,7 +31,7 @@ from datetime import datetime, timezone, timedelta
 from t3_telemetry.usage import UsageCache, UsageReport, PERIOD_LABELS, node_cost, read_store_usage_report, stats_for_node
 from t3_telemetry.collector import Collector, default_roots
 from t3_telemetry.store import TelemetryStore, session_rows
-from t3_telemetry.db_t3 import T3StateSnapshot
+from t3_telemetry.db_t3 import T3StateSnapshot, read_t3_state
 from t3_telemetry.thread_view import build_thread_node, resolve_thread_node, list_root_nodes
 
 from t3_telemetry.context_history import ContextHistoryStore, make_agent_key

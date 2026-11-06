@@ -2035,10 +2035,11 @@ def test_period_live_flow_and_frame_size(monkeypatch):
     from datetime import datetime, timezone
     from types import SimpleNamespace
     from t3_telemetry import cli
-    from t3_telemetry.usage import build_usage_report, ThreadUsage, TokenBreakdown
+    from t3_telemetry.usage import ThreadUsage, TokenBreakdown, build_store_usage_report
+    from t3_telemetry.store import TelemetryStore
 
     now = datetime(2026, 11, 4, tzinfo=timezone.utc)
-    report = build_usage_report([], now)
+    report = build_store_usage_report(TelemetryStore(":memory:"), now)
     report.periods["month"].stats.add("claude-sonnet-4-5", now, 1000, 2000, 300, 400, True)
     for period in report.periods.values():
         period.threads.append(ThreadUsage("th", "Parent", "idle", ["Codex"], TokenBreakdown(input_tokens=100)))
@@ -2086,7 +2087,8 @@ def test_home_sections_and_running_clock(width, height):
     from datetime import datetime, timezone, timedelta
     from types import SimpleNamespace
     from t3_telemetry.models import ThreadTelemetryNode, ModelStep
-    from t3_telemetry.usage import build_usage_report
+    from t3_telemetry.usage import build_store_usage_report
+    from t3_telemetry.store import TelemetryStore
     from t3_telemetry.ui import format_duration
 
     now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
@@ -2095,7 +2097,7 @@ def test_home_sections_and_running_clock(width, height):
     snapshot = SimpleNamespace(provider_turns_by_thread={"root": [turn]}, get_provider_thread=lambda _: None)
     nav = NavigationState()
     frame = _browser_frame([], None, summary, nav, height, width, snapshot=snapshot,
-                           usage=build_usage_report([], now), now=now, running_ids=["root", "a", "b"])
+                           usage=build_store_usage_report(TelemetryStore(":memory:"), now), now=now, running_ids=["root", "a", "b"])
     buf = io.StringIO()
     Console(file=buf, width=width, height=height, force_terminal=True, color_system=None).print(frame)
     output = buf.getvalue()
@@ -2121,7 +2123,8 @@ def test_home_polish_empty_list_naive_clock_and_single_today_date():
     from datetime import datetime, timezone, timedelta
     from types import SimpleNamespace
     from t3_telemetry.models import ThreadTelemetryNode, ModelStep
-    from t3_telemetry.usage import build_usage_report
+    from t3_telemetry.usage import build_store_usage_report
+    from t3_telemetry.store import TelemetryStore
     from t3_telemetry.ui import format_duration
 
     now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
@@ -2130,7 +2133,7 @@ def test_home_polish_empty_list_naive_clock_and_single_today_date():
     turn = ModelStep(step_index=1, status="running", started_at=naive_start)
     snapshot = SimpleNamespace(provider_turns_by_thread={"root": [turn]}, get_provider_thread=lambda _: None)
     frame = _browser_frame([], None, summary, NavigationState(), 24, 80, snapshot=snapshot,
-                           usage=build_usage_report([], now), now=now, running_ids=[])
+                           usage=build_store_usage_report(TelemetryStore(":memory:"), now), now=now, running_ids=[])
     buf = io.StringIO()
     Console(file=buf, width=80, height=24, force_terminal=True, color_system=None).print(frame)
     output = buf.getvalue()
@@ -2142,10 +2145,11 @@ def test_home_polish_empty_list_naive_clock_and_single_today_date():
 
 def test_period_top_threads_align_columns():
     from datetime import datetime, timezone
-    from t3_telemetry.usage import build_usage_report, ThreadUsage, TokenBreakdown
+    from t3_telemetry.usage import ThreadUsage, TokenBreakdown, build_store_usage_report
+    from t3_telemetry.store import TelemetryStore
 
     now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
-    report = build_usage_report([], now)
+    report = build_store_usage_report(TelemetryStore(":memory:"), now)
     report.periods["week"].threads = [
         ThreadUsage("a", "Alpha", "idle", ["Codex", "Antigravity"], TokenBreakdown(input_tokens=139_210_000)),
         ThreadUsage("b", "A much longer thread title that must be cut", "idle", ["Claude"], TokenBreakdown(input_tokens=45_370_000)),
@@ -2372,15 +2376,21 @@ def test_chat_list_shows_lifetime_totals_in_active_measure():
     import io
     from t3_telemetry.cli import _browser_frame
     from t3_telemetry.models import AppThreadRecord
-    from t3_telemetry.usage import build_usage_report
+    from t3_telemetry.prices import CostBreakdown
+    from t3_telemetry.store import TelemetryStore
+    from t3_telemetry.usage import ThreadUsage, TokenBreakdown, build_store_usage_report
 
-    root = _priced_tree()
     record = AppThreadRecord(
         thread_id="root1", title="Root chat", model="claude-opus-5-5", project_id="p", default_provider="claude",
         provider_instance_id="claude", thinking_level=None, active_provider_thread_id=None, parent_thread_id=None,
         root_thread_id=None, relationship_to_parent=None, created_at=None, updated_at=None,
     )
-    usage = build_usage_report([root], datetime(2026, 11, 5, 3, tzinfo=timezone.utc))
+    usage = build_store_usage_report(TelemetryStore(":memory:"), datetime(2026, 11, 5, 3, tzinfo=timezone.utc))
+    usage.all_time["root1"] = ThreadUsage(
+        "root1", "Root chat", "idle", ["Claude"],
+        TokenBreakdown(input_tokens=1_500_000),
+        CostBreakdown(input=6.0),
+    )
 
     def render(measure):
         nav = NavigationState(ids=["root1"], selected_id="root1", measure=measure)
