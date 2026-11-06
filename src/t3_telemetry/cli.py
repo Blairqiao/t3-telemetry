@@ -23,11 +23,8 @@ from rich.text import Text
 
 from t3_telemetry.activity import build_activity_entries, launch_targets
 from t3_telemetry.aggregator import (
-    build_thread_telemetry,
     running_root_ids,
-    list_root_threads,
     read_t3_state,
-    resolve_thread,
     resolve_thread_id_in_snapshot,
     snapshot_thread_status,
 )
@@ -35,6 +32,8 @@ from datetime import datetime, timezone, timedelta
 from t3_telemetry.usage import UsageCache, UsageReport, PERIOD_LABELS, node_cost, read_store_usage_report, stats_for_node
 from t3_telemetry.collector import Collector, default_roots
 from t3_telemetry.store import TelemetryStore, session_rows
+from t3_telemetry.db_t3 import T3StateSnapshot
+from t3_telemetry.thread_view import build_thread_node, resolve_thread_node, list_root_nodes
 
 from t3_telemetry.context_history import ContextHistoryStore, make_agent_key
 from t3_telemetry.models import AppThreadRecord, ContextSample, ThreadTelemetryNode
@@ -139,10 +138,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max recent steps/turns to display in the stream table.",
     )
     parser.add_argument("--store", type=Path, default=Path("~/.t3-telemetry/telemetry.sqlite").expanduser(), help="Path to the local telemetry store.")
-    parser.add_argument("--no-store", action="store_true", help="Use T3-only usage reporting.")
+    parser.add_argument("--no-store", action="store_true", help="Do not sync native session files; read the store as it is.")
     parser.add_argument("--sync", action="store_true", help="Sync the telemetry store once and exit.")
     parser.add_argument("--sessions", action="store_true", help="List recent native sessions from the telemetry store and exit.")
     return parser
+
+
+def _synced_store(args: argparse.Namespace, t3_dir: Path) -> tuple[TelemetryStore, T3StateSnapshot]:
+    store = TelemetryStore(args.store.expanduser())
+    try:
+        try:
+            snapshot = read_t3_state(t3_dir)
+        except (sqlite3.Error, OSError):
+            snapshot = T3StateSnapshot()
+        if not args.no_store:
+            stats = Collector(store, default_roots(t3_dir)).sync(snapshot)
+            if args.sync:
+                print(f"files_seen={stats.files_seen} files_read={stats.files_read} steps_written={stats.steps_written} errors={stats.errors}")
+        return store, snapshot
+    except BaseException:
+        store.close()
+        raise
 
 
 def run_live_loop(
@@ -165,10 +181,14 @@ def run_live_loop(
     # Noninteractive fallback
     if _adapter is None and _max_iterations is None:
         if not console.is_terminal or not sys.stdin.isatty():
-            node = resolve_thread(args.t3_dir, args.thread_query)
-            if node is not None:
-                console.print(build_dashboard_renderable(node, max_steps=args.max_steps))
-            return 0
+            store, snapshot = _synced_store(args, Path(args.t3_dir).expanduser())
+            try:
+                node = resolve_thread_node(snapshot, store, args.thread_query)
+                if node is not None:
+                    console.print(build_dashboard_renderable(node, max_steps=args.max_steps))
+                return 0
+            finally:
+                store.close()
 
     t3_dir = Path(args.t3_dir).expanduser()
     adapter = _adapter or PosixTerminalAdapter()
@@ -176,14 +196,11 @@ def run_live_loop(
     browser = TelemetryBrowser(adapter, history_store=history_store)
     live_factory = _live_cls or Live
 
-    store = None
-    collector = _collector
-    if not args.no_store and _usage_cache is None:
-        store = TelemetryStore(Path(args.store).expanduser())
-        collector = collector or Collector(store, default_roots(t3_dir))
-        usage_cache = UsageCache(background=True, reader=lambda d, s: read_store_usage_report(store, s))
-    else:
-        usage_cache = _usage_cache if _usage_cache is not None else UsageCache(background=True)
+    store = TelemetryStore(Path(args.store).expanduser())
+    collector = None if args.no_store else (_collector or Collector(store, default_roots(t3_dir)))
+    usage_cache = _usage_cache if _usage_cache is not None else UsageCache(
+        background=True, reader=lambda d, s: read_store_usage_report(store, s)
+    )
     sync_worker = None
     last_sync = None
 
@@ -284,8 +301,11 @@ def run_live_loop(
                     polls += 1
                     try:
                         snapshot = read_t3_state(t3_dir)
+                        if polls == 1 and collector is not None and store.get_meta("last_sync_at") is None:
+                            collector.sync(snapshot)
+                            last_sync = now
                         start_sync(snapshot, now)
-                        if store is not None and usage_cache.report is None:
+                        if _usage_cache is None and not args.no_store and usage_cache.report is None:
                             # UsageCache normally reads its first report synchronously.
                             if (usage_cache.built_at is None or
                                     usage_cache.clock() - usage_cache.built_at >= usage_cache.max_age):
@@ -330,7 +350,7 @@ def run_live_loop(
                             if tid in tree_node_cache:
                                 return tree_node_cache[tid]
                             if tid in snapshot.threads:
-                                n = build_thread_telemetry(tid, t3_dir, snapshot=snapshot)
+                                n = build_thread_node(tid, snapshot, store)
                                 index_telemetry_tree(n)
                                 return n
                             return None
@@ -441,7 +461,7 @@ def run_live_loop(
                         browser.navigation.sync_top([t.thread_id for t in usage.periods[browser.navigation.period].top(browser.navigation.measure)])
                     active_id = browser.navigation.detail_id or browser.navigation.selected_id
                     if active_id and active_id not in tree_node_cache and cached_snapshot and active_id in cached_snapshot.threads:
-                        n = build_thread_telemetry(active_id, t3_dir, snapshot=cached_snapshot)
+                        n = build_thread_node(active_id, cached_snapshot, store)
                         index_telemetry_tree(n)
                         cached_node = n
                     else:
@@ -532,7 +552,7 @@ def run_live_loop(
             if sync_worker is not None:
                 sync_worker.join(timeout=1.0)
             if store is not None:
-                if usage_cache._worker is not None:
+                if getattr(usage_cache, "_worker", None) is not None:
                     usage_cache._worker.join(timeout=1.0)
                 store.close()
     return 0
@@ -1137,72 +1157,43 @@ def main(argv: list[str] | None = None) -> int:
     t3_dir = Path(args.t3_dir).expanduser()
     console = Console()
 
-    if args.sessions:
-        store = TelemetryStore(args.store.expanduser())
+    if args.sessions or args.sync or args.list or args.json or args.once:
+        store, snapshot = _synced_store(args, t3_dir)
         try:
-            try:
-                snapshot = read_t3_state(t3_dir)
-            except (sqlite3.Error, OSError):
-                snapshot = None
-            Collector(store, default_roots(t3_dir)).sync(snapshot)
-            rows = session_rows(store)
-            for row in rows:
-                row["status"] = (snapshot_thread_status(snapshot, row["thread_id"])
-                                 if snapshot is not None and row["thread_id"] in snapshot.threads else None)
+            if args.sessions:
+                rows = session_rows(store)
+                for row in rows:
+                    row["status"] = (snapshot_thread_status(snapshot, row["thread_id"])
+                                     if row["thread_id"] in snapshot.threads else None)
+                if args.json:
+                    print(json.dumps(rows, indent=2))
+                else:
+                    console.print(build_sessions_table(rows))
+                return 0
+            if args.sync:
+                return 0
+            if args.list:
+                nodes = list_root_nodes(snapshot, store, limit=50)
+                if args.json:
+                    print(json.dumps([n.to_dict() for n in nodes], indent=2))
+                else:
+                    console.print(build_threads_list_table(nodes))
+                return 0
+            node = resolve_thread_node(snapshot, store, args.thread_query)
+            if node is None:
+                if args.json:
+                    print(json.dumps({"error": f"No thread found matching '{args.thread_query}'"}, indent=2), file=sys.stderr)
+                else:
+                    query_desc = f"'{args.thread_query}'" if args.thread_query else "any active thread"
+                    print(f"Error: No thread found matching {query_desc} in {t3_dir}", file=sys.stderr)
+                return 1
             if args.json:
-                print(json.dumps(rows, indent=2))
+                print(json.dumps(node.to_dict(), indent=2))
             else:
-                table = build_sessions_table(rows)
-                console.print(table)
+                console.print(build_dashboard_renderable(node, max_steps=args.max_steps))
+            return 0
         finally:
             store.close()
-        return 0
-
-    if args.sync:
-        store = TelemetryStore(args.store.expanduser())
-        try:
-            try:
-                snapshot = read_t3_state(t3_dir)
-            except (sqlite3.Error, OSError):
-                snapshot = None
-            stats = Collector(store, default_roots(t3_dir)).sync(snapshot)
-            print(f"files_seen={stats.files_seen} files_read={stats.files_read} steps_written={stats.steps_written} errors={stats.errors}")
-        finally:
-            store.close()
-        return 0
-
-    # Mode 1: List threads
-    if args.list:
-        nodes = list_root_threads(t3_dir, limit=50)
-        if args.json:
-            print(json.dumps([n.to_dict() for n in nodes], indent=2))
-        else:
-            table = build_threads_list_table(nodes)
-            console.print(table)
-        return 0
-
-    # Mode 2: JSON dump
-    if args.json:
-        node = resolve_thread(t3_dir, args.thread_query)
-        if node is None:
-            print(
-                json.dumps({"error": f"No thread found matching '{args.thread_query}'"}, indent=2),
-                file=sys.stderr,
-            )
-            return 1
-        print(json.dumps(node.to_dict(), indent=2))
-        return 0
-
-    # Mode 3: Print once
-    if args.once:
-        node = resolve_thread(t3_dir, args.thread_query)
-        if node is None:
-            query_desc = f"'{args.thread_query}'" if args.thread_query else "any active thread"
-            print(f"Error: No thread found matching {query_desc} in {t3_dir}", file=sys.stderr)
-            return 1
-        renderable = build_dashboard_renderable(node, max_steps=args.max_steps)
-        console.print(renderable)
-        return 0
 
     # Mode 4: Live TUI mode
     try:

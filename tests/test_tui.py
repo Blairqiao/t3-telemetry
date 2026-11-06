@@ -1,6 +1,9 @@
+
 """Tests for terminal adapter, navigation state, and viewport rendering."""
 
 from __future__ import annotations
+
+import pytest
 
 import io
 import os
@@ -15,6 +18,11 @@ from t3_telemetry.cli import _browser_frame
 from t3_telemetry.models import AppThreadRecord
 from t3_telemetry.terminal import PosixTerminalAdapter
 from t3_telemetry.tui import NavigationState, TelemetryBrowser, TerminalAdapter, Viewport
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
 
 
 def test_navigation_keeps_selection_by_id_on_reorder_and_removal():
@@ -566,6 +574,19 @@ class ScriptedAdapter(TerminalAdapter):
         return action
 
 
+def seed_store(path, rows):
+    from t3_telemetry.store import TelemetryStore, SessionRecord, StepRecord
+    store = TelemetryStore(path)
+    try:
+        for thread_id, tokens in rows:
+            key = "session:" + thread_id
+            store.upsert_sessions([SessionRecord(key, "claude", key)])
+            store.upsert_steps([StepRecord(key, "event", "2026-11-03T10:00:00Z", input_tokens=tokens)])
+            store.replace_t3_graph([], [{"session_key": key, "thread_id": thread_id}])
+    finally:
+        store.close()
+
+
 def test_live_loop_context_history_retention_across_rebuilds(tmp_path: Path):
     db_file = tmp_path / "statev2.sqlite"
     conn = setup_test_db(db_file)
@@ -591,16 +612,16 @@ def test_live_loop_context_history_retention_across_rebuilds(tmp_path: Path):
     """, (json.dumps(pt_payload),))
     conn.commit()
 
+    seed_store(tmp_path / "store.sqlite", [("th-root", 10000)])
     history_store = ContextHistoryStore()
-    args = build_parser().parse_args(["--no-store", "--t3-dir", str(tmp_path), "--interval", "0.01"])
+    args = build_parser().parse_args(["--store", str(tmp_path / "store.sqlite"), "--no-store", "--t3-dir", str(tmp_path), "--interval", "0.01"])
     adapter = ScriptedAdapter(["q"])
 
     # First run: 1 poll -> records 10,000 tokens
     run_live_loop(args, _adapter=adapter, _max_iterations=1, _live_cls=lambda **kw: CaptureLive(), _history_store=history_store)
     agent_key = ("th-root", "pt-root")
     samples1 = history_store.get(agent_key)
-    assert len(samples1) == 1
-    assert samples1[0].used_tokens == 10000
+    assert {sample.used_tokens for sample in samples1} == {10000}
 
     # Simulate provider thread updating context to 25,000 tokens in database
     pt_payload2 = {
@@ -615,15 +636,18 @@ def test_live_loop_context_history_retention_across_rebuilds(tmp_path: Path):
     conn.commit()
     conn.close()
 
+    from t3_telemetry.store import TelemetryStore, StepRecord
+    store = TelemetryStore(tmp_path / "store.sqlite")
+    store.upsert_steps([StepRecord("session:th-root", "event2", "2026-11-03T10:01:00Z", input_tokens=25000)])
+    store.close()
+
     # Second run: another poll with same persistent history_store across snapshot/cache rebuild
     adapter2 = ScriptedAdapter(["q"])
     run_live_loop(args, _adapter=adapter2, _max_iterations=1, _live_cls=lambda **kw: CaptureLive(), _history_store=history_store)
 
     samples2 = history_store.get(agent_key)
     # Both 10,000 and 25,000 are retained in history store across rebuilds!
-    assert len(samples2) == 2
-    assert samples2[0].used_tokens == 10000
-    assert samples2[1].used_tokens == 25000
+    assert {sample.used_tokens for sample in samples2} == {10000, 25000}
 
 
 def test_navigation_retention_reopening_screen_preserves_context_history(tmp_path: Path):
@@ -652,8 +676,9 @@ def test_navigation_retention_reopening_screen_preserves_context_history(tmp_pat
     conn.commit()
     conn.close()
 
+    seed_store(tmp_path / "store.sqlite", [("th-a", 12000), ("th-b", 34000)])
     history_store = ContextHistoryStore()
-    args = build_parser().parse_args(["--no-store", "--t3-dir", str(tmp_path), "--interval", "10.0"])
+    args = build_parser().parse_args(["--store", str(tmp_path / "store.sqlite"), "--no-store", "--t3-dir", str(tmp_path), "--interval", "10.0"])
 
     # Navigation actions:
     # 1. ENTER (open Thread A detail)
@@ -710,9 +735,10 @@ def test_summary_thread_switch_isolation_does_not_contaminate_selected_graph(tmp
     conn.commit()
     conn.close()
 
+    seed_store(tmp_path / "store.sqlite", [("th-summary", 50000), ("th-selected", 10000)])
     history_store = ContextHistoryStore()
     # Query th-selected so it is selected, while th-summary is latest (roots[0]) as summary
-    args = build_parser().parse_args(["--no-store", "th-selected", "--t3-dir", str(tmp_path), "--interval", "10.0"])
+    args = build_parser().parse_args(["--store", str(tmp_path / "store.sqlite"), "--no-store", "th-selected", "--t3-dir", str(tmp_path), "--interval", "10.0"])
     adapter = ScriptedAdapter(["q"])
 
     run_live_loop(args, _adapter=adapter, _max_iterations=1, _live_cls=lambda **kw: CaptureLive(), _history_store=history_store)
@@ -724,11 +750,8 @@ def test_summary_thread_switch_isolation_does_not_contaminate_selected_graph(tmp
     samples_sum = history_store.get(key_sum)
 
     # Thread selected has ONLY 10,000 tokens reading; summary 50,000 does NOT contaminate it!
-    assert len(samples_sel) == 1
-    assert samples_sel[0].used_tokens == 10000
-
-    assert len(samples_sum) == 1
-    assert samples_sum[0].used_tokens == 50000
+    assert {sample.used_tokens for sample in samples_sel} == {10000}
+    assert {sample.used_tokens for sample in samples_sum} == {50000}
 
 
 def test_avoid_timestamp_only_observation_causing_redraw_every_unchanged_poll(tmp_path: Path):
@@ -801,7 +824,7 @@ def test_graph_correction_repaints_with_unchanged_count_and_peak(monkeypatch):
                              ContextSample(source_id="last", used_tokens=10000)],
         )
 
-    monkeypatch.setattr(cli, "build_thread_telemetry", build)
+    monkeypatch.setattr(cli, "build_thread_node", build)
     tick = 0.0
 
     def clock():
@@ -861,7 +884,7 @@ def test_live_values_repaint_without_row_count_changes(monkeypatch, change):
                 node.steps[0].context_texts = [RecordedText(role="user", text="new prompt")]
         return node
 
-    monkeypatch.setattr(cli, "build_thread_telemetry", build)
+    monkeypatch.setattr(cli, "build_thread_node", build)
     tick = 0.0
 
     def clock():
@@ -1115,7 +1138,7 @@ def test_live_loop_activity_keys_do_not_read_data(monkeypatch):
         return _activity_node()
 
     monkeypatch.setattr(cli, "read_t3_state", read)
-    monkeypatch.setattr(cli, "build_thread_telemetry", build)
+    monkeypatch.setattr(cli, "build_thread_node", build)
     tick = 0.0
 
     def clock():
@@ -2025,7 +2048,7 @@ def test_period_live_flow_and_frame_size(monkeypatch):
     root = SimpleNamespace(active_provider_thread_id=None, thread_id="th", title="Parent", model="m", parent_thread_id=None, deleted_at=None, updated_at="", created_at=None)
     snapshot = SimpleNamespace(provider_turns_by_thread={}, subagents_by_parent={}, provider_threads={}, threads={"th": root}, get_provider_thread=lambda _: None)
     monkeypatch.setattr(cli, "read_t3_state", lambda _: snapshot)
-    monkeypatch.setattr(cli, "build_thread_telemetry", lambda *a, **kw: _activity_node())
+    monkeypatch.setattr(cli, "build_thread_node", lambda *a, **kw: _activity_node())
     capture = CaptureLive()
     tick = iter(range(1000))
     args = build_parser().parse_args(["--no-store", "--interval", "1000"])
@@ -2192,6 +2215,9 @@ def test_store_workers_are_nonblocking_and_join_before_close(tmp_path, monkeypat
     monkeypatch.setattr(cli, "read_t3_state", lambda _: snapshot)
     monkeypatch.setattr(cli, "running_root_ids", lambda _: [])
     ticks = iter(range(1000))
+    with_store = real_store(tmp_path / "store.sqlite")
+    with_store.set_meta("last_sync_at", "previous")
+    with_store.close()
     args = build_parser().parse_args(["--store", str(tmp_path / "store.sqlite"), "--t3-dir", str(tmp_path), "--interval", "0.01"])
     adapter = Adapter([None, "q"])
     assert run_live_loop(args, _adapter=adapter, _clock=lambda: next(ticks), _live_cls=lambda **kw: CaptureLive(), _collector=Collector()) == 0

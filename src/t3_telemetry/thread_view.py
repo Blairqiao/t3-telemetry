@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import replace
 import json
 
-from t3_telemetry.aggregator import build_subagent_launches, snapshot_thread_status
+from t3_telemetry.aggregator import build_subagent_launches, snapshot_thread_status, resolve_thread_id_in_snapshot
 from t3_telemetry.context_limits import context_limit_for
 from t3_telemetry.db_t3 import T3StateSnapshot, parse_iso_duration
 from t3_telemetry.models import (
@@ -214,3 +214,16 @@ def _build_thread_node(thread_id, snapshot, ctx, visited):
         key=lambda step: (step.started_at or "", step.step_index),
     )
     return node
+
+
+def resolve_thread_node(snapshot: T3StateSnapshot, store: TelemetryStore, query: str | None = None) -> ThreadTelemetryNode | None:
+    """Resolve a query against the snapshot and build its store-backed node."""
+    thread_id = resolve_thread_id_in_snapshot(snapshot, query)
+    return build_thread_node(thread_id, snapshot, store) if thread_id is not None else None
+
+
+def list_root_nodes(snapshot: T3StateSnapshot, store: TelemetryStore, limit: int = 20) -> list[ThreadTelemetryNode]:
+    """Build non-deleted root nodes in most recently updated order."""
+    roots = [t for t in snapshot.threads.values() if t.parent_thread_id is None and t.deleted_at is None]
+    roots.sort(key=lambda t: t.updated_at or t.created_at or "", reverse=True)
+    return [build_thread_node(t.thread_id, snapshot, store) for t in roots[:limit]]

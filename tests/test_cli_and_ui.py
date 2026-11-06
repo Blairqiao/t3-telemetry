@@ -23,6 +23,11 @@ from t3_telemetry.cli import _browser_frame, build_parser, main, run_live_loop
 from t3_telemetry.tui import NavigationState, ScreenState, TerminalAdapter
 
 
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
 def test_format_tokens():
     assert format_tokens(None) == "0"
     assert format_tokens(0) == "0"
@@ -364,13 +369,38 @@ def synthetic_t3_dir(tmp_path: Path):
 
 
 def test_cli_list(synthetic_t3_dir: Path, capsys: pytest.CaptureFixture):
-    code = main(["--list", "--t3-dir", str(synthetic_t3_dir)])
+    from t3_telemetry.store import TelemetryStore, SessionRecord, StepRecord
+    path = synthetic_t3_dir / "store.sqlite"
+    store = TelemetryStore(path)
+    store.upsert_sessions([SessionRecord("agy:1", "antigravity", "1")])
+    store.upsert_steps([StepRecord("agy:1", "e", "2026-11-03T10:00:00Z", input_tokens=45000)])
+    store.replace_t3_graph([], [{"session_key": "agy:1", "thread_id": "th-root-alpha"}])
+    store.close()
+    code = main(["--list", "--store", str(path), "--no-store", "--t3-dir", str(synthetic_t3_dir)])
     assert code == 0
     captured = capsys.readouterr().out
     assert "Recent T3 Code App Threads" in captured
     assert "th-root-" in captured
     assert "45.0k" in captured
 
+
+
+def test_cli_json_uses_store_usage(synthetic_t3_dir: Path, capsys):
+    with sqlite3.connect(synthetic_t3_dir / "statev2.sqlite") as conn:
+        conn.execute("UPDATE orchestration_v2_projection_threads SET title = 'Root' WHERE thread_id = 'th-root-alpha'")
+    from t3_telemetry.store import TelemetryStore, SessionRecord, StepRecord
+    path = synthetic_t3_dir / "store.sqlite"
+    store = TelemetryStore(path)
+    store.upsert_sessions([SessionRecord("claude:1", "claude", "1"), SessionRecord("codex:2", "codex", "2")])
+    store.upsert_steps([StepRecord("claude:1", "a", "2026-11-03T10:00:00Z", input_tokens=123, output_tokens=7),
+                        StepRecord("codex:2", "b", "2026-11-03T10:00:00Z", cache_read_tokens=40)])
+    store.replace_t3_graph([], [{"session_key": key, "thread_id": "th-root-alpha"} for key in ("claude:1", "codex:2")])
+    store.close()
+    assert main(["--json", "--store", str(path), "--no-store", "--t3-dir", str(synthetic_t3_dir), "Root"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["rollup_metrics"]["total_tokens"] == 170
+    assert data["by_provider"]["claude"]["total_tokens"] == 130
+    assert data["by_provider"]["codex"]["total_tokens"] == 40
 
 def test_cli_list_json(synthetic_t3_dir: Path, capsys: pytest.CaptureFixture):
     code = main(["--list", "--json", "--t3-dir", str(synthetic_t3_dir)])
@@ -602,13 +632,13 @@ def test_event_loop_same_root_build_reuse(
     import t3_telemetry.cli as cli_mod
 
     build_counts = {}
-    orig_build = cli_mod.build_thread_telemetry
+    orig_build = cli_mod.build_thread_node
 
-    def counted_build(tid, t3_dir, **kwargs):
+    def counted_build(tid, snapshot, store):
         build_counts[tid] = build_counts.get(tid, 0) + 1
-        return orig_build(tid, t3_dir, **kwargs)
+        return orig_build(tid, snapshot, store)
 
-    monkeypatch.setattr(cli_mod, "build_thread_telemetry", counted_build)
+    monkeypatch.setattr(cli_mod, "build_thread_node", counted_build)
 
     args = build_parser().parse_args(["--no-store", "--t3-dir", str(synthetic_t3_dir), "--interval", "10.0"])
     adapter = ScriptedAdapter(["q"])

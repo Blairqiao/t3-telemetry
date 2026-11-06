@@ -10,11 +10,7 @@ from t3_telemetry.models import (
     ThreadTelemetryNode,
     TokenMetricsSummary,
 )
-from t3_telemetry.aggregator import (
-    build_thread_telemetry,
-    list_root_threads,
-    resolve_thread,
-)
+from t3_telemetry.thread_view import build_thread_node, list_root_nodes, resolve_thread_node
 from t3_telemetry.ui import (
     build_dashboard_renderable,
     build_threads_list_table,
@@ -36,9 +32,9 @@ __all__ = [
     "SubagentLinkRecord",
     "ThreadTelemetryNode",
     "TokenMetricsSummary",
-    "build_thread_telemetry",
-    "list_root_threads",
-    "resolve_thread",
+    "build_thread_node",
+    "list_root_nodes",
+    "resolve_thread_node",
     "build_dashboard_renderable",
     "build_threads_list_table",
     "format_duration",
