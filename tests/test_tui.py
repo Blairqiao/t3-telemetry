@@ -2092,7 +2092,7 @@ def test_home_sections_and_running_clock(width, height):
     from t3_telemetry.ui import format_duration
 
     now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
-    summary = ThreadTelemetryNode(thread_id="root", title="Live chat", driver="codex", provider_instance_id="codex", model="m")
+    summary = ThreadTelemetryNode(thread_id="root", title="Live chat", driver="codex", provider_instance_id="codex", model="m", status="running")
     turn = ModelStep(step_index=1, status="running", started_at=(now - timedelta(seconds=134)).isoformat())
     snapshot = SimpleNamespace(provider_turns_by_thread={"root": [turn]}, get_provider_thread=lambda _: None)
     nav = NavigationState()
@@ -2102,8 +2102,12 @@ def test_home_sections_and_running_clock(width, height):
     Console(file=buf, width=width, height=height, force_terminal=True, color_system=None).print(frame)
     output = buf.getvalue()
     assert len(output.splitlines()) == height
-    for text in ("Live", "Usage", "Today", "This week", "This month", "Chats", "Turn running " + format_duration(134), "+2 other threads running"):
+    for text in ("Live", "Usage", "Today", "This week", "This month", "Chats", "RUNNING " + format_duration(134), "+2 other threads running"):
         assert text in output
+    live_section = output[output.find("Live"):output.find("Usage")]
+    assert "Spent" in live_section
+    assert " est." in live_section
+    assert "Last turn" not in output
 
 
 def test_idle_home_does_not_repaint_on_unchanged_polls(monkeypatch):
@@ -2128,7 +2132,7 @@ def test_home_polish_empty_list_naive_clock_and_single_today_date():
     from t3_telemetry.ui import format_duration
 
     now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
-    summary = ThreadTelemetryNode(thread_id="root", title="Live chat", driver="codex", provider_instance_id="codex", model="m")
+    summary = ThreadTelemetryNode(thread_id="root", title="Live chat", driver="codex", provider_instance_id="codex", model="m", status="running")
     naive_start = (now - timedelta(seconds=134)).replace(tzinfo=None).isoformat()
     turn = ModelStep(step_index=1, status="running", started_at=naive_start)
     snapshot = SimpleNamespace(provider_turns_by_thread={"root": [turn]}, get_provider_thread=lambda _: None)
@@ -2137,10 +2141,96 @@ def test_home_polish_empty_list_naive_clock_and_single_today_date():
     buf = io.StringIO()
     Console(file=buf, width=80, height=24, force_terminal=True, color_system=None).print(frame)
     output = buf.getvalue()
-    assert "Turn running " + format_duration(134) in output
+    assert "RUNNING " + format_duration(134) in output
     assert "No app threads found" in output
     today = next(line for line in output.splitlines() if "Today " in line and "Nov" in line)
     assert "Nov 04" in today and "–" not in today
+
+
+def test_home_live_card_syncing_and_unpriced():
+    from datetime import datetime, timezone
+    from t3_telemetry.models import ThreadTelemetryNode, ModelStep, TokenMetricsSummary
+    from t3_telemetry.tui import NavigationState
+
+    now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+    # Syncing state shows "Spent    syncing…"
+    syncing_summary = ThreadTelemetryNode("root", "Sync test", "codex", None, "m", store_state="syncing")
+    frame = _browser_frame([], None, syncing_summary, NavigationState(), 24, 80, now=now)
+    buf = io.StringIO()
+    Console(file=buf, width=80, height=24, force_terminal=True, color_system=None).print(frame)
+    output = buf.getvalue()
+    live_section = output[output.find("Live"):output.find("Usage")]
+    assert "Spent    syncing…" in live_section
+
+    # Unpriced model shows "unpriced"
+    unpriced_summary = ThreadTelemetryNode(
+        "root", "Unpriced test", "codex", None, "custom-local-model",
+        rollup_metrics=TokenMetricsSummary(input_tokens=500),
+        steps=[ModelStep(step_index=0, model="custom-local-model", input_tokens=500)],
+    )
+    frame = _browser_frame([], None, unpriced_summary, NavigationState(), 24, 80, now=now)
+    buf = io.StringIO()
+    Console(file=buf, width=80, height=24, force_terminal=True, color_system=None).print(frame)
+    output = buf.getvalue()
+    live_section = output[output.find("Live"):output.find("Usage")]
+    assert "Spent    500 tokens  ·  unpriced" in live_section
+
+
+def test_home_live_card_subagents_plural_and_both_units():
+    from datetime import datetime, timezone
+    from t3_telemetry.models import ThreadTelemetryNode, ModelStep, TokenMetricsSummary
+    from t3_telemetry.tui import NavigationState
+
+    now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+    for n, subagent_text in [(1, "incl. 1 subagent"), (3, "incl. 3 subagents")]:
+        summary = ThreadTelemetryNode(
+            "root", "Subagent test", "codex", None, "claude-opus-5-5",
+            rollup_metrics=TokenMetricsSummary(input_tokens=1_000_000, total_subagents=n),
+            steps=[ModelStep(step_index=0, model="claude-opus-5-5", input_tokens=1_000_000)],
+        )
+        # Verify both measure='usd' and measure='tokens' show both tokens and $ est.
+        for measure in ("usd", "tokens"):
+            frame = _browser_frame([], None, summary, NavigationState(measure=measure), 24, 100, now=now)
+            buf = io.StringIO()
+            Console(file=buf, width=100, height=24, force_terminal=True, color_system=None).print(frame)
+            output = buf.getvalue()
+            live_section = output[output.find("Live"):output.find("Usage")]
+            assert "Spent    1.00M tokens  ·  $4.00 est.  ·  " + subagent_text in live_section
+
+
+def test_home_live_card_driver_width_and_context_once():
+    from datetime import datetime, timezone
+    from t3_telemetry.models import ThreadTelemetryNode
+    from t3_telemetry.tui import NavigationState
+
+    now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+    summary = ThreadTelemetryNode(
+        "root", "Driver test", "custom-driver", None, "claude-opus-5-5",
+        status="idle",
+        context_used_tokens=120_000,
+        context_limit=200_000,
+    )
+    # At width 80 (< 90), driver is not on line 1 and not on line 2
+    frame_narrow = _browser_frame([], None, summary, NavigationState(), 24, 80, now=now)
+    buf = io.StringIO()
+    Console(file=buf, width=80, height=24, force_terminal=True, color_system=None).print(frame_narrow)
+    output_narrow = buf.getvalue()
+    live_narrow = output_narrow[output_narrow.find("Live"):output_narrow.find("Usage")]
+    assert "custom-driver" not in live_narrow
+    assert "Context  [" in live_narrow
+    # Context numbers appear once (120.0k / 200.0k)
+    assert live_narrow.count("120.0k / 200.0k") == 1
+    assert "Last turn" not in live_narrow
+
+    # At width 100 (>= 90), driver is appended to line 1
+    frame_wide = _browser_frame([], None, summary, NavigationState(), 24, 100, now=now)
+    buf = io.StringIO()
+    Console(file=buf, width=100, height=24, force_terminal=True, color_system=None).print(frame_wide)
+    output_wide = buf.getvalue()
+    live_wide = output_wide[output_wide.find("Live"):output_wide.find("Usage")]
+    assert "claude-opus-5-5  ·  custom-driver" in live_wide
+    assert "Context  [" in live_wide
+    assert live_wide.count("120.0k / 200.0k") == 1
 
 
 def test_period_top_threads_align_columns():

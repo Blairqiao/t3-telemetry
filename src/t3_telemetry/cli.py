@@ -70,6 +70,7 @@ from t3_telemetry.ui import (
     format_duration,
     render_context_bar,
     format_tokens,
+    format_usd,
     get_status_style,
 )
 
@@ -956,27 +957,37 @@ def _parse_utc(value: str | None) -> datetime | None:
 def _home_body(roots, summary, usage, nav, running_ids, snapshot, inner_height, inner_width, now, syncing=False):
     card = []
     if summary:
-        status = summary.status or "idle"
-        line = Text(f"{status.upper()}  {summary.title or summary.thread_id[:8]}", style=get_status_style(status) or "bold")
-        line.append(f"  ·  {summary.model or 'unknown'}")
-        card.append(line)
-        context_line = Text(f"{summary.driver or 'unknown'}  ·  ")
-        context_line.append_text(Text.from_markup(render_context_bar(summary.context_used_tokens, summary.context_limit, 10)))
-        context_line.append(" " + _context_text(summary))
-        card.append(context_line)
         turns = snapshot.provider_turns_by_thread.get(summary.thread_id, []) if snapshot else []
         running = next((t for t in reversed(turns) if t.status == "running" and t.started_at), None)
-        clock = ""
         started = _parse_utc(running.started_at) if running else None
-        completed = _parse_utc(turns[-1].completed_at) if turns and not running else None
+
+        status = summary.status or "idle"
+        status_text = status.upper()
         if started:
-            clock = "Turn running " + format_duration(max(0.0, (now - started).total_seconds()))
-        elif completed:
-            clock = "Last turn " + completed.astimezone(now.tzinfo).strftime("%H:%M")
-        if usage:
-            clock += ("  ·  " if clock else "") + "Today " + format_measure(usage.root_total("today", summary.thread_id, nav.measure), nav.measure)
-        if clock:
-            card.append(Text(clock))
+            status_text += " " + format_duration(max(0.0, (now - started).total_seconds()))
+        line = Text(f"{status_text}  {summary.title or summary.thread_id[:8]}", style=get_status_style(status) or "bold")
+        line.append(f"  ·  {summary.model or 'unknown'}")
+        if inner_width >= 90:
+            line.append("  ·  " + (summary.driver or "unknown"))
+        card.append(line)
+
+        context_line = Text("Context  ")
+        context_line.append_text(Text.from_markup(render_context_bar(summary.context_used_tokens, summary.context_limit, 10)))
+        card.append(context_line)
+
+        if getattr(summary, "store_state", "ready") == "syncing":
+            card.append(Text("Spent    syncing…"))
+        else:
+            c = node_cost(summary)
+            cost = "unpriced" if (c.total <= 0 and c.unpriced_tokens) else (format_usd(c.total) + " est.")
+            rollup = getattr(summary, "rollup_metrics", None)
+            total_tokens = rollup.total_tokens if rollup else 0
+            spent = f"Spent    {format_tokens(total_tokens)} tokens  ·  {cost}"
+            n = rollup.total_subagents if rollup else 0
+            if n > 0:
+                spent += f"  ·  incl. {n} subagent{'s' if n != 1 else ''}"
+            card.append(Text(spent))
+
         if summary.steps:
             card.append(Text("Act: " + (summary.steps[-1].action_summary or ""), style="magenta"))
         children = [c for c in summary.subagents if c.status == "running"]
