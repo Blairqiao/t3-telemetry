@@ -71,6 +71,9 @@ class ModelStep:
     context_used_tokens: int | None = None
     context_max_tokens: int | None = None
     timeline: list[TurnItem] = field(default_factory=list)
+    model: str | None = None
+    provider: str | None = None
+    turn_key: str | None = None
 
     @property
     def kind(self) -> str:
@@ -455,6 +458,8 @@ class ThreadTelemetryNode:
     combined_steps: list[ModelStep] = field(default_factory=list)
     subagents: list[ThreadTelemetryNode] = field(default_factory=list)
     launches: list[SubagentLaunch] = field(default_factory=list)
+    provider: str | None = None
+    store_state: str = "ready"
 
     @property
     def provider_thread_id(self) -> str | None:
@@ -481,6 +486,8 @@ class ThreadTelemetryNode:
             "thread_id": self.thread_id,
             "title": self.title,
             "driver": self.driver,
+            "provider": self.provider,
+            "store_state": self.store_state,
             "provider_instance_id": self.provider_instance_id,
             "model": self.model,
             "thinking_level": self.thinking_level,
