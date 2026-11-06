@@ -64,3 +64,64 @@ def test_forked_subagent_keeps_first_session_meta(tmp_path):
     assert result.sessions[0].cwd == "/child"
     assert result.sessions[0].origin_hint == "cli"
     assert [s.session_key for s in result.steps] == ["codex:child-id"]
+
+
+def test_turns_items_and_steps(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_bytes(
+        line("session_meta", {"id": "s"})
+        + line("event_msg", {"type": "task_started", "turn_id": "t", "started_at": 1.5,
+                             "model_context_window": 475000})
+        + line("event_msg", {"type": "item_completed", "turn_id": "t", "item": {
+            "id": "u", "type": "UserMessage", "content": [{"text": "hello"}, {"text": "world"}]}})
+        + line("event_msg", {"type": "item_completed", "turn_id": "t", "started_at_ms": 2000,
+                             "completed_at_ms": 2500, "item": {"id": "i", "type": "CommandExecution",
+                                                               "command": ["sh", "ls"]}})
+        + line("token_usage_record", {"turn_id": "t", "response_id": "r1", "usage": {}})
+        + line("token_usage_record", {"turn_id": "t", "response_id": "r2", "usage": {}})
+        + line("event_msg", {"type": "item_completed", "turn_id": "t", "item": {
+            "id": "a", "type": "AgentMessage", "text": "done"}})
+        + line("event_msg", {"type": "task_complete", "turn_id": "t", "completed_at": 3})
+    )
+    result = parse_codex_file(path)
+    assert len(result.turns) == 1
+    turn = result.turns[0]
+    assert (turn.turn_id, turn.started_at, turn.completed_at, turn.context_limit, turn.prompt, turn.reply) == (
+        "t", "1970-01-01T00:00:01.500000Z", "1970-01-01T00:00:03.000000Z", 475000,
+        "hello\nworld", "done")
+    assert [(i.kind, i.text, i.started_at, i.completed_at) for i in result.items] == [
+        ("run", "ls", "1970-01-01T00:00:02.000000Z", "1970-01-01T00:00:02.500000Z")]
+    assert [step.turn_id for step in result.steps] == ["t", "t"]
+
+
+def test_fallback_turn_and_timestamp(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_bytes(
+        line("session_meta", {"id": "s"})
+        + line("token_usage_record", {"turn_id": "t", "response_id": "r", "usage": {}})
+        + line("event_msg", {"type": "task_started", "turn_id": "other", "started_at": "bad"})
+        + line("event_msg", {"type": "task_complete", "turn_id": "other"})
+    )
+    turns = {t.turn_id: t for t in parse_codex_file(path).turns}
+    for turn in turns.values():
+        assert turn.started_at == turn.completed_at == "2026-11-03T22:08:01.000000Z"
+
+
+def test_records_before_session_meta_are_ignored(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    event = {"type": "item_completed", "turn_id": "t", "item": {"id": "i", "type": "Reasoning"}}
+    path.write_bytes(line("event_msg", event) + line("session_meta", {"id": "s"}) + line("event_msg", event))
+    result = parse_codex_file(path)
+    assert len(result.items) == 1
+    assert result.items[0].session_key == "codex:s"
+
+
+def test_file_change_paths_from_dictionary(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_bytes(
+        line("session_meta", {"id": "s"})
+        + line("event_msg", {"type": "item_completed", "turn_id": "t", "item": {
+            "id": "i", "type": "FileChange", "changes": {"first.py": {}, "second.py": {}}}})
+    )
+    item, = parse_codex_file(path).items
+    assert (item.kind, item.text) == ("edit", "first.py (+1 more)")
