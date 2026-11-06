@@ -147,3 +147,76 @@ def test_v1_store_drops_codex_rows_for_reread(tmp_path):
     assert store.get_file(tmp_path / "x.jsonl") is None
     assert len(store.steps_between("2026", "2027")) == 1
     store.close()
+
+
+def test_v2_migration_and_v3_reopen(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "v2.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta VALUES ('schema_version', '2');
+        CREATE TABLE files (path TEXT PRIMARY KEY, provider TEXT NOT NULL, size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL, offset INTEGER NOT NULL, session_key TEXT);
+        INSERT INTO files VALUES ('old', 'claude', 1, 1, 1, NULL);
+        CREATE TABLE steps (session_key TEXT NOT NULL, event_id TEXT NOT NULL, ts TEXT NOT NULL, model TEXT,
+            input_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_creation_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+            thinking_tokens INTEGER NOT NULL DEFAULT 0, tool_names TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (session_key, event_id));
+    """)
+    conn.close()
+    store = TelemetryStore(path)
+    assert "turn_id" in {row[1] for row in store.conn.execute("PRAGMA table_info(steps)")}
+    assert store.conn.execute("SELECT count(*) FROM files").fetchone()[0] == 0
+    assert store.get_meta("schema_version") == "3"
+    store.set_file(tmp_path / "new", "claude", 1, 2, 3, None)
+    store.close()
+    store = TelemetryStore(path)
+    assert store.get_file(tmp_path / "new") == (1, 2, 3)
+    store.close()
+
+
+def test_turn_merge_and_last_turn(tmp_path):
+    from t3_telemetry.store import TurnRecord
+
+    store = TelemetryStore(tmp_path / "store.db")
+    store.upsert_turns([TurnRecord("s", "one", started_at="02", completed_at="03", prompt="first",
+                                   prompt_truncated=True, reply="old", context_limit=10)])
+    store.upsert_turns([TurnRecord("s", "one", kind="model_step", started_at="01", completed_at="04",
+                                   prompt="second", reply="new", reply_truncated=True, context_limit=20),
+                        TurnRecord("s", "two", started_at="05")])
+    row = store.turns_for(["s"])[0]
+    assert (row["started_at"], row["completed_at"], row["prompt"], row["prompt_truncated"]) == ("01", "04", "first", 1)
+    assert (row["reply"], row["reply_truncated"], row["kind"], row["context_limit"]) == ("new", 1, "model_step", 20)
+    assert store.last_turn_id("s") == "two"
+    assert store.last_turn_id("missing") is None
+    store.close()
+
+
+def test_item_merge(tmp_path):
+    from t3_telemetry.store import ItemRecord
+
+    store = TelemetryStore(tmp_path / "store.db")
+    store.upsert_items([ItemRecord("s", "i", "t", 7, "run", text="old", status="running", started_at="01",
+                                   fields={"a": "b"}, truncated_fields=["a"])])
+    store.upsert_items([ItemRecord("s", "i", "other", 0, "tool", text="new", truncated=True,
+                                   status="failed", completed_at="02", tool_name="Bash")])
+    store.upsert_items([ItemRecord("s", "i", "other", 0, "tool", status="completed", completed_at="03")])
+    row = store.items_for(["s"])[0]
+    assert (row["turn_id"], row["seq"], row["kind"], row["started_at"], row["tool_name"]) == ("t", 7, "run", "01", "Bash")
+    assert (row["text"], row["truncated"], row["status"], row["completed_at"]) == ("new", 1, "failed", "03")
+    assert json.loads(row["fields_json"]) == {"a": "b"}
+    assert json.loads(row["truncated_fields_json"]) == ["a"]
+    store.close()
+
+
+def test_bounded_and_empty_steps(tmp_path):
+    from t3_telemetry.store import bounded
+
+    store = TelemetryStore(tmp_path / "store.db")
+    assert store.steps_for([]) == []
+    assert bounded("x" * 2001, 2000) == ("x" * 2000, True)
+    assert bounded("  ", 2000) == (None, False)
+    store.close()

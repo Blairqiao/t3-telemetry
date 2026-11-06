@@ -8,7 +8,9 @@ from pathlib import Path
 import sqlite3
 from threading import Lock
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+MAX_TEXT_CHARS = 2000
+MAX_ITEM_CHARS = 300
 
 
 @dataclass(slots=True)
@@ -37,6 +39,38 @@ class StepRecord:
     output_tokens: int = 0
     thinking_tokens: int = 0
     tool_names: list[str] = field(default_factory=list)
+    turn_id: str | None = None
+
+
+@dataclass(slots=True)
+class TurnRecord:
+    session_key: str
+    turn_id: str
+    kind: str = "provider_turn"
+    started_at: str | None = None
+    completed_at: str | None = None
+    prompt: str | None = None
+    prompt_truncated: bool = False
+    reply: str | None = None
+    reply_truncated: bool = False
+    context_limit: int | None = None
+
+
+@dataclass(slots=True)
+class ItemRecord:
+    session_key: str
+    item_id: str
+    turn_id: str
+    seq: int
+    kind: str
+    text: str = ""
+    truncated: bool = False
+    status: str = "completed"
+    started_at: str | None = None
+    completed_at: str | None = None
+    tool_name: str | None = None
+    fields: dict[str, str] = field(default_factory=dict)
+    truncated_fields: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -44,6 +78,15 @@ class ParseResult:
     sessions: list[SessionRecord]
     steps: list[StepRecord]
     offset: int
+    turns: list[TurnRecord] = field(default_factory=list)
+    items: list[ItemRecord] = field(default_factory=list)
+
+
+def bounded(text: str | None, limit: int) -> tuple[str | None, bool]:
+    """Return bounded text and whether it was truncated; blanks become None."""
+    if text is None or not text.strip():
+        return None, False
+    return text[:limit], len(text) > limit
 
 
 def utc_iso(value: str | datetime) -> str:
@@ -68,10 +111,24 @@ CREATE TABLE IF NOT EXISTS steps (
   session_key TEXT NOT NULL, event_id TEXT NOT NULL, ts TEXT NOT NULL, model TEXT,
   input_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0,
   cache_creation_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
-  thinking_tokens INTEGER NOT NULL DEFAULT 0, tool_names TEXT NOT NULL DEFAULT '[]',
+  thinking_tokens INTEGER NOT NULL DEFAULT 0, tool_names TEXT NOT NULL DEFAULT '[]', turn_id TEXT,
   PRIMARY KEY (session_key, event_id)
 );
 CREATE INDEX IF NOT EXISTS steps_ts ON steps(ts);
+CREATE TABLE IF NOT EXISTS turns (
+  session_key TEXT NOT NULL, turn_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'provider_turn',
+  started_at TEXT, completed_at TEXT, prompt TEXT, prompt_truncated INTEGER NOT NULL DEFAULT 0,
+  reply TEXT, reply_truncated INTEGER NOT NULL DEFAULT 0, context_limit INTEGER,
+  PRIMARY KEY (session_key, turn_id)
+);
+CREATE TABLE IF NOT EXISTS turn_items (
+  session_key TEXT NOT NULL, item_id TEXT NOT NULL, turn_id TEXT NOT NULL, seq INTEGER NOT NULL,
+  kind TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', truncated INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'completed', started_at TEXT, completed_at TEXT, tool_name TEXT,
+  fields_json TEXT NOT NULL DEFAULT '{}', truncated_fields_json TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY (session_key, item_id)
+);
+CREATE INDEX IF NOT EXISTS turn_items_turn ON turn_items(session_key, turn_id, seq);
 CREATE TABLE IF NOT EXISTS t3_threads (
   thread_id TEXT PRIMARY KEY, title TEXT, parent_thread_id TEXT, root_thread_id TEXT,
   driver TEXT, provider_instance_id TEXT, created_at TEXT, updated_at TEXT
@@ -99,6 +156,11 @@ class TelemetryStore:
                     self.conn.execute("DELETE FROM steps WHERE session_key LIKE 'codex:%'")
                     self.conn.execute("DELETE FROM sessions WHERE provider='codex'")
                     self.conn.execute("DELETE FROM files WHERE provider='codex'")
+                if row is not None and int(row[0]) < 3:
+                    columns = {info[1] for info in self.conn.execute("PRAGMA table_info(steps)")}
+                    if "turn_id" not in columns:
+                        self.conn.execute("ALTER TABLE steps ADD COLUMN turn_id TEXT")
+                    self.conn.execute("DELETE FROM files")
                 self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
 
     def close(self) -> None:
@@ -135,14 +197,101 @@ class TelemetryStore:
                 values = asdict(record)
                 values["tool_names"] = json.dumps(names)
                 self.conn.execute("""
-                    INSERT INTO steps VALUES (:session_key, :event_id, :ts, :model, :input_tokens,
-                      :cache_read_tokens, :cache_creation_tokens, :output_tokens, :thinking_tokens, :tool_names)
+                    INSERT INTO steps (session_key, event_id, ts, model, input_tokens, cache_read_tokens,
+                      cache_creation_tokens, output_tokens, thinking_tokens, tool_names, turn_id)
+                    VALUES (:session_key, :event_id, :ts, :model, :input_tokens,
+                      :cache_read_tokens, :cache_creation_tokens, :output_tokens, :thinking_tokens, :tool_names, :turn_id)
                     ON CONFLICT(session_key, event_id) DO UPDATE SET
                       ts=excluded.ts, model=excluded.model, input_tokens=excluded.input_tokens,
                       cache_read_tokens=excluded.cache_read_tokens, cache_creation_tokens=excluded.cache_creation_tokens,
                       output_tokens=excluded.output_tokens, thinking_tokens=excluded.thinking_tokens,
-                      tool_names=excluded.tool_names
+                      tool_names=excluded.tool_names, turn_id=COALESCE(excluded.turn_id, steps.turn_id)
                 """, values)
+
+    def upsert_turns(self, records: list[TurnRecord]) -> None:
+        with self.lock, self.conn:
+            self.conn.executemany("""
+                INSERT INTO turns VALUES (:session_key, :turn_id, :kind, :started_at, :completed_at,
+                  :prompt, :prompt_truncated, :reply, :reply_truncated, :context_limit)
+                ON CONFLICT(session_key, turn_id) DO UPDATE SET
+                  kind=COALESCE(excluded.kind, turns.kind),
+                  started_at=CASE WHEN turns.started_at IS NULL THEN excluded.started_at
+                    WHEN excluded.started_at IS NULL THEN turns.started_at ELSE MIN(turns.started_at, excluded.started_at) END,
+                  completed_at=CASE WHEN turns.completed_at IS NULL THEN excluded.completed_at
+                    WHEN excluded.completed_at IS NULL THEN turns.completed_at ELSE MAX(turns.completed_at, excluded.completed_at) END,
+                  prompt_truncated=CASE WHEN turns.prompt IS NULL THEN excluded.prompt_truncated ELSE turns.prompt_truncated END,
+                  prompt=COALESCE(turns.prompt, excluded.prompt),
+                  reply_truncated=CASE WHEN excluded.reply IS NOT NULL THEN excluded.reply_truncated ELSE turns.reply_truncated END,
+                  reply=COALESCE(excluded.reply, turns.reply),
+                  context_limit=COALESCE(excluded.context_limit, turns.context_limit)
+            """, [asdict(record) for record in records])
+
+    def upsert_items(self, records: list[ItemRecord]) -> None:
+        values = []
+        for record in records:
+            item = asdict(record)
+            item["fields_json"] = json.dumps(item.pop("fields"))
+            item["truncated_fields_json"] = json.dumps(item.pop("truncated_fields"))
+            values.append(item)
+        with self.lock, self.conn:
+            self.conn.executemany("""
+                INSERT INTO turn_items VALUES (:session_key, :item_id, :turn_id, :seq, :kind, :text,
+                  :truncated, :status, :started_at, :completed_at, :tool_name, :fields_json, :truncated_fields_json)
+                ON CONFLICT(session_key, item_id) DO UPDATE SET
+                  turn_id=COALESCE(turn_items.turn_id, excluded.turn_id), seq=COALESCE(turn_items.seq, excluded.seq),
+                  kind=COALESCE(turn_items.kind, excluded.kind), started_at=COALESCE(turn_items.started_at, excluded.started_at),
+                  tool_name=COALESCE(turn_items.tool_name, excluded.tool_name),
+                  truncated=CASE WHEN excluded.text != '' THEN excluded.truncated ELSE turn_items.truncated END,
+                  text=CASE WHEN excluded.text != '' THEN excluded.text ELSE turn_items.text END,
+                  completed_at=COALESCE(excluded.completed_at, turn_items.completed_at),
+                  status=CASE WHEN excluded.status='completed' AND turn_items.status='failed'
+                    THEN turn_items.status ELSE excluded.status END,
+                  fields_json=CASE WHEN excluded.fields_json != '{}' THEN excluded.fields_json ELSE turn_items.fields_json END,
+                  truncated_fields_json=CASE WHEN excluded.truncated_fields_json != '[]'
+                    THEN excluded.truncated_fields_json ELSE turn_items.truncated_fields_json END
+            """, values)
+
+    def get_meta(self, key: str) -> str | None:
+        with self.lock:
+            row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
+
+    def last_turn_id(self, session_key: str) -> str | None:
+        with self.lock:
+            row = self.conn.execute("SELECT turn_id FROM turns WHERE session_key=? ORDER BY started_at DESC, turn_id DESC LIMIT 1", (session_key,)).fetchone()
+            return row[0] if row else None
+
+    def _rows_for(self, session_keys: list[str], select: str, order: tuple) -> list[sqlite3.Row]:
+        if not session_keys:
+            return []
+        session_keys = list(dict.fromkeys(session_keys))
+        rows = []
+        with self.lock:
+            for start in range(0, len(session_keys), 500):
+                chunk = session_keys[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(self.conn.execute(f"{select} WHERE {order[0]} IN ({placeholders})", chunk).fetchall())
+        rows.sort(key=order[1])
+        return rows
+
+    def steps_for(self, session_keys: list[str]) -> list[sqlite3.Row]:
+        return self._rows_for(session_keys, "SELECT steps.*, sessions.provider FROM steps JOIN sessions ON sessions.session_key=steps.session_key",
+                              ("steps.session_key", lambda row: row["ts"]))
+
+    def turns_for(self, session_keys: list[str]) -> list[sqlite3.Row]:
+        return self._rows_for(session_keys, "SELECT * FROM turns",
+                              ("session_key", lambda row: (row["started_at"] or "", row["turn_id"])))
+
+    def items_for(self, session_keys: list[str]) -> list[sqlite3.Row]:
+        return self._rows_for(session_keys, "SELECT * FROM turn_items",
+                              ("session_key", lambda row: (row["session_key"], row["turn_id"], row["seq"])))
+
+    def sessions_by_key(self) -> dict[str, SessionRecord]:
+        return {session.session_key: session for session in self.sessions()}
 
     def get_file(self, path: Path) -> tuple[int, int, int] | None:
         with self.lock:
