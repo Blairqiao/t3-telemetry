@@ -1866,3 +1866,18 @@ def test_overview_120x40_shows_usage_breakdown():
     output = buf.getvalue()
     assert "of this chat's tokens" in output
     assert "Cache read" in output
+
+
+def test_provider_lines_mixed_and_single():
+    from t3_telemetry.ui import provider_lines
+    from t3_telemetry.usage import UsageStats
+
+    stats = UsageStats()
+    stats.add("gpt-6.1-sol", None, 1_000_000, 0, 0, 0, False, family="Claude")
+    assert provider_lines(stats, "tokens", 40) == []
+    stats.add("gpt-6.1-sol", None, 500_000, 0, 0, 0, True, family="Codex")
+    lines = provider_lines(stats, "tokens", 40)
+    assert len(lines) == 2
+    assert lines[0].cell_len == 40
+    assert "Claude" in lines[1].plain and "Codex" in lines[1].plain
+    assert "$" in provider_lines(stats, "usd", 80)[1].plain

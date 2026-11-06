@@ -353,3 +353,31 @@ def test_store_report_costs_and_lifetime(tmp_path):
     assert report.lifetime('root', 'usd') == pytest.approx(8.0)
     assert report.all_time['session:codex:free'].cost.unpriced_tokens == 7
     store.close()
+
+
+def test_provider_split_and_serialization():
+    from t3_telemetry.models import TurnMetrics
+    from t3_telemetry.usage import provider_breakdown
+
+    root_step = ModelStep(step_index=1, started_at=None, input_tokens=10, cache_read_tokens=2,
+                          provider="claude", turn_key="session|turn", model="gpt-6.1-sol")
+    child_step = ModelStep(step_index=1, started_at=None, cache_creation_tokens=3, output_tokens=4,
+                           provider="codex", turn_key="child|turn")
+    child = node("child", "Child", "codex", [child_step, child_step])
+    root = node("root", "Root", "claude", [root_step], [child])
+    root.rollup_metrics.input_tokens = 10
+    root.rollup_metrics.cache_read_tokens = 2
+    root.rollup_metrics.cache_creation_tokens = 3
+    root.rollup_metrics.output_tokens = 4
+    root.current_turn_metrics = TurnMetrics(turn_id="turn")
+    stats = stats_for_node(root)
+    assert {k: v.total for k, v in stats.provider_tokens.items()} == {"Claude": 12, "Codex": 7}
+    assert stats.model_tokens["gpt-6.1-sol"] == 12
+    split = provider_breakdown(root)
+    assert split["claude"] == {"input_tokens": 10, "cache_read_tokens": 2,
+                                "cache_creation_tokens": 0, "output_tokens": 0, "total_tokens": 12}
+    assert split["codex"]["total_tokens"] == 7
+    data = root.to_dict()
+    assert data["by_provider"] == split
+    assert sum(v["total_tokens"] for v in split.values()) == data["rollup_metrics"]["total_tokens"]
+    assert data["current_turn_metrics"]["turn_id"] == "turn"

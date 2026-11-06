@@ -52,16 +52,20 @@ class UsageStats:
     cost: CostBreakdown = field(default_factory=CostBreakdown)
     subagent_tokens: TokenBreakdown = field(default_factory=TokenBreakdown)
     subagent_cost: CostBreakdown = field(default_factory=CostBreakdown)
+    provider_tokens: dict[str, TokenBreakdown] = field(default_factory=dict)
+    provider_cost: dict[str, CostBreakdown] = field(default_factory=dict)
     model_tokens: dict[str, int] = field(default_factory=dict)
     model_cost: dict[str, float] = field(default_factory=dict)
     steps: int = 0
     large_context_steps: int = 0
 
     def add(self, model: str | None, when: datetime | None, input: int, cache_read: int,
-            cache_write: int, output: int, subagent: bool) -> None:
+            cache_write: int, output: int, subagent: bool, *, family: str = "Other") -> None:
         self.tokens.add_counts(input, cache_read, cache_write, output)
         c = step_cost(model, when, input, cache_read, cache_write, output)
         self.cost.add(c)
+        self.provider_tokens.setdefault(family, TokenBreakdown()).add_counts(input, cache_read, cache_write, output)
+        self.provider_cost.setdefault(family, CostBreakdown()).add(c)
         if subagent:
             self.subagent_tokens.add_counts(input, cache_read, cache_write, output)
             self.subagent_cost.add(c)
@@ -81,7 +85,7 @@ def stats_for_node(node: ThreadTelemetryNode) -> UsageStats:
         n = stack.pop()
         stack.extend(reversed(n.subagents))
         for step in n.steps:
-            identity = (n.thread_id, step.source, step.provider_turn_id, step.step_index)
+            identity = step.turn_key or (n.thread_id, step.source, step.provider_turn_id, step.step_index)
             if identity in seen:
                 continue
             seen.add(identity)
@@ -89,9 +93,21 @@ def stats_for_node(node: ThreadTelemetryNode) -> UsageStats:
                 started_at = datetime.fromisoformat(step.started_at)
             except (TypeError, ValueError):
                 started_at = None
-            stats.add(n.model, started_at, step.input_tokens, step.cache_read_tokens,
-                      step.cache_creation_tokens, step.output_tokens, subagent=n is not node)
+            stats.add(step.model or n.model, started_at, step.input_tokens, step.cache_read_tokens,
+                      step.cache_creation_tokens, step.output_tokens, subagent=n is not node,
+                      family=family_label(step.provider or n.provider or provider_key(n.driver, n.provider_instance_id)))
     return stats
+
+
+def provider_breakdown(node: ThreadTelemetryNode) -> dict[str, dict[str, int]]:
+    """Token counts for each provider across the node and its descendants."""
+    result = {}
+    for family, counts in stats_for_node(node).provider_tokens.items():
+        if counts.total > 0:
+            result[family.lower()] = {name: getattr(counts, name) for name in (
+                "input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens"
+            )} | {"total_tokens": counts.total}
+    return result
 
 
 def _step_time(step: ModelStep) -> datetime | None:
@@ -301,7 +317,7 @@ def build_usage_report(roots: list[ThreadTelemetryNode], now: datetime) -> Usage
                     w = usage.window
                     if not w.start.astimezone(timezone.utc) <= t < w.end.astimezone(timezone.utc):
                         continue
-                    usage.stats.add(node.model, t, *counts, subagent=is_subagent)
+                    usage.stats.add(node.model, t, *counts, subagent=is_subagent, family=family)
                     _add_to_period(usage, bisect_right(utc_starts[key], t) - 1, family,
                                    "Subagents" if is_subagent else "Main", counts, cost)
                     totals[key].add_counts(*counts)
@@ -388,7 +404,7 @@ def build_store_usage_report(store: TelemetryStore, now: datetime,
             w = usage.window
             if not w.start.astimezone(timezone.utc) <= t < w.end.astimezone(timezone.utc):
                 continue
-            usage.stats.add(model, t, *counts, subagent=is_subagent)
+            usage.stats.add(model, t, *counts, subagent=is_subagent, family=family)
             _add_to_period(usage, bisect_right(utc_starts[key], t) - 1, family,
                            "Subagents" if is_subagent else "Main", counts, cost)
             row, families = rows[key].setdefault(row_id, (ThreadUsage(row_id, title, status, [], TokenBreakdown()), set()))

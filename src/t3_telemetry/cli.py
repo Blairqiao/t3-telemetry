@@ -54,6 +54,7 @@ from t3_telemetry.ui import (
     format_measure,
     usage_graph_lines,
     breakdown_lines,
+    provider_lines,
     ActionsView,
     build_action_detail_lines,
     section_rule,
@@ -734,10 +735,12 @@ def _overview_body(
     # One section rule each for Usage, Context, and every list.
     section_rules = 2 + len(counts)
     stats = stats_for_node(node)
-    variants = [dict(headline_on=True, legend="compact"), dict(headline_on=False, legend="compact"), dict(headline_on=False, legend="none"), None]
+    variants = [(True, dict(headline_on=True, legend="compact")), (False, dict(headline_on=True, legend="compact")), (False, dict(headline_on=False, legend="compact")), (False, dict(headline_on=False, legend="none")), (False, None)]
     graph_h = graph_min
-    for variant in variants:
-        block = breakdown_lines(stats, nav.measure, inner_width, scope="this chat's", **variant) if variant is not None else []
+    for show_provider, variant in variants:
+        block = (provider_lines(stats, nav.measure, inner_width) if show_provider else [])
+        if variant is not None:
+            block += breakdown_lines(stats, nav.measure, inner_width, scope="this chat's", **variant)
         fixed = 1 + len(scope_lines) + section_rules + len(block)
         spare = inner_height - fixed - graph_h - sum(_lines(k) for k in counts)
         if spare >= 0:

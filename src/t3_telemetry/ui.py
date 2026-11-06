@@ -515,6 +515,25 @@ def breakdown_lines(
 
 
 PROVIDER_GLYPHS = {"Claude": "█", "Codex": "▓", "Antigravity": "▒", "Other": "░"}
+
+def provider_lines(stats: UsageStats, measure: str, width: int) -> list[Text]:
+    """Render a provider split when multiple providers contribute."""
+    breakdown = stats.provider_cost if measure == "usd" else stats.provider_tokens
+    values = {provider: breakdown[provider].total for provider in PROVIDER_ORDER if provider in breakdown}
+    active = [provider for provider in PROVIDER_ORDER if values.get(provider, 0) > 0]
+    if len(active) <= 1:
+        return []
+    cells = allocate_cells(values, width, PROVIDER_ORDER)
+    bar, legend = Text(), Text(no_wrap=True)
+    for provider in active:
+        bar.append(PROVIDER_GLYPHS[provider] * cells[provider], style=PROVIDER_STYLES[provider])
+        if legend:
+            legend.append(" · ")
+        legend.append(PROVIDER_GLYPHS[provider], style=PROVIDER_STYLES[provider])
+        legend.append(f" {provider} {format_measure(values[provider], measure)}")
+    legend.truncate(max(0, width), overflow="ellipsis")
+    return [bar, legend]
+
 SCOPE_STYLES = {"Main": CHART_BLUE, "Subagents": CHART_MAGENTA}
 SCOPE_GLYPHS = {"Main": "█", "Subagents": "▓"}
 

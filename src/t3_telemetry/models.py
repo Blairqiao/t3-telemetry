@@ -381,7 +381,7 @@ class TurnMetrics(TokenMetricsSummary):
     activity_kind: str = "provider_turn"
 
     def to_dict(self) -> dict[str, Any]:
-        data = super().to_dict()
+        data = TokenMetricsSummary.to_dict(self)
         data["ordinal"] = self.ordinal
         data["turn_id"] = self.turn_id
         data["status"] = self.status
@@ -482,12 +482,15 @@ class ThreadTelemetryNode:
         return min(100.0, (self.context_used_tokens / lim) * 100.0)
 
     def to_dict(self) -> dict[str, Any]:
+        from .usage import provider_breakdown
+
         return {
             "thread_id": self.thread_id,
             "title": self.title,
             "driver": self.driver,
             "provider": self.provider,
             "store_state": self.store_state,
+            "by_provider": provider_breakdown(self),
             "provider_instance_id": self.provider_instance_id,
             "model": self.model,
             "thinking_level": self.thinking_level,
