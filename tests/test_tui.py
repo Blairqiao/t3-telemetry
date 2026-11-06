@@ -1527,7 +1527,8 @@ def test_list_ranges_and_focus_are_in_section_rules():
     for focus in ("activity", "overview"):
         nav.current_screen.focus = focus
         lines = _render_lines(node, nav, 24, 60)
-        for label in ("Subagents", "Activity"):
+        labels = ("Activity",) if focus == "activity" else ("Subagents", "Activity")
+        for label in labels:
             rules = [i for i, line in enumerate(lines) if f" {label} · " in line and "of 12" in line]
             assert len(rules) == 1
             rule = lines[rules[0]]
@@ -1540,8 +1541,9 @@ def test_list_ranges_and_focus_are_in_section_rules():
 def test_every_overview_section_uses_the_standard_rule():
     node = _activity_node(n_children=3)
     nav = _open_overview(node)
+    nav.current_screen.focus = "overview"
     text = "\n".join(_render_lines(node, nav, 40, 100))
-    for label in ("─ Usage ─", "─ Context ─", "─ Subagents · ", "▌ Activity · "):
+    for label in ("─ Usage ─", "─ Context ─", "▌ Subagents · ", "─ Activity · "):
         assert label in text
 
 
@@ -1564,12 +1566,60 @@ def test_focus_switch_preserves_table_capacity_and_section_rules():
             nav.current_screen.focus = focus
             lines = _render_lines(node, nav, height, width)
             headers = [i for i, line in enumerate(lines) if "of 40" in line]
-            assert len(headers) == 2
+            assert len(headers) == (1 if focus == "activity" else 2)
             ranges.append([" ".join(lines[i].replace("▌", "─").split()) for i in headers])
             for i in headers:
                 assert "───" in lines[i] and "Time" in lines[i + 1]
         # Ignore the focus marker, which replaces the rule's first dash.
-        assert ranges[0] == ranges[1] == ranges[2]
+        assert ranges[0] == ranges[2]
+
+
+def test_activity_tab_full_height_and_tab_strip():
+    node = _activity_node(n_steps=20, n_children=5)
+    nav = _open_overview(node)
+    # 1. On Activity tab at height 30, activity list fills body and shows 1–20 of 20
+    nav.current_screen.focus = "activity"
+    lines_act = _render_lines(node, nav, 30, 100)
+    text_act = "\n".join(lines_act)
+    assert "1–20 of 20" in text_act
+    tab_strip_act = next(line for line in lines_act if "Overview" in line and "Activity (20)" in line)
+    assert "▌ Activity" in tab_strip_act
+
+    # 2. On Overview tab, tab strip text appears with Overview active
+    nav.current_screen.focus = "overview"
+    lines_ov = _render_lines(node, nav, 30, 100)
+    tab_strip_ov = next(line for line in lines_ov if "Overview" in line and "Activity (20)" in line)
+    assert "▌ Overview" in tab_strip_ov
+    text_ov = "\n".join(lines_ov)
+    assert "Usage" in text_ov
+    assert "Context" in text_ov
+    assert "Subagents" in text_ov
+    assert "Activity" in text_ov
+
+
+def test_tab_strip_styling_and_fitting():
+    from t3_telemetry.cli import _tab_strip
+    from t3_telemetry.tui import ScreenState
+
+    # Overview active
+    s_ov = ScreenState("th", focus="overview")
+    t_ov = _tab_strip(s_ov, 42, 80)
+    assert t_ov.plain == "▌ Overview   Activity (42) "
+    spans_ov = [(t_ov.plain[s.start:s.end], s.style) for s in t_ov.spans]
+    assert ("▌ Overview", "bold cyan") in spans_ov
+    assert ("Activity (42) ", "dim") in spans_ov
+
+    # Activity active
+    s_act = ScreenState("th", focus="activity")
+    t_act = _tab_strip(s_act, 42, 80)
+    assert t_act.plain == " Overview  ▌ Activity (42) "
+    spans_act = [(t_act.plain[s.start:s.end], s.style) for s in t_act.spans]
+    assert (" Overview", "dim") in spans_act
+    assert ("▌ Activity (42) ", "bold cyan") in spans_act
+
+    # Fitting to narrow width
+    assert _tab_strip(s_ov, 42, 20).plain == "▌ Overview   Activi…"
+    assert _tab_strip(s_ov, 42, 10).plain == "▌ Overvie…"
 
 
 def test_w_s_move_selection_and_scroll_activity_details():

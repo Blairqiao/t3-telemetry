@@ -1374,8 +1374,8 @@ def test_browser_frame_60x24_repro_parent_claude_child_worker_scopes_context_act
     assert len(lines_act) == 24
     out_act = chr(10).join(lines_act)
     assert "Activity" in out_act
-    assert "Subagents" in out_act
-    assert "Worker Subagent" in out_act
+    assert "Subagents" not in out_act
+    assert "Worker Subagent" not in out_act
     # Default selection is the most recent entry
     assert any("tool_5" in line or "Model step #5" in line for line in lines_act)
 

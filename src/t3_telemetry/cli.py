@@ -708,6 +708,71 @@ def _child_table(node: ThreadTelemetryNode, screen: ScreenState, window: list, s
     return table
 
 
+def _tab_strip(screen: ScreenState, activity_count: int, width: int) -> Text:
+    """Two-tab strip for an agent screen: Overview and Activity (N)."""
+    strip = Text()
+    if screen.focus == "activity":
+        strip.append(" Overview", style="dim")
+        strip.append("  ")
+        strip.append(f"▌ Activity ({activity_count}) ", style="bold cyan")
+    else:
+        strip.append("▌ Overview", style="bold cyan")
+        strip.append("   ")
+        strip.append(f"Activity ({activity_count}) ", style="dim")
+    return _fit(strip, width)
+
+
+def _activity_tab_body(
+    node: ThreadTelemetryNode,
+    nav: NavigationState,
+    screen: ScreenState,
+    entries: list,
+    inner_height: int,
+    inner_width: int,
+) -> list:
+    """Full-height activity tab for an agent screen."""
+    identity = _identity_line(node, inner_width, nav.measure)
+    tab_strip = _tab_strip(screen, len(entries), inner_width)
+    lines = max(0, inner_height - 3)
+
+    entry_ids = [e.entry_id for e in entries]
+    act_total = len(entries)
+    act_sel = entry_ids.index(screen.selected_activity_id) if screen.selected_activity_id in entry_ids else max(0, act_total - 1)
+
+    if not entries:
+        note = "0 of 0"
+        table = build_activity_table([], interactive=True, focused=True, range_label=note, measure=nav.measure)
+        return [
+            identity,
+            tab_strip,
+            section_rule("Activity", inner_width, note=note, focused=True),
+            Viewport(table, height=lines, width=inner_width),
+        ]
+
+    header_lines, rows = table_geometry(lines)
+    start = window_start(act_total, act_sel, screen.activity_offset, rows)
+    screen.activity_offset = start
+    window = entries[start : start + rows]
+    note = activity_range_label(start, len(window), act_total)
+    table = build_activity_table(
+        window,
+        selected_id=entry_ids[act_sel],
+        focused=True,
+        interactive=True,
+        show_header=header_lines > 0,
+        range_label=note,
+        measure=nav.measure,
+        model=node.model,
+        syncing=node.store_state == "syncing",
+    )
+    return [
+        identity,
+        tab_strip,
+        section_rule("Activity", inner_width, note=note, focused=True),
+        Viewport(table, height=lines, width=inner_width),
+    ]
+
+
 def _overview_body(
     node: ThreadTelemetryNode,
     nav: NavigationState,
@@ -764,7 +829,7 @@ def _overview_body(
         block = (provider_lines(stats, nav.measure, inner_width) if show_provider else [])
         if variant is not None:
             block += breakdown_lines(stats, nav.measure, inner_width, scope="this chat's", **variant)
-        fixed = 1 + len(scope_lines) + section_rules + len(block)
+        fixed = 2 + len(scope_lines) + section_rules + len(block)
         spare = inner_height - fixed - graph_h - sum(_lines(k) for k in counts)
         if spare >= 0:
             break
@@ -802,6 +867,7 @@ def _overview_body(
 
     body: list = [
         identity,
+        _tab_strip(screen, act_total, inner_width),
         section_rule("Usage", inner_width),
         *scope_lines,
         *block,
@@ -1134,6 +1200,8 @@ def _browser_frame(
             body = _action_detail_body(node, screen, action_lines, inner_height, inner_width, nav.measure)
         elif detail_entry is not None:
             body = _activity_detail_body(node, screen, detail_entry, inner_height, inner_width, nav.measure)
+        elif screen.focus == "activity":
+            body = _activity_tab_body(node, nav, screen, entries, inner_height, inner_width)
         else:
             body = _overview_body(node, nav, screen, entries, inner_height, inner_width, width)
         title = Text(_breadcrumb(nav, max(10, width - 8)), style="bold cyan")
