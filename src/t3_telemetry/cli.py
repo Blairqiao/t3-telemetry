@@ -52,7 +52,8 @@ from t3_telemetry.ui import (
     format_measure,
     usage_graph_lines,
     breakdown_lines,
-    provider_lines,
+    build_provider_model_table,
+    provider_model_row_count,
     ActionsView,
     build_action_detail_lines,
     section_rule,
@@ -773,6 +774,59 @@ def _activity_tab_body(
     ]
 
 
+def _overview_budget(inner_height: int, stats, legend_lines: int, graph_min: int,
+                     graph_full: int, graph_natural: int, children: int,
+                     has_samples: bool, syncing: bool = False) -> dict:
+    """Allocate overview lines in display priority order."""
+    providers = sum(1 for tokens in stats.provider_tokens.values() if tokens.total > 0)
+    pm_rows = 0 if syncing else provider_model_row_count(stats, max_rows=max(1, providers))
+    # Syncing replaces the table with a single status line.
+    fixed = 2 + 3 + (4 if children else 3) + (0 if syncing else 1)
+    fixed += 1 if syncing else 1 + pm_rows
+    sub_rows = 1 if children else 0
+    fixed += 1 + sub_rows if children else 0
+    graph = graph_min
+    spare = inner_height - fixed - graph
+    if spare < 0:
+        graph = max(1, graph + spare)
+        spare = max(0, inner_height - fixed - graph)
+    headline = False
+    legend = False
+    if not syncing and spare >= 1:
+        headline = True
+        spare -= 1
+    if not syncing and spare >= legend_lines:
+        legend = True
+        spare -= legend_lines
+    if not syncing:
+        full_rows = provider_model_row_count(stats, max_rows=10**6)
+        # A model group may need multiple rows before any additional rows appear.
+        for limit in range(pm_rows + 1, full_rows + 1):
+            count = provider_model_row_count(stats, max_rows=limit)
+            if count - pm_rows <= spare:
+                spare -= count - pm_rows
+                pm_rows = count
+    def grow_graph(amount):
+        nonlocal graph, spare
+        added = min(max(0, amount), spare)
+        graph += added
+        spare -= added
+    grow_graph(graph_full - graph)
+    if children:
+        added = min(max(0, min(3, children) - sub_rows), spare)
+        sub_rows += added
+        spare -= added
+    grow_graph(min(graph_natural - graph, spare // 2))
+    if children:
+        added = min(children - sub_rows, spare)
+        sub_rows += added
+        spare -= added
+    if has_samples:
+        grow_graph(spare)
+    return dict(graph=graph, pm_rows=pm_rows, sub_rows=sub_rows,
+                headline=headline, legend=legend, spare=spare)
+
+
 def _overview_body(
     node: ThreadTelemetryNode,
     nav: NavigationState,
@@ -782,124 +836,42 @@ def _overview_body(
     inner_width: int,
     width: int,
 ) -> list:
-    """Overview for any agent (root or child): identity, scopes, graph, Subagents, Activity.
-
-    Height budget: identity and scope lines first; then each nonempty list gets
-    a heading and one row, and the graph gets its three labeled plot rows.
-    Extra lines go to the lists (up to three rows each, in a fixed order),
-    then the graph (up to its natural size, at most half of what is left),
-    then the lists again until every row is shown.
-    Every list row is one line, so the window, selection, and clip agree.
-    """
     identity = _identity_line(node, inner_width, nav.measure)
     scope_lines = [_fit(line, inner_width) for line in build_scopes_summary(node, width=inner_width, measure=nav.measure)]
-
-    entry_ids = [e.entry_id for e in entries]
-    act_total = len(entries)
-    act_sel = entry_ids.index(screen.selected_activity_id) if screen.selected_activity_id in entry_ids else max(0, act_total - 1)
     children = list(node.subagents)
     child_ids = [c.thread_id for c in children]
     child_sel = child_ids.index(screen.selected_child_id) if screen.selected_child_id in child_ids else 0
-    sub_focus = bool(children) and screen.focus == "overview"
-
-    # Rows per list (an empty list still shows one message line) and how many it could use.
-    counts = ({"subagents": len(children)} if children else {}) | {"activity": act_total}
-    rows = {key: 1 for key in counts}
-    order = list(counts)
-
-    def _lines(key: str) -> int:
-        return rows[key] + table_header_lines(rows[key])
-
-    # Between the minimum (optional lines merged or dropped) and the full
-    # three-row graph, the graph would trade plot rows for optional lines, so
-    # it only ever grows to `graph_full` or beyond.
+    stats = stats_for_node(node)
+    syncing = node.store_state == "syncing"
     plot_rows = 3 if inner_height <= 20 else (5 if inner_height <= 30 else 7)
     graph_min = context_graph_min_height(node, inner_width, 3)
     graph_full = max(graph_min, len(context_graph_lines(node, inner_width, 3)))
     graph_natural = max(graph_full, len(context_graph_lines(node, inner_width, plot_rows)))
-
-    # One section rule each for Usage, Context, and every list.
-    section_rules = 2 + len(counts)
-    stats = stats_for_node(node)
-    variants = [(True, dict(headline_on=True, legend="compact")), (False, dict(headline_on=True, legend="compact")), (False, dict(headline_on=False, legend="compact")), (False, dict(headline_on=False, legend="none")), (False, None)]
-    if node.store_state == "syncing":
-        variants = [(False, None)]
-    graph_h = graph_min
-    for show_provider, variant in variants:
-        block = (provider_lines(stats, nav.measure, inner_width) if show_provider else [])
-        if variant is not None:
-            block += breakdown_lines(stats, nav.measure, inner_width, scope="this chat's", **variant)
-        fixed = 2 + len(scope_lines) + section_rules + len(block)
-        spare = inner_height - fixed - graph_h - sum(_lines(k) for k in counts)
-        if spare >= 0:
-            break
-    if spare < 0:
-        # Below the supported minimum: the graph shrinks before list rows go.
-        graph_h = max(1, graph_h + spare)
-        spare = inner_height - fixed - graph_h - sum(_lines(k) for k in counts)
-
-    def _grow(cap: int) -> None:
-        nonlocal spare
-        moved = True
-        while moved:
-            moved = False
-            for key in order:
-                if rows[key] >= min(cap, counts[key]):
-                    continue
-                cost = 1 + table_header_lines(rows[key] + 1) - table_header_lines(rows[key])
-                if cost <= spare:
-                    rows[key] += 1
-                    spare -= cost
-                    moved = True
-
-    _grow(3)
-    graph_extra = min(graph_natural - graph_h, spare // 2)
-    if graph_h + graph_extra >= graph_full:
-        graph_h += graph_extra
-        spare -= graph_extra
-    _grow(10**6)
-    if node.context_samples and graph_h + spare >= graph_full:
-        # Lists are fully shown; leftover lines become taller bars.
-        graph_h += spare
-    alloc = {key: _lines(key) for key in counts}
-
-    graph = render_context_graph(node, width=inner_width, as_panel=False, height=graph_h, min_plot_rows=3)
-
-    body: list = [
-        identity,
-        _tab_strip(screen, act_total, inner_width),
-        section_rule("Usage", inner_width),
-        *scope_lines,
-        *block,
-        section_rule("Context", inner_width),
-        graph,
-    ]
-
+    legend_count = len(breakdown_lines(stats, nav.measure, inner_width, scope="this chat's", headline_on=False, legend="compact")) - 1
+    alloc = _overview_budget(inner_height, stats, legend_count, graph_min, graph_full,
+                             graph_natural, len(children), bool(node.context_samples), syncing)
+    block = [] if syncing else breakdown_lines(stats, nav.measure, inner_width, scope="this chat's",
+                                                headline_on=alloc["headline"],
+                                                legend="compact" if alloc["legend"] else "none")
+    body: list = [identity, _tab_strip(screen, len(entries), inner_width),
+                  section_rule("Usage", inner_width), *scope_lines, *block,
+                  section_rule("Context", inner_width),
+                  render_context_graph(node, width=inner_width, as_panel=False, height=alloc["graph"], min_plot_rows=3),
+                  section_rule("Providers & models", inner_width, note="est. $" if nav.measure == "usd" else "tokens")]
+    if syncing:
+        body.append(Text("syncing…", style="dim"))
+    else:
+        table = build_provider_model_table(stats, nav.measure, inner_width, max_rows=alloc["pm_rows"], show_header=True)
+        body.append(Viewport(table, height=1 + alloc["pm_rows"], width=inner_width))
     if children:
-        lines = alloc["subagents"]
+        lines = 1 + alloc["sub_rows"]
         header_lines, rows = table_geometry(lines)
         start = window_start(len(children), child_sel, screen.child_scroll, rows)
         screen.child_scroll = start
         window = children[start : start + rows]
-        table = _child_table(node, screen, window, header_lines > 0, sub_focus, width, activity_range_label(start, len(window), len(children)), nav.measure)
-        body.append(section_rule("Subagents", inner_width, note=activity_range_label(start, len(window), len(children)), focused=sub_focus))
-        body.append(Viewport(table, height=lines, width=inner_width))
-
-    lines = alloc["activity"]
-    if not entries:
-        body.append(section_rule("Activity", inner_width, note="0 of 0", focused=not sub_focus))
-        body.append(Viewport(build_activity_table([], interactive=True, focused=not sub_focus, range_label="0 of 0", measure=nav.measure), height=lines, width=inner_width))
-    else:
-        header_lines, rows = table_geometry(lines)
-        start = window_start(act_total, act_sel, screen.activity_offset, rows)
-        screen.activity_offset = start
-        window = entries[start : start + rows]
-        body.append(section_rule("Activity", inner_width, note=activity_range_label(start, len(window), act_total), focused=not sub_focus))
-        table = build_activity_table(
-            window, selected_id=entry_ids[act_sel], focused=not sub_focus, interactive=True, show_header=header_lines > 0,
-            range_label=activity_range_label(start, len(window), act_total),
-            measure=nav.measure, model=node.model, syncing=node.store_state == "syncing",
-        )
+        note = activity_range_label(start, len(window), len(children))
+        table = _child_table(node, screen, window, header_lines > 0, True, width, note, nav.measure)
+        body.append(section_rule("Subagents", inner_width, note=note, focused=True))
         body.append(Viewport(table, height=lines, width=inner_width))
     return body
 

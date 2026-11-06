@@ -1527,7 +1527,7 @@ def test_list_ranges_and_focus_are_in_section_rules():
     for focus in ("activity", "overview"):
         nav.current_screen.focus = focus
         lines = _render_lines(node, nav, 24, 60)
-        labels = ("Activity",) if focus == "activity" else ("Subagents", "Activity")
+        labels = ("Activity",) if focus == "activity" else ("Subagents",)
         for label in labels:
             rules = [i for i, line in enumerate(lines) if f" {label} · " in line and "of 12" in line]
             assert len(rules) == 1
@@ -1543,7 +1543,7 @@ def test_every_overview_section_uses_the_standard_rule():
     nav = _open_overview(node)
     nav.current_screen.focus = "overview"
     text = "\n".join(_render_lines(node, nav, 40, 100))
-    for label in ("─ Usage ─", "─ Context ─", "▌ Subagents · ", "─ Activity · "):
+    for label in ("─ Usage ─", "─ Context ─", "▌ Subagents · ", "─ Providers & models · "):
         assert label in text
 
 
@@ -1566,7 +1566,7 @@ def test_focus_switch_preserves_table_capacity_and_section_rules():
             nav.current_screen.focus = focus
             lines = _render_lines(node, nav, height, width)
             headers = [i for i, line in enumerate(lines) if "of 40" in line]
-            assert len(headers) == (1 if focus == "activity" else 2)
+            assert len(headers) == 1
             ranges.append([" ".join(lines[i].replace("▌", "─").split()) for i in headers])
             for i in headers:
                 assert "───" in lines[i] and "Time" in lines[i + 1]

@@ -816,7 +816,7 @@ def test_activity_isolation_parent_child_grandchild():
     assert "act_gamma" not in out_p
 
     # 2. Render Child View: Only child's own steps appear
-    nav.stack.append(ScreenState(node_id="th-child", title="Child Node"))
+    nav.stack.append(ScreenState(node_id="th-child", title="Child Node", focus="activity"))
     layout_child = _browser_frame([], node=child, summary=None, nav=nav, height=30, width=100)
     buf_c = io.StringIO()
     Console(file=buf_c, width=100, height=30).print(layout_child)
@@ -826,7 +826,7 @@ def test_activity_isolation_parent_child_grandchild():
     assert "act_gamma" not in out_c
 
     # 3. Render Grandchild View: Only grandchild's own steps appear
-    nav.stack.append(ScreenState(node_id="th-grandchild", title="Grandchild Node"))
+    nav.stack.append(ScreenState(node_id="th-grandchild", title="Grandchild Node", focus="activity"))
     layout_gc = _browser_frame([], node=grandchild, summary=None, nav=nav, height=30, width=100)
     buf_gc = io.StringIO()
     Console(file=buf_gc, width=100, height=30).print(layout_gc)
@@ -848,7 +848,7 @@ def test_missing_child_telemetry_renders_usable_screen():
     )
 
     nav = NavigationState()
-    nav.stack = [ScreenState(node_id="th-empty-child", title=empty_child.title)]
+    nav.stack = [ScreenState(node_id="th-empty-child", title=empty_child.title, focus="activity")]
 
     layout = _browser_frame([], node=empty_child, summary=empty_child, nav=nav, height=24, width=80)
     buf = io.StringIO()
@@ -1001,6 +1001,11 @@ def test_live_renderer_scopes_running_with_exact_turn():
     # Scope 3: Chat + subagents
     assert "Chat + subagents" in out
 
+    nav.current_screen.focus = "activity"
+    buf = io.StringIO()
+    Console(file=buf, width=100, height=28).print(_browser_frame([], node=node, summary=node, nav=nav, height=28, width=100))
+    out = buf.getvalue()
+
     # Activity stream shows explicit Provider turn #N and unknown tool when none provided
     assert "Provider turn #1" in out
     assert "Provider turn #2" in out
@@ -1063,6 +1068,11 @@ def test_live_renderer_scopes_idle_with_unavailable_turn():
     assert "2 steps" in out
     # Scope 3: Chat + subagents
     assert "Chat + subagents" in out
+
+    nav.current_screen.focus = "activity"
+    buf = io.StringIO()
+    Console(file=buf, width=100, height=28).print(_browser_frame([], node=node, summary=node, nav=nav, height=28, width=100))
+    out = buf.getvalue()
 
     # Steps have compact #N identity and correct action summary
     assert "· #1" in out
@@ -1411,7 +1421,7 @@ def test_browser_frame_60x24_repro_parent_claude_child_worker_scopes_context_act
     assert "Subagents" in out_120
     assert "Activity" in out_120
     assert "Worker Subagent" in out_120
-    assert "tool_1" in out_120 or "Model step #1" in out_120
+    assert "Providers & models" in out_120
 
 
 def test_browser_frame_content_accessibility_with_long_model_and_title():
@@ -1451,7 +1461,7 @@ def test_browser_frame_content_accessibility_with_long_model_and_title():
     assert len(lines_60) == 24
     out_60 = chr(10).join(lines_60)
     assert "Activity" in out_60
-    assert "execute_task" in out_60 or "Model step #1" in out_60
+    assert "Providers & models" in out_60
 
     # 120x40 layout
     layout_120 = _browser_frame([node], node=node, summary=node, nav=nav, height=40, width=120)
@@ -1461,7 +1471,7 @@ def test_browser_frame_content_accessibility_with_long_model_and_title():
     assert len(lines_120) == 40
     out_120 = chr(10).join(lines_120)
     assert "Activity" in out_120
-    assert "execute_task" in out_120 or "Model step #1" in out_120
+    assert "Providers & models" in out_120
 
 
 def _graph_node(values, limit=None, provenances=None, timestamps=True, current=None):
@@ -1958,3 +1968,35 @@ def test_provider_model_table_rows_and_widths():
     assert '$' in output and 'unpriced' in output
     assert table.row_count == provider_model_row_count(stats, 2) == 2
     assert provider_model_row_count(UsageStats(), 2) == 1
+
+
+def test_overview_budget_priorities_and_line_accounting():
+    from t3_telemetry.cli import _overview_budget
+    from t3_telemetry.usage import UsageStats
+
+    stats = UsageStats()
+    stats.add('claude-opus-5-5', None, 100, 200, 20, 50, False, family='Claude')
+    stats.add('claude-sonnet-5', None, 10, 20, 0, 5, False, family='Claude')
+    stats.add('unknown-model', None, 10, 0, 0, 0, False, family='Codex')
+    for height in (24, 40, 80):
+        budget = _overview_budget(height, stats, 2, 5, 5, 7, 4, True)
+        used = (2 + 3 + 4 + 1 + budget['headline'] + 2 * budget['legend']
+                + budget['graph'] + 1 + budget['pm_rows'] + 1 + budget['sub_rows'])
+        assert used + budget['spare'] == height
+        if height == 24:
+            assert budget['pm_rows'] == 2
+            assert budget['graph'] == 5
+        else:
+            assert budget['headline'] and budget['legend']
+            assert budget['pm_rows'] == 4
+            assert budget['sub_rows'] == 4
+            assert budget['graph'] >= 7
+
+
+def test_overview_budget_syncing_replaces_usage_blocks():
+    from t3_telemetry.cli import _overview_budget
+    from t3_telemetry.usage import UsageStats
+
+    budget = _overview_budget(40, UsageStats(), 2, 3, 5, 7, 0, True, syncing=True)
+    assert budget['pm_rows'] == 0
+    assert not budget['headline'] and not budget['legend']
