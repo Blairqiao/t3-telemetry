@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from t3_telemetry.db_t3 import T3StateSnapshot
-from t3_telemetry.models import AppThreadRecord, ProviderThreadRecord
+from t3_telemetry.models import AppThreadRecord, ProviderThreadRecord, SubagentLinkRecord
 from t3_telemetry.store import TelemetryStore
 from t3_telemetry.t3_mirror import mirror_t3_graph
 
@@ -266,4 +266,150 @@ def test_upsert_only_thread_vanishes(tmp_path: Path):
     # Binding for thread A also still present
     assert store.bindings() == {"claude:c-a": "t-a", "codex:x-b": "t-b"}
 
+    store.close()
+
+
+def test_mirror_native_claude_subagent_bindings(tmp_path: Path):
+    """A snapshot with parent thread (native_id='P') and provider-native Claude subagent link
+    produces claude:P/agent-<id> binding for child thread. An app_owned link produces none.
+    """
+    snap = T3StateSnapshot()
+    snap.threads["parent"] = _make_app_thread("parent", title="Parent Thread")
+    snap.threads["C"] = _make_app_thread("C", title="Child Thread", parent_thread_id="parent")
+    snap.threads["app-child"] = _make_app_thread("app-child", title="App Child Thread", parent_thread_id="parent")
+
+    snap.provider_threads["pt-parent"] = _make_provider_thread(
+        "pt-parent", "parent", driver="claudeAgent", provider_instance_id="claude_inst", native_id="P"
+    )
+
+    snap.subagents_by_parent["parent"] = [
+        SubagentLinkRecord(
+            subagent_id="node:provider:claudeAgent:native-item:task%3Aabc",
+            parent_thread_id="parent",
+            child_thread_id="C",
+            driver="claudeAgent",
+            provider_instance_id="claude_inst",
+            model="claude-3-7-sonnet",
+            title="Native Subagent",
+            status="completed",
+            origin="provider_native",
+        ),
+        SubagentLinkRecord(
+            subagent_id="node:provider:claudeAgent:native-item:task%3Adef",
+            parent_thread_id="parent",
+            child_thread_id="app-child",
+            driver="claudeAgent",
+            provider_instance_id="claude_inst",
+            model="claude-3-7-sonnet",
+            title="App Owned Subagent",
+            status="completed",
+            origin="app_owned",
+        ),
+    ]
+
+    store = TelemetryStore(tmp_path / "store.db")
+    mirror_t3_graph(store, snap)
+
+    bindings = store.bindings()
+    assert bindings["claude:P/agent-abc"] == "C"
+    assert "claude:P/agent-def" not in bindings
+    assert bindings["claude:P"] == "parent"
+
+    # Verify provider_thread_id is None for the subagent binding
+    rows = store.conn.execute(
+        "SELECT session_key, thread_id, provider_thread_id FROM t3_bindings WHERE session_key='claude:P/agent-abc'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["provider_thread_id"] is None
+
+    store.close()
+
+
+def test_mirror_native_claude_subagent_skipped_conditions(tmp_path: Path):
+    """Verify skipping conditions for subagent links:
+    missing/pending native_id on parent, missing child_thread_id, non-claude driver, no task: in id.
+    """
+    snap = T3StateSnapshot()
+    snap.threads["parent-pending"] = _make_app_thread("parent-pending")
+    snap.provider_threads["pt-parent-pending"] = _make_provider_thread(
+        "pt-parent-pending", "parent-pending", driver="claudeAgent", provider_instance_id="claude_inst", native_id="pending:123"
+    )
+
+    snap.threads["parent-no-pt"] = _make_app_thread("parent-no-pt")
+
+    snap.threads["parent-valid"] = _make_app_thread("parent-valid")
+    snap.provider_threads["pt-parent-valid"] = _make_provider_thread(
+        "pt-parent-valid", "parent-valid", driver="claudeAgent", provider_instance_id="claude_inst", native_id="P_valid"
+    )
+
+    snap.subagents_by_parent["parent-pending"] = [
+        SubagentLinkRecord(
+            subagent_id="node:provider:claudeAgent:native-item:task%3Askip1",
+            parent_thread_id="parent-pending",
+            child_thread_id="t-c1",
+            driver="claudeAgent",
+            provider_instance_id="claude_inst",
+            model="claude-3-7-sonnet",
+            title="Skip 1",
+            status="completed",
+            origin="provider_native",
+        )
+    ]
+    snap.subagents_by_parent["parent-no-pt"] = [
+        SubagentLinkRecord(
+            subagent_id="node:provider:claudeAgent:native-item:task%3Askip2",
+            parent_thread_id="parent-no-pt",
+            child_thread_id="t-c2",
+            driver="claudeAgent",
+            provider_instance_id="claude_inst",
+            model="claude-3-7-sonnet",
+            title="Skip 2",
+            status="completed",
+            origin="provider_native",
+        )
+    ]
+    snap.subagents_by_parent["parent-valid"] = [
+        # Missing child_thread_id
+        SubagentLinkRecord(
+            subagent_id="node:provider:claudeAgent:native-item:task%3Askip3",
+            parent_thread_id="parent-valid",
+            child_thread_id=None,
+            driver="claudeAgent",
+            provider_instance_id="claude_inst",
+            model="claude-3-7-sonnet",
+            title="Skip 3",
+            status="completed",
+            origin="provider_native",
+        ),
+        # Non-claude provider
+        SubagentLinkRecord(
+            subagent_id="node:provider:codex:native-item:task%3Askip4",
+            parent_thread_id="parent-valid",
+            child_thread_id="t-c4",
+            driver="codex",
+            provider_instance_id="codex_inst",
+            model="o3",
+            title="Skip 4",
+            status="completed",
+            origin="provider_native",
+        ),
+        # Missing task: in subagent_id
+        SubagentLinkRecord(
+            subagent_id="node:provider:claudeAgent:native-item:other%3Askip5",
+            parent_thread_id="parent-valid",
+            child_thread_id="t-c5",
+            driver="claudeAgent",
+            provider_instance_id="claude_inst",
+            model="claude-3-7-sonnet",
+            title="Skip 5",
+            status="completed",
+            origin="provider_native",
+        ),
+    ]
+
+    store = TelemetryStore(tmp_path / "store.db")
+    mirror_t3_graph(store, snap)
+
+    bindings = store.bindings()
+    assert bindings == {"claude:P_valid": "parent-valid"}
     store.close()

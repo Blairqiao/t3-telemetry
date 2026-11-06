@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from urllib.parse import unquote
 
 from t3_telemetry.providers import provider_key
 
@@ -45,5 +46,26 @@ def mirror_t3_graph(store: TelemetryStore, snapshot: T3StateSnapshot) -> None:
             "thread_id": pt.thread_id,
             "provider_thread_id": pt.provider_thread_id,
         })
+
+    for parent_thread_id, links in snapshot.subagents_by_parent.items():
+        for link in links:
+            if (
+                link.origin != "provider_native"
+                or provider_key(link.driver, link.provider_instance_id) != "claude"
+                or not link.child_thread_id
+            ):
+                continue
+            unquoted_id = unquote(link.subagent_id)
+            if "task:" not in unquoted_id:
+                continue
+            agent_id = unquoted_id.rsplit("task:", 1)[1]
+            parent_pt = snapshot.get_provider_thread(parent_thread_id)
+            if parent_pt is None or not parent_pt.native_id or parent_pt.native_id.startswith("pending:"):
+                continue
+            bindings.append({
+                "session_key": f"claude:{parent_pt.native_id}/agent-{agent_id}",
+                "thread_id": link.child_thread_id,
+                "provider_thread_id": None,
+            })
 
     store.replace_t3_graph(threads, bindings)
