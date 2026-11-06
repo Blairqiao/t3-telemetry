@@ -742,7 +742,15 @@ def _activity_tab_body(
 
     if not entries:
         note = "0 of 0"
-        table = build_activity_table([], interactive=True, focused=True, range_label=note, measure=nav.measure)
+        table = build_activity_table(
+            [],
+            interactive=True,
+            focused=True,
+            range_label=note,
+            measure=nav.measure,
+            detailed=True,
+            width=inner_width,
+        )
         return [
             identity,
             tab_strip,
@@ -765,6 +773,8 @@ def _activity_tab_body(
         measure=nav.measure,
         model=node.model,
         syncing=node.store_state == "syncing",
+        detailed=True,
+        width=inner_width,
     )
     return [
         identity,

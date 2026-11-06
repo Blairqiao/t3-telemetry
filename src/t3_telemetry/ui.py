@@ -1108,7 +1108,7 @@ def activity_tokens_cell(entry: ActivityEntry, measure: str = "tokens", model: s
     if measure == "usd":
         if entry.detail is None:
             return "—"
-        cost = step_usd(model, entry.detail)
+        cost = step_usd((entry.detail.model or model) if entry.detail else model, entry.detail)
         if cost.total <= 0 and cost.unpriced_tokens:
             return "unpriced"
         return format_usd(cost.total) + ("~" if approx else "")
@@ -1128,35 +1128,118 @@ def build_activity_table(
     measure: str = "tokens",
     model: str | None = None,
     syncing: bool = False,
+    detailed: bool = False,
+    width: int = 80,
 ) -> Table:
     """Compact activity feed: descriptive title, total tokens, duration.
 
     Shared by the live browser (``interactive`` adds the selection marker and
     highlight) and the one-shot snapshot.
     """
+    is_detailed = detailed and interactive
+    if is_detailed and width >= 100:
+        mode = "wide"
+    elif is_detailed and 70 <= width < 100:
+        mode = "medium"
+    else:
+        mode = "compact"
+
     if interactive:
         # The section rule above carries the name, range and focus; the header names columns only.
         table = Table(box=None, expand=True, padding=(0, 1), show_header=show_header, pad_edge=False, show_edge=False, header_style="dim")
     else:
         table = Table(title=title, box=box_style, expand=True, show_header=show_header)
+
     header = "" if interactive else "Activity"
-    table.add_column(header, ratio=1, no_wrap=True, overflow="ellipsis")
-    table.add_column("Cost" if measure == "usd" else "Tokens", justify="right", no_wrap=True)
-    table.add_column("Time", justify="right", no_wrap=True)
+    tokens_col = "Cost" if measure == "usd" else "Tokens"
+
+    if mode == "wide":
+        distinct_models = {
+            entry.detail.model or model
+            for entry in entries
+            if not entry.is_launch and entry.detail is not None
+        }
+        show_model = len(distinct_models) >= 2
+
+        table.add_column(header, ratio=1, no_wrap=True, overflow="ellipsis")
+        if show_model:
+            table.add_column("Model", no_wrap=True)
+        table.add_column("Mix", justify="left", no_wrap=True)
+        table.add_column("Cache hit", justify="right", no_wrap=True)
+        table.add_column("New in", justify="right", no_wrap=True)
+        table.add_column("Out", justify="right", no_wrap=True)
+        table.add_column(tokens_col, justify="right", no_wrap=True)
+        table.add_column("Time", justify="right", no_wrap=True)
+    elif mode == "medium":
+        table.add_column(header, ratio=1, no_wrap=True, overflow="ellipsis")
+        table.add_column("Mix", justify="left", no_wrap=True)
+        table.add_column(tokens_col, justify="right", no_wrap=True)
+        table.add_column("Time", justify="right", no_wrap=True)
+    else:
+        table.add_column(header, ratio=1, no_wrap=True, overflow="ellipsis")
+        table.add_column(tokens_col, justify="right", no_wrap=True)
+        table.add_column("Time", justify="right", no_wrap=True)
+
     for entry in entries:
         duration = "—" if entry.is_launch else format_duration(entry.duration_seconds)
-        cells: list[Any] = [Text(entry.title), activity_tokens_cell(entry, measure, model, syncing), duration]
+        tokens_str = activity_tokens_cell(entry, measure, model, syncing)
+
+        is_sel = entry.entry_id == selected_id
+        highlighted = is_sel and focused
         if interactive:
-            is_sel = entry.entry_id == selected_id
-            highlighted = is_sel and focused
-            title = Text()
-            title.append("▶ " if is_sel else "  ", style="bold" if highlighted else "bold cyan")
-            title.append_text(cells[0])
-            table.add_row(title, *cells[1:], style=SELECTED_ROW_STYLE if highlighted else "")
+            title_text = Text()
+            title_text.append("▶ " if is_sel else "  ", style="bold" if highlighted else "bold cyan")
+            title_text.append(entry.title)
         else:
-            table.add_row(*cells)
+            title_text = Text(entry.title)
+
+        if mode == "wide":
+            if entry.is_launch or entry.detail is None:
+                model_cell = ""
+                mix_cell = ""
+                cache_hit_cell = ""
+                new_in_cell = ""
+                out_cell = ""
+            else:
+                step = entry.detail
+                step_model = step.model or model
+                model_cell = step_model or ""
+                step_tokens = TokenBreakdown()
+                step_tokens.add_step(step)
+                step_cost = step_usd(step_model, step)
+                values = _kind_values_of(step_tokens, step_cost, measure)
+                fmt = format_usd if measure == "usd" else format_tokens
+                mix_cell = kind_bar_line(values, 8)
+                cache_hit_cell = fmt(values["cache_read"])
+                new_in_cell = fmt(values["input"] + values["cache_write"])
+                out_cell = fmt(values["output"])
+
+            row_cells = [title_text]
+            if show_model:
+                row_cells.append(model_cell)
+            row_cells.extend([mix_cell, cache_hit_cell, new_in_cell, out_cell, tokens_str, duration])
+            table.add_row(*row_cells, style=SELECTED_ROW_STYLE if highlighted else "")
+        elif mode == "medium":
+            if entry.is_launch or entry.detail is None:
+                mix_cell = ""
+            else:
+                step = entry.detail
+                step_model = step.model or model
+                step_tokens = TokenBreakdown()
+                step_tokens.add_step(step)
+                step_cost = step_usd(step_model, step)
+                values = _kind_values_of(step_tokens, step_cost, measure)
+                mix_cell = kind_bar_line(values, 6)
+            table.add_row(title_text, mix_cell, tokens_str, duration, style=SELECTED_ROW_STYLE if highlighted else "")
+        else:
+            cells: list[Any] = [title_text, tokens_str, duration]
+            if interactive:
+                table.add_row(*cells, style=SELECTED_ROW_STYLE if highlighted else "")
+            else:
+                table.add_row(*cells)
+
     if interactive and not entries:
-        table.add_row("No recorded activity for this agent.", "", "")
+        table.add_row("No recorded activity for this agent.", *([""] * (len(table.columns) - 1)))
     return table
 
 

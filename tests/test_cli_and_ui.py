@@ -2000,3 +2000,230 @@ def test_overview_budget_syncing_replaces_usage_blocks():
     budget = _overview_budget(40, UsageStats(), 2, 3, 5, 7, 0, True, syncing=True)
     assert budget['pm_rows'] == 0
     assert not budget['headline'] and not budget['legend']
+
+
+def test_activity_table_detailed_columns_by_width():
+    from rich.console import Console
+    from t3_telemetry.activity import ActivityEntry
+    from t3_telemetry.models import ModelStep
+    from t3_telemetry.ui import build_activity_table
+
+    step1 = ModelStep(
+        step_index=1,
+        model="claude-3-5-sonnet",
+        input_tokens=100,
+        cache_read_tokens=500,
+        cache_creation_tokens=50,
+        output_tokens=25,
+    )
+    step2 = ModelStep(
+        step_index=2,
+        model="gpt-4o",
+        input_tokens=200,
+        cache_read_tokens=1000,
+        cache_creation_tokens=100,
+        output_tokens=50,
+    )
+    e1 = ActivityEntry(
+        entry_id="1",
+        title="Turn 1",
+        kind="turn",
+        status="done",
+        total_tokens=675,
+        duration_seconds=1.5,
+        accounting_scope="self",
+        detail=step1,
+    )
+    e2 = ActivityEntry(
+        entry_id="2",
+        title="Turn 2",
+        kind="turn",
+        status="done",
+        total_tokens=1350,
+        duration_seconds=2.0,
+        accounting_scope="self",
+        detail=step2,
+    )
+
+    # 1. Width 120 with two models: shows Model column, Mix, Cache hit, New in, Out
+    table120_two = build_activity_table([e1, e2], interactive=True, detailed=True, width=120)
+    col_names_two = [c.header for c in table120_two.columns]
+    assert col_names_two == ["", "Model", "Mix", "Cache hit", "New in", "Out", "Tokens", "Time"]
+    c120_two = Console(width=120, record=True)
+    c120_two.print(table120_two)
+    out120_two = c120_two.export_text()
+    assert "Model" in out120_two
+    assert "claude-3-5-sonnet" in out120_two
+    assert "gpt-4o" in out120_two
+    assert "Cache hit" in out120_two
+    assert "New in" in out120_two
+    assert "Out" in out120_two
+    assert "500" in out120_two  # Cache hit for step 1
+    assert "150" in out120_two  # New in (100 + 50) for step 1
+    assert "25" in out120_two   # Out for step 1
+
+    # 2. Width 120 with one model: hides Model column
+    step3 = ModelStep(
+        step_index=3,
+        model="claude-3-5-sonnet",
+        input_tokens=200,
+        cache_read_tokens=1000,
+        output_tokens=50,
+    )
+    e3 = ActivityEntry(
+        entry_id="3",
+        title="Turn 3",
+        kind="turn",
+        status="done",
+        total_tokens=1250,
+        duration_seconds=2.0,
+        accounting_scope="self",
+        detail=step3,
+    )
+    table120_one = build_activity_table([e1, e3], interactive=True, detailed=True, width=120)
+    col_names_one = [c.header for c in table120_one.columns]
+    assert col_names_one == ["", "Mix", "Cache hit", "New in", "Out", "Tokens", "Time"]
+    c120_one = Console(width=120, record=True)
+    c120_one.print(table120_one)
+    out120_one = c120_one.export_text()
+    assert "Model" not in out120_one
+    assert "Cache hit" in out120_one
+    assert "New in" in out120_one
+    assert "Out" in out120_one
+
+    # 3. Width 120 with step.model=None falling back to node model: shows Model column when distinct
+    step4 = ModelStep(
+        step_index=4,
+        model=None,
+        input_tokens=100,
+        cache_read_tokens=200,
+        output_tokens=10,
+    )
+    e4 = ActivityEntry(
+        entry_id="4",
+        title="Turn 4",
+        kind="turn",
+        status="done",
+        total_tokens=310,
+        duration_seconds=1.0,
+        accounting_scope="self",
+        detail=step4,
+    )
+    table120_fallback = build_activity_table(
+        [e4, e2],
+        model="claude-3-5-sonnet",
+        interactive=True,
+        detailed=True,
+        width=120,
+    )
+    col_names_fb = [c.header for c in table120_fallback.columns]
+    assert "Model" in col_names_fb
+
+    # 4. Width 60 output is unchanged from detailed=False
+    table60_det = build_activity_table([e1, e2], interactive=True, detailed=True, width=60)
+    table60_nodet = build_activity_table([e1, e2], interactive=True, detailed=False, width=60)
+    col_names_60 = [c.header for c in table60_det.columns]
+    assert col_names_60 == ["", "Tokens", "Time"]
+    c60_a = Console(width=60, record=True)
+    c60_b = Console(width=60, record=True)
+    c60_a.print(table60_det)
+    c60_b.print(table60_nodet)
+    assert c60_a.export_text() == c60_b.export_text()
+
+    # 5. Medium width (70 <= width < 100): shows "" | Mix | Tokens | Time
+    table80 = build_activity_table([e1, e2], interactive=True, detailed=True, width=80)
+    col_names_80 = [c.header for c in table80.columns]
+    assert col_names_80 == ["", "Mix", "Tokens", "Time"]
+    c80 = Console(width=80, record=True)
+    c80.print(table80)
+    out80 = c80.export_text()
+    assert "Mix" in out80
+    assert "Cache hit" not in out80
+    assert "Model" not in out80
+
+    # 6. Non-interactive calls (e.g. --once snapshot) ignore detailed
+    table_once_det = build_activity_table([e1, e2], interactive=False, detailed=True, width=120)
+    table_once_nodet = build_activity_table([e1, e2], interactive=False, detailed=False, width=120)
+    col_names_once = [c.header for c in table_once_det.columns]
+    assert col_names_once == ["Activity", "Tokens", "Time"]
+    c_once_a = Console(width=120, record=True)
+    c_once_b = Console(width=120, record=True)
+    c_once_a.print(table_once_det)
+    c_once_b.print(table_once_nodet)
+    assert c_once_a.export_text() == c_once_b.export_text()
+
+
+def test_activity_table_launch_and_empty_rows_and_syncing():
+    from rich.console import Console
+    from t3_telemetry.activity import ActivityEntry
+    from t3_telemetry.models import ModelStep, SubagentLaunch
+    from t3_telemetry.ui import build_activity_table
+
+    step1 = ModelStep(step_index=1, model="m1", input_tokens=100, cache_read_tokens=200, output_tokens=30)
+    step2 = ModelStep(step_index=2, model="m2", input_tokens=100, cache_read_tokens=200, output_tokens=30)
+    e1 = ActivityEntry(entry_id="1", title="Turn 1", kind="turn", status="done", total_tokens=330, duration_seconds=1.0, accounting_scope="self", detail=step1)
+    e2 = ActivityEntry(entry_id="2", title="Turn 2", kind="turn", status="done", total_tokens=330, duration_seconds=1.0, accounting_scope="self", detail=step2)
+    launch = SubagentLaunch(launch_id="l1", title="Worker", origin="app_owned", status="running", child_thread_id="c1", child_present=True, launched_at=None)
+    e_launch = ActivityEntry(entry_id="l1", title="Launch Worker", kind="launch", status="running", total_tokens=None, duration_seconds=0.0, accounting_scope="launch", detail=None, launch=launch)
+    e_no_detail = ActivityEntry(entry_id="nd", title="No detail", kind="turn", status="done", total_tokens=50, duration_seconds=0.5, accounting_scope="self", detail=None)
+
+    table = build_activity_table([e1, e2, e_launch, e_no_detail], interactive=True, detailed=True, width=120, syncing=True)
+    c = Console(width=120, record=True)
+    c.print(table)
+    out = c.export_text()
+    # syncing shows "syncing…" in Tokens column
+    assert "syncing…" in out
+    # Launch row and no-detail row duration / token handling
+    assert "Launch Worker" in out
+    assert "No detail" in out
+
+
+def test_activity_tab_body_detailed_at_120_and_compact_at_60():
+    from rich.console import Console
+    from t3_telemetry.activity import build_activity_entries
+    from t3_telemetry.cli import _activity_tab_body
+    from t3_telemetry.models import ModelStep, ThreadTelemetryNode
+    from t3_telemetry.tui import NavigationState, ScreenState
+
+    node = ThreadTelemetryNode(
+        thread_id="th1",
+        title="Test Chat",
+        driver="antigravity",
+        provider_instance_id="p1",
+        model="claude-3-5-sonnet",
+        steps=[
+            ModelStep(
+                step_index=1,
+                activity_kind="model_step",
+                model="claude-3-5-sonnet",
+                input_tokens=1000,
+                cache_read_tokens=4000,
+                cache_creation_tokens=500,
+                output_tokens=200,
+                duration_seconds=2.5,
+            ),
+        ],
+    )
+    entries = build_activity_entries(node, max_steps=10)
+    nav = NavigationState()
+    screen = ScreenState(node_id="th1", focus="activity")
+
+    # Width 120 Activity tab shows Cache hit and Out columns
+    body_120 = _activity_tab_body(node, nav, screen, entries, inner_height=20, inner_width=120)
+    c_120 = Console(width=120, record=True)
+    for item in body_120:
+        c_120.print(item)
+    out_120 = c_120.export_text()
+    assert "Cache hit" in out_120
+    assert "Out" in out_120
+
+    # Width 60 Activity tab matches compact output (no Cache hit, no Out)
+    body_60 = _activity_tab_body(node, nav, screen, entries, inner_height=20, inner_width=60)
+    c_60 = Console(width=60, record=True)
+    for item in body_60:
+        c_60.print(item)
+    out_60 = c_60.export_text()
+    assert "Cache hit" not in out_60
+    assert "Out" not in out_60
+    assert "Tokens" in out_60
+
