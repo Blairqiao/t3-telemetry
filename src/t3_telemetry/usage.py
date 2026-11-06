@@ -14,6 +14,7 @@ from datetime import datetime, time, timedelta, timezone
 
 from .models import ModelStep, ThreadTelemetryNode
 from .prices import CostBreakdown, model_key, step_cost
+from .providers import family_label, provider_key
 from .store import TelemetryStore, utc_iso
 
 PERIODS = ("today", "week", "month")
@@ -231,8 +232,7 @@ def _add_to_period(usage: PeriodUsage, idx: int, family: str, scope: str,
 
 
 def provider_family(driver: str | None, provider_instance_id: str | None = None) -> str:
-    value = (driver or provider_instance_id or "").lower()
-    return next((name for name in PROVIDER_ORDER[:-1] if value.startswith(name.lower())), "Other")
+    return family_label(provider_key(driver, provider_instance_id))
 
 
 def period_window(key: str, now: datetime) -> PeriodWindow:
