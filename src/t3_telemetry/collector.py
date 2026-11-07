@@ -3,11 +3,11 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 import sqlite3
 from typing import Callable
 
+from t3_telemetry import paths
 from t3_telemetry.db_agy import read_agy_conversation
 from t3_telemetry.db_t3 import T3StateSnapshot
 from t3_telemetry.sources.antigravity import parse_antigravity_conversation
@@ -26,11 +26,11 @@ class SourceRoots:
 
 
 def default_roots(t3_dir: Path) -> SourceRoots:
-    claude = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-    codex = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    claude = paths.claude_home()
+    codex = paths.codex_home()
     t3_dir = Path(t3_dir)
     agy = list((t3_dir / "providers" / "antigravity").glob("*/antigravity-acp/conversations"))
-    agy.append(Path.home() / ".gemini/antigravity-cli/conversations")
+    agy.append(paths.antigravity_cli_dir() / "conversations")
     return SourceRoots(claude / "projects", [codex / "sessions", codex / "archived_sessions"], agy, t3_dir)
 
 
@@ -48,20 +48,21 @@ class Collector:
         self.roots = roots
         self.reader = reader
 
-    def sync(self, snapshot: T3StateSnapshot | None = None) -> SyncStats:
+    def sync(self, snapshot: T3StateSnapshot | None = None,
+             progress: Callable[[int, int], None] | None = None) -> SyncStats:
+        """Ingest new or changed session files. ``progress(done, total)`` is called once per file."""
         stats = SyncStats()
         models = {s.session_key: s.model for s in self.store.sessions()}
-        paths = [(p, "claude") for p in self.roots.claude_projects.glob("*/*.jsonl")]
-        paths.extend((p, "claude") for p in self.roots.claude_projects.glob("*/*/subagents/agent-*.jsonl"))
+        files = [(p, "claude") for p in self.roots.claude_projects.glob("*/*.jsonl")]
+        files.extend((p, "claude") for p in self.roots.claude_projects.glob("*/*/subagents/agent-*.jsonl"))
         for root in self.roots.codex_dirs:
-            paths.extend((p, "codex") for p in root.rglob("rollout-*.jsonl"))
+            files.extend((p, "codex") for p in root.rglob("rollout-*.jsonl"))
         for root in self.roots.antigravity_dirs:
-            paths.extend((p, "antigravity") for p in root.glob("*.db"))
-        seen = set()
-        for path, provider in paths:
-            if path in seen:
-                continue
-            seen.add(path)
+            files.extend((p, "antigravity") for p in root.glob("*.db"))
+        files = list(dict.fromkeys(files))
+        for index, (path, provider) in enumerate(files, 1):
+            if progress is not None:
+                progress(index, len(files))
             stats.files_seen += 1
             try:
                 stat = path.stat()

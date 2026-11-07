@@ -452,3 +452,37 @@ def test_native_claude_child_after_parent_switches_to_codex(tmp_path: Path):
     assert "claude:X/agent-abc" not in bindings
     assert "claude:P-other/agent-def" not in bindings
     store.close()
+
+
+def test_unknown_driver_falls_back_to_t3_turn_usage(tmp_path: Path):
+    """A harness with no parser (e.g. OpenCode) keeps its T3-recorded usage, labelled Other."""
+    from t3_telemetry.models import ProviderTurnRecord
+    from t3_telemetry.providers import family_label, provider_key
+
+    snap = T3StateSnapshot()
+    snap.threads["t-oc"] = _make_app_thread("t-oc", title="OpenCode chat", default_provider="opencode",
+                                            provider_instance_id="opencode")
+    snap.provider_threads["pt-oc"] = _make_provider_thread("pt-oc", "t-oc", "opencode", "opencode", "ses_1")
+    snap.provider_turns_by_thread["t-oc"] = [
+        ProviderTurnRecord(provider_turn_id="turn-1", thread_id="t-oc", provider_thread_id="pt-oc",
+                           driver="opencode", native_turn_id=None, ordinal=1, status="completed",
+                           started_at="2026-11-03T10:00:00Z", completed_at="2026-11-03T10:01:00Z",
+                           input_tokens=100, cache_read_tokens=50, output_tokens=20, thinking_tokens=5),
+        ProviderTurnRecord(provider_turn_id="turn-2", thread_id="t-oc", provider_thread_id="pt-oc",
+                           driver="opencode", native_turn_id=None, ordinal=2, status="running",
+                           started_at="2026-11-03T10:02:00Z", completed_at=None),
+    ]
+    store = TelemetryStore(tmp_path / "store.db")
+    mirror_t3_graph(store, snap)
+
+    sessions = store.sessions_by_key()
+    assert set(sessions) == {"other:pt-oc"}
+    assert family_label(provider_key(sessions["other:pt-oc"].provider)) == "Other"
+    assert store.bindings() == {"other:pt-oc": "t-oc"}
+    steps = store.all_steps()
+    assert [(s["event_id"], s["input_tokens"], s["cache_read_tokens"], s["output_tokens"]) for s in steps] == [
+        ("turn-1", 100, 50, 20)
+    ]
+    mirror_t3_graph(store, snap)  # idempotent
+    assert len(store.all_steps()) == 1
+    store.close()

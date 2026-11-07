@@ -1,20 +1,86 @@
 # t3-telemetry
-Live terminal telemetry dashboard and command-line inspector for T3 Code and Antigravity.
-`t3-top` aggregates token consumption, context window usage, cache efficiency, thinking tokens, and execution latency across T3 Code threads and delegated subagent hierarchies. It uses native harness files as the primary source of token numbers and activity, backed by a local telemetry store, and connects to local T3 SQLite databases using read-only URIs (`?mode=ro`) for the thread tree, titles, and status without locking or interrupting active agent runs.
 
-## Installation
+`t3-top` is a terminal telemetry companion for [T3 Code](https://github.com/pingdotgg/t3code). It shows token usage, estimated cost, context-window occupancy, cache efficiency and subagent trees for the coding agents T3 drives: **Claude Code**, **Codex** and **Antigravity**. It also counts sessions you ran outside T3, such as `claude` or `codex` in a plain terminal or through an SDK.
 
-Install using `uv`:
+Usage numbers come from each harness's own session files, which `t3-top` indexes into a small local SQLite store. Thread titles, lineage and status come from T3's own database, which is opened read-only.
+
+## Requirements
+
+- macOS or Linux. Live mode needs a POSIX terminal; Windows is not supported.
+- [`uv`](https://docs.astral.sh/uv/). It fetches Python 3.12+ itself if needed.
+- T3 Code, for thread titles and the per-thread screens. Without it, `t3-top` still shows usage from native session files and tells you where it looked for T3.
+
+## Install
 
 ```bash
-uv tool install -e /Users/blair/Desktop/Projects/t3-telemetry
+uv tool install git+https://github.com/Blairqiao/t3-telemetry
+t3-top --sync   # one-time backfill of your existing history
+t3-top
 ```
 
-Or run directly from the repository worktree:
+There is no config file and no setup step. The first run indexes every session file it finds, with progress on screen. After that, syncing is incremental and runs in the background.
+
+To work on it from a clone:
 
 ```bash
-uv run t3-top [options]
+git clone https://github.com/Blairqiao/t3-telemetry && cd t3-telemetry
+uv run t3-top
+uv run pytest
 ```
+
+## Where data comes from
+
+Each location resolves in this order: CLI flag, then environment variable, then default.
+
+| Data | Default | Override |
+|---|---|---|
+| Telemetry store (written by `t3-top`) | `~/.t3-telemetry/telemetry.sqlite` | `--store`, `T3_TELEMETRY_STORE` |
+| T3 userdata (`statev2.sqlite`) | `$T3CODE_HOME/userdata`, else `~/.t3/userdata` | `--t3-dir`, `T3_TELEMETRY_T3_DIR` |
+| Claude Code sessions | `~/.claude/projects/*/*.jsonl` and `*/*/subagents/agent-*.jsonl` | `CLAUDE_CONFIG_DIR` |
+| Codex sessions | `~/.codex/{sessions,archived_sessions}/**/rollout-*.jsonl` | `CODEX_HOME` |
+| Antigravity (via T3) | `<t3-dir>/providers/antigravity/*/antigravity-acp/conversations/*.db` | follows `--t3-dir` |
+| Antigravity CLI | `~/.gemini/antigravity-cli/{conversations,brain}` | `ANTIGRAVITY_CLI_DIR` |
+
+If `statev2.sqlite` is missing or unreadable, `t3-top` prints the path it checked (live mode shows it in the footer) and carries on with usage from the session files.
+
+## Privacy
+
+- Everything stays on your machine. `t3-top` makes no network requests.
+- T3's database and the Antigravity databases are opened read-only (`?mode=ro`). Harness files are only read. `t3-top` never reads T3's `secrets/`, `clerk/` or auth tables.
+- The store keeps token counts, model names, timestamps, session titles and working directories. It also keeps short excerpts for the activity screens: each prompt and reply is cut to 2,000 characters, and each tool-call description to 300. Delete `~/.t3-telemetry/` to remove all of it.
+
+## Supported harnesses
+
+| Harness | Source | Status |
+|---|---|---|
+| Claude Code (including subagents) | native JSONL transcripts | supported |
+| Codex | native rollout logs | supported |
+| Antigravity | native conversation databases | supported |
+| Anything else T3 drives (OpenCode, …) | T3's own per-turn usage records | totals only, shown as **Other** |
+
+A T3 thread whose harness has no parser still counts toward usage, from the turn totals T3 recorded, labelled "Other". It has no activity detail, and sessions run outside T3 aren't counted. A real parser fixes both: see [CONTRIBUTING.md](CONTRIBUTING.md#adding-a-harness). An OpenCode parser would be very welcome.
+
+## Estimated costs
+
+Press `$` to switch between tokens and estimated USD. Costs are **estimates at API list prices**, taken from a static table in [`src/t3_telemetry/prices.py`](src/t3_telemetry/prices.py). The date the table was last checked is shown in the footer in cost mode. On a subscription plan, the figure is what the same work would cost on the API. Models missing from the table show as `unpriced` rather than `$0`. To add or correct a rate, see [CONTRIBUTING.md](CONTRIBUTING.md#updating-prices).
+
+## Command-line options
+
+| Flag | What it does |
+|---|---|
+| *(none)* | Live dashboard. |
+| `QUERY` | Open a thread by ID prefix, native session ID prefix, or title substring. |
+| `--once` | Print one snapshot of the latest (or queried) thread and exit. |
+| `--json` | Print the thread telemetry as JSON and exit. Combine with `--list` or `--sessions`. |
+| `--list` | List recent T3 threads with totals and exit. |
+| `--sessions` | List native sessions in the store (T3, CLI and SDK) and exit. |
+| `--sync` | Sync the store once, print counts, and exit. |
+| `--no-store` | Don't sync; read the store as it is. |
+| `--store PATH` | Use a different store file. |
+| `--t3-dir PATH` | Use a different T3 userdata directory. |
+| `--interval SECONDS` | Live refresh interval (default 0.5). |
+| `--no-follow` | In live mode, keep the header on the first thread instead of following the latest active one. |
+| `--max-steps N` | Recent activity entries to keep per thread (default 20). |
 
 ## Usage
 
@@ -86,14 +152,6 @@ Export detailed telemetry for a selected thread and its full subagent tree:
 ```bash
 t3-top --json
 t3-top th-root-alpha --json
-```
-
-### Custom userdata directory
-
-By default, `t3-top` reads from `~/.t3/userdata`. You can override this location:
-
-```bash
-t3-top --t3-dir /path/to/custom/userdata --once
 ```
 
 ### Terminal navigation and controls
@@ -214,25 +272,9 @@ t3-top --interval 0.5
 
 The interface automatically scales across narrow split panes (60+ columns) and wide multi-monitor terminals.
 
-## Data sources and the local store
+## The local store
 
-`t3-top` aggregates telemetry from local agent session files and stores incremental token metrics in a local SQLite database.
-
-### Native session files
-
-The collector scans three native agent directories:
-
-- **Claude.** Reads JSONL transcripts from `~/.claude/projects/*/*.jsonl` for root sessions and `~/.claude/projects/*/*/subagents/agent-*.jsonl` for subagents. Subagent descriptions are loaded from matching `.meta.json` files. The `CLAUDE_CONFIG_DIR` environment variable overrides `~/.claude`.
-- **Codex.** Reads session rollout files from `~/.codex/sessions/**/rollout-*.jsonl` and `~/.codex/archived_sessions/**/rollout-*.jsonl`. The `CODEX_HOME` environment variable overrides `~/.codex`.
-- **Antigravity.** Reads conversation databases from `<t3-dir>/providers/antigravity/*/antigravity-acp/conversations/*.db` and CLI conversations from `~/.gemini/antigravity-cli/conversations/*.db`. The collector inspects companion `-wal` files so sizes and modification timestamps reflect recent writes.
-
-### Telemetry store and privacy
-
-The store is a SQLite database located at `~/.t3-telemetry/telemetry.sqlite` by default. You can specify a different location with `--store`.
-
-The store records token counts, session metadata, turn boundaries, prompts, replies, and activity details from harness files. Prompts and replies are limited to 2,000 characters each; activity item text is limited to 300 characters. Stored history remains available if the harness deletes its logs.
-
-The local store powers calendar usage views across Today, This week, and This month, as well as thread telemetry overviews, turn metrics, and activity streams. Harness files supply token numbers and activity details, while T3 provides the thread tree, titles, and thread status. While background syncing is underway or awaiting completion, affected metrics report `syncing…`.
+The store powers the calendar usage views (Today, This week, This month), thread overviews, turn metrics and activity streams. Harness files supply token numbers and activity details. T3 supplies the thread tree, titles and status. History stays in the store even after a harness deletes its logs or T3 deletes a thread. While a sync is running or hasn't happened yet, affected metrics show `syncing…`.
 
 ### Origin detection
 
@@ -289,8 +331,13 @@ t3-top --no-store
 8. `thread_view.py`: Builder constructing thread telemetry trees, activity entries, and rollup metrics from the owned store.
 9. `aggregator.py`: Subagent launch merger and thread status resolver.
 10. `ui.py`: Rich terminal renderables generating context gauges, summary metric comparisons, recursive subagent trees, and step stream tables.
-11. `cli.py`: Command-line interface supporting live monitoring, snapshot printing, list queries, store sync, and JSON serialization.
+11. `paths.py`: Default locations for the store, T3 and each harness, with their flag and environment-variable overrides.
+12. `cli.py`: Command-line interface supporting live monitoring, snapshot printing, list queries, store sync, and JSON serialization.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), including how to add a harness and update prices.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

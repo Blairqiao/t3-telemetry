@@ -36,7 +36,8 @@ from t3_telemetry.thread_view import build_thread_node, resolve_thread_node, lis
 
 from t3_telemetry.context_history import ContextHistoryStore, make_agent_key
 from t3_telemetry.models import AppThreadRecord, ContextSample, ThreadTelemetryNode
-from t3_telemetry.terminal import PosixTerminalAdapter
+from t3_telemetry import paths
+from t3_telemetry.prices import PRICES_CHECKED
 from t3_telemetry.tui import (
     NavigationState,
     ScreenState,
@@ -124,8 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--t3-dir",
         type=Path,
-        default=Path("~/.t3/userdata").expanduser(),
-        help="Override base T3 userdata directory.",
+        default=None,
+        help="T3 userdata directory (env: T3_TELEMETRY_T3_DIR; default: $T3CODE_HOME/userdata or ~/.t3/userdata).",
     )
     parser.add_argument(
         "--no-follow",
@@ -138,22 +139,52 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="Max recent steps/turns to display in the stream table.",
     )
-    parser.add_argument("--store", type=Path, default=Path("~/.t3-telemetry/telemetry.sqlite").expanduser(), help="Path to the local telemetry store.")
+    parser.add_argument("--store", type=Path, default=None, help="Path to the local telemetry store (env: T3_TELEMETRY_STORE; default: ~/.t3-telemetry/telemetry.sqlite).")
     parser.add_argument("--no-store", action="store_true", help="Do not sync native session files; read the store as it is.")
     parser.add_argument("--sync", action="store_true", help="Sync the telemetry store once and exit.")
     parser.add_argument("--sessions", action="store_true", help="List recent native sessions from the telemetry store and exit.")
     return parser
 
 
-def _synced_store(args: argparse.Namespace, t3_dir: Path) -> tuple[TelemetryStore, T3StateSnapshot]:
-    store = TelemetryStore(args.store.expanduser())
+def t3_state_problem(t3_dir: Path) -> str | None:
+    """Explain why T3's state can't be read, or None when it looks usable."""
+    db_path = paths.t3_state_db(t3_dir)
+    if db_path.is_file():
+        return None
+    return (f"T3 state not found at {db_path}. Chat titles and thread views need T3 Code; "
+            "usage from native session files still works. Point at T3 with --t3-dir or "
+            "T3_TELEMETRY_T3_DIR if it lives elsewhere.")
+
+
+def _read_t3_or_empty(t3_dir: Path) -> T3StateSnapshot:
     try:
-        try:
-            snapshot = read_t3_state(t3_dir)
-        except (sqlite3.Error, OSError):
-            snapshot = T3StateSnapshot()
+        return read_t3_state(t3_dir)
+    except (sqlite3.Error, OSError):
+        return T3StateSnapshot()
+
+
+def _sync_with_progress(collector: Collector, snapshot: T3StateSnapshot | None):
+    """Sync, showing a progress line on stderr when it's interactive (the first run can take a while)."""
+    err = Console(stderr=True)
+    if not err.is_terminal:
+        return collector.sync(snapshot)
+    with err.status("Indexing session files…") as status:
+        def progress(done: int, total: int) -> None:
+            if done % 25 == 0 or done == total:
+                status.update(f"Indexing session files… {done}/{total}")
+        return collector.sync(snapshot, progress=progress)
+
+
+def _synced_store(args: argparse.Namespace, t3_dir: Path) -> tuple[TelemetryStore, T3StateSnapshot]:
+    store = TelemetryStore(paths.store_path(args.store))
+    try:
+        snapshot = _read_t3_or_empty(t3_dir)
         if not args.no_store:
-            stats = Collector(store, default_roots(t3_dir)).sync(snapshot)
+            collector = Collector(store, default_roots(t3_dir))
+            if args.sync or store.get_meta("last_sync_at") is None:
+                stats = _sync_with_progress(collector, snapshot)
+            else:
+                stats = collector.sync(snapshot)
             if args.sync:
                 print(f"files_seen={stats.files_seen} files_read={stats.files_read} steps_written={stats.steps_written} errors={stats.errors}")
         return store, snapshot
@@ -182,7 +213,7 @@ def run_live_loop(
     # Noninteractive fallback
     if _adapter is None and _max_iterations is None:
         if not console.is_terminal or not sys.stdin.isatty():
-            store, snapshot = _synced_store(args, Path(args.t3_dir).expanduser())
+            store, snapshot = _synced_store(args, paths.t3_dir(args.t3_dir))
             try:
                 node = resolve_thread_node(snapshot, store, args.thread_query)
                 if node is not None:
@@ -191,14 +222,25 @@ def run_live_loop(
             finally:
                 store.close()
 
-    t3_dir = Path(args.t3_dir).expanduser()
-    adapter = _adapter or PosixTerminalAdapter()
+    t3_dir = paths.t3_dir(args.t3_dir)
+    if _adapter is None:
+        # termios/tty are POSIX-only; importing here keeps --once/--json usable elsewhere.
+        from t3_telemetry.terminal import PosixTerminalAdapter
+        adapter = PosixTerminalAdapter()
+    else:
+        adapter = _adapter
     history_store = _history_store if _history_store is not None else ContextHistoryStore()
     browser = TelemetryBrowser(adapter, history_store=history_store)
+    if t3_state_problem(t3_dir):
+        browser.navigation.notice = f"No T3 state at {paths.t3_state_db(t3_dir)}; usage only (see --t3-dir)"
     live_factory = _live_cls or Live
 
-    store = TelemetryStore(Path(args.store).expanduser())
+    store = TelemetryStore(paths.store_path(args.store))
     collector = None if args.no_store else (_collector or Collector(store, default_roots(t3_dir)))
+    if _adapter is None and collector is not None and store.get_meta("last_sync_at") is None:
+        # First run: backfill before the full-screen view opens, with visible progress,
+        # so the Usage section doesn't start from partial totals.
+        _sync_with_progress(collector, _read_t3_or_empty(t3_dir))
     usage_cache = _usage_cache if _usage_cache is not None else UsageCache(
         background=True, reader=lambda d, s: read_store_usage_report(store, s)
     )
@@ -639,6 +681,11 @@ def _footer_line(nav: NavigationState, node: ThreadTelemetryNode | None, width: 
         foot.append(nav.notice, style="bold yellow")
         foot.append("  ·  ")
     foot.append(keys, style="bold")
+    if nav.measure == "usd":
+        # Costs are list-price estimates; say how fresh the price table is when there's room.
+        note = f"  · est. at list prices checked {PRICES_CHECKED}"
+        if foot.cell_len + len(note) <= width:
+            foot.append(note, style="dim")
     return _fit(foot, width)
 
 
@@ -1202,7 +1249,10 @@ def _browser_frame(
             expand=True,
         )
 
-    header = _root_strip(summary, width) if nav.stack or nav.period else _fit(Text("t3-top · Home · " + (now or datetime.now().astimezone()).strftime("%a %-d %b"), style="bold"), width)
+    today = now or datetime.now().astimezone()
+    # "%-d" (no zero padding) is not portable, so the day goes in separately.
+    home_title = f"t3-top · Home · {today:%a} {today.day} {today:%b}"
+    header = _root_strip(summary, width) if nav.stack or nav.period else _fit(Text(home_title, style="bold"), width)
     return _assemble_frame(header, body_panel, _footer_line(nav, node, width))
 
 
@@ -1221,8 +1271,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    t3_dir = Path(args.t3_dir).expanduser()
+    t3_dir = paths.t3_dir(args.t3_dir)
     console = Console()
+    problem = t3_state_problem(t3_dir)
+    if problem and not args.json:
+        print(f"t3-top: {problem}", file=sys.stderr)
 
     if args.sessions or args.sync or args.list or args.json or args.once:
         store, snapshot = _synced_store(args, t3_dir)

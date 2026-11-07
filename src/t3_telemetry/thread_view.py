@@ -136,8 +136,10 @@ def _build_thread_node(thread_id, snapshot, ctx, visited):
     syncing = ctx["syncing"]
     for provider_thread in snapshot.provider_threads_by_thread.get(thread_id, []):
         native_id = provider_thread.native_id
-        if native_id and not native_id.startswith("pending:"):
-            key = f"{provider_key(provider_thread.driver, provider_thread.provider_instance_id)}:{native_id}"
+        provider = provider_key(provider_thread.driver, provider_thread.provider_instance_id)
+        # Unparsed harnesses have no native file to wait for (see t3_mirror._fallback_session).
+        if provider is not None and native_id and not native_id.startswith("pending:"):
+            key = f"{provider}:{native_id}"
             if key not in sessions:
                 syncing = True
     node = ThreadTelemetryNode(

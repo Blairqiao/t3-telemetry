@@ -5,12 +5,27 @@ build-backend = "hatchling.build"
 [project]
 name = "t3-telemetry"
 version = "0.1.0"
-description = "Terminal telemetry dashboard and CLI for T3 Code and Antigravity"
+description = "Terminal telemetry companion for T3 Code: token usage, cost and context for Claude Code, Codex and Antigravity"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Blairqiao" }]
+keywords = ["t3", "t3-code", "claude-code", "codex", "antigravity", "telemetry", "tokens", "tui", "llm"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+]
 dependencies = [
     "rich>=13.9.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Blairqiao/t3-telemetry"
+Issues = "https://github.com/Blairqiao/t3-telemetry/issues"
 
 [project.scripts]
 t3-top = "t3_telemetry.cli:_entrypoint"

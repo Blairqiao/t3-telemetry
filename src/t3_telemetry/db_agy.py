@@ -12,6 +12,7 @@ import sqlite3
 from pathlib import Path
 
 from t3_telemetry.models import ConversationTelemetry, ModelStep, NativeLaunchRecord, ToolCallDetail
+from t3_telemetry.paths import antigravity_cli_dir
 from t3_telemetry.protobuf import decode_step_metadata
 
 UUID_PATTERN = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -90,7 +91,7 @@ def find_agy_db_path(native_id: str, t3_dir: Path | str) -> Path | None:
     Searches:
     1. <t3_dir>/providers/antigravity/*/antigravity-acp/conversations/<native_id>.db
     2. <t3_dir>/conversations/<native_id>.db
-    3. ~/.gemini/antigravity-cli/conversations/<native_id>.db
+    3. <antigravity CLI dir>/conversations/<native_id>.db (see paths.antigravity_cli_dir)
     """
     base = Path(t3_dir).expanduser()
     db_filename = f"{native_id}.db"
@@ -106,7 +107,7 @@ def find_agy_db_path(native_id: str, t3_dir: Path | str) -> Path | None:
         return flat
 
     # 3. Gemini CLI fallback
-    gemini_db = Path("~/.gemini/antigravity-cli/conversations").expanduser() / db_filename
+    gemini_db = antigravity_cli_dir() / "conversations" / db_filename
     if gemini_db.exists():
         return gemini_db
 
@@ -120,7 +121,7 @@ def find_agy_transcript_path(native_id: str, t3_dir: Path | str) -> Path | None:
     1. <t3_dir>/providers/antigravity/*/antigravity-acp/brain/<native_id>/.system_generated/logs/transcript.jsonl
     2. <t3_dir>/brain/<native_id>/.system_generated/logs/transcript.jsonl
     3. <t3_dir>/transcripts/<native_id>.jsonl
-    4. ~/.gemini/antigravity-cli/brain/<native_id>/.system_generated/logs/transcript.jsonl
+    4. <antigravity CLI dir>/brain/<native_id>/.system_generated/logs/transcript.jsonl
     """
     base = Path(t3_dir).expanduser()
 
@@ -141,7 +142,7 @@ def find_agy_transcript_path(native_id: str, t3_dir: Path | str) -> Path | None:
 
     # 4. Gemini CLI fallback
     gemini_transcript = (
-        Path("~/.gemini/antigravity-cli/brain").expanduser()
+        antigravity_cli_dir() / "brain"
         / native_id
         / ".system_generated"
         / "logs"
